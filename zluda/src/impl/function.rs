@@ -25,7 +25,12 @@ impl HasLivenessCookie for FunctionData {
 
 pub struct FunctionData {
     pub base: l0::Kernel<'static>,
+    /// The sizes of the arguments as the application passes them. A kernel
+    /// that reads them from a buffer still receives them one by one.
     pub arg_size: Vec<usize>,
+    /// Set when the argument list is too large for the compiler: the layout of
+    /// the buffer the kernel reads its arguments from instead.
+    pub param_buffer: Option<super::param_buffer::ParamBuffer>,
     pub use_shared_mem: bool,
     pub properties: Option<Box<l0::sys::ze_kernel_properties_t>>,
     pub legacy_args: LegacyArguments,
@@ -105,6 +110,19 @@ pub fn launch_kernel(
             );
         }
     }
+    // A kernel whose arguments do not fit in the parameter list reads them from
+    // a buffer, which has to be filled before the stream is locked: the copy
+    // that fills it takes the same locks.
+    let mut param_block = None;
+    if let Ok(func) = unsafe { &mut *f }.as_result_mut() {
+        if let Some(layout) = func.param_buffer.clone() {
+            param_block = Some(super::param_buffer::publish(
+                &layout,
+                kernel_params,
+                extra,
+            )?);
+        }
+    }
     GlobalState::lock_enqueue(hstream, |cmd_list, signal, wait| {
         let func: &mut FunctionData = match unsafe { &mut *f }.as_result_mut() {
             Ok(func) => func,
@@ -122,7 +140,11 @@ pub fn launch_kernel(
         let dump_this = std::env::var("ZLUDA_DUMP_PARAMS")
             .map(|want| func.name.to_string_lossy().contains(want.as_str()))
             .unwrap_or(false);
-        if kernel_params != ptr::null_mut() {
+        if let Some(block) = param_block {
+            // The whole argument list is one eight byte value: the address of
+            // the buffer it was copied into.
+            unsafe { func.base.set_arg_raw(0, std::mem::size_of::<*mut c_void>(), &block as *const _ as *const c_void)? };
+        } else if kernel_params != ptr::null_mut() {
             for (i, arg_size) in func.arg_size.iter().enumerate() {
                 let value = unsafe { *kernel_params.add(i) };
                 if dump_this {
@@ -198,9 +220,16 @@ pub fn launch_kernel(
             }
         }
         if func.use_shared_mem {
+            // The shared-memory size follows the kernel's own parameters, and a
+            // kernel that reads its arguments from a buffer has exactly one.
+            let own_parameters = if func.param_buffer.is_some() {
+                1
+            } else {
+                func.arg_size.len()
+            };
             unsafe {
                 func.base.set_arg_raw(
-                    func.arg_size.len() as u32,
+                    own_parameters as u32,
                     shared_mem_bytes as usize,
                     ptr::null(),
                 )?

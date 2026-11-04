@@ -31,6 +31,9 @@ pub struct ModuleData {
     pub spirv: SpirvModule,
     /// The argument sizes of the kernels that have been translated so far.
     pub kernel_info: HashMap<String, ptx::KernelInfo>,
+    /// The kernels whose arguments do not fit in the parameter list, with the
+    /// layout of the buffer they read them from instead.
+    pub param_buffers: HashMap<String, super::param_buffer::ParamBuffer>,
     pub device_binaries: HashMap<device::Index, CompiledModules>,
 }
 
@@ -54,6 +57,9 @@ pub enum UnitSource {
 /// One kernel, translated and ready to be compiled.
 pub struct TranslatedKernel {
     pub binary: Vec<u32>,
+    /// Set when the kernel reads its arguments from a buffer instead of the
+    /// parameter list, because the list is larger than the compiler allows.
+    pub param_buffer: Option<super::param_buffer::ParamBuffer>,
     /// The kernel calls into the PTX implementation module, which has to be
     /// linked in; the others are built on their own.
     pub need_ptx_impl: bool,
@@ -256,6 +262,13 @@ impl SpirvModule {
                 }
             }
         };
+        // A kernel whose argument list is larger than the compiler allows is
+        // rewritten to read its arguments from a buffer, which the driver fills
+        // at launch time.
+        let (split, param_buffer) = match super::param_buffer::rewrite(&split, kernel) {
+            Some((rewritten, layout)) => (rewritten, Some(layout)),
+            None => (split, None),
+        };
         let trace = std::env::var_os("ZLUDA_TRACE_LIBRARY").is_some();
         let mut errors = Vec::new();
         let ast = ptx::ModuleParser::new()
@@ -305,6 +318,7 @@ impl SpirvModule {
             .ok_or(CUresult::CUDA_ERROR_NOT_FOUND)?;
         Ok(TranslatedKernel {
             binary,
+            param_buffer,
             need_ptx_impl: spirv_module.should_link_ptx_impl.is_some(),
             ptx_impl: spirv_module.should_link_ptx_impl,
             info,
@@ -435,6 +449,9 @@ pub fn get_function(
                     kernels: HashMap::new(),
                 },
             );
+            if let Some(layout) = translated.param_buffer.clone() {
+                module.param_buffers.insert(kernel_name.clone(), layout);
+            }
             module.kernel_info.insert(kernel_name.clone(), translated.info);
         }
         let kernel_info = module
@@ -470,7 +487,14 @@ pub fn get_function(
         )?;
         let mut function = Box::new(Function::new(FunctionData {
             base: l0_kernel,
-            arg_size: kernel_info.arguments_sizes.clone(),
+            // A kernel that reads its arguments from a buffer still takes them
+            // from the application one by one, so the sizes it is launched with
+            // are the ones of the original list.
+            arg_size: match module.param_buffers.get(&kernel_name) {
+                Some(layout) => layout.sizes.clone(),
+                None => kernel_info.arguments_sizes.clone(),
+            },
+            param_buffer: module.param_buffers.get(&kernel_name).cloned(),
             use_shared_mem: kernel_info.uses_shared_mem,
             properties: None,
             legacy_args: LegacyArguments::new(),
@@ -626,6 +650,7 @@ pub fn load_data_impl(pmod: *mut *mut Module, spirv_data: SpirvModule) -> Result
         let module_data = ModuleData {
             spirv: spirv_data,
             kernel_info: HashMap::new(),
+            param_buffers: HashMap::new(),
             device_binaries,
         };
         Ok::<_, CUresult>(module_data)

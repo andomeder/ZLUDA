@@ -25,6 +25,7 @@ pub mod library;
 pub mod memory;
 pub mod module;
 pub(crate) mod occupancy;
+mod param_buffer;
 mod ptx_split;
 #[cfg_attr(windows, path = "os_win.rs")]
 #[cfg_attr(not(windows), path = "os_unix.rs")]

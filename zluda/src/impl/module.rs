@@ -521,6 +521,7 @@ pub fn get_function(
             },
             param_buffer: module.param_buffers.get(&kernel_name).cloned(),
             use_shared_mem: kernel_info.uses_shared_mem,
+            shared_mem_prefix: kernel_info.shared_mem_prefix,
             properties: None,
             legacy_args: LegacyArguments::new(),
             name: name.clone(),

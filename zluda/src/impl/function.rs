@@ -32,6 +32,10 @@ pub struct FunctionData {
     /// the buffer the kernel reads its arguments from instead.
     pub param_buffer: Option<super::param_buffer::ParamBuffer>,
     pub use_shared_mem: bool,
+    /// Bytes the kernel's own addressing assumes before the dynamic shared
+    /// window: a lifted kernel declares its whole shared memory as one symbol,
+    /// and the static part of it becomes the prefix.
+    pub shared_mem_prefix: usize,
     pub properties: Option<Box<l0::sys::ze_kernel_properties_t>>,
     pub legacy_args: LegacyArguments,
     /// The name the kernel was looked up with, for the launch trace.
@@ -227,12 +231,11 @@ pub fn launch_kernel(
             } else {
                 func.arg_size.len()
             };
+            // The application asks for its own dynamic shared memory; the
+            // prefix the kernel assumes sits in front of it.
+            let dynamic_shared = shared_mem_bytes as usize + func.shared_mem_prefix;
             unsafe {
-                func.base.set_arg_raw(
-                    own_parameters as u32,
-                    shared_mem_bytes as usize,
-                    ptr::null(),
-                )?
+                func.base.set_arg_raw(own_parameters as u32, dynamic_shared, ptr::null())?
             };
         }
         if let Err(e) = func.base.set_group_size(block_dim_x, block_dim_y, block_dim_z) {

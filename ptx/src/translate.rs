@@ -453,6 +453,8 @@ impl Module {
 pub struct KernelInfo {
     pub arguments_sizes: Vec<usize>,
     pub uses_shared_mem: bool,
+    /// Bytes to ask for on top of the application's dynamic shared request.
+    pub shared_mem_prefix: usize,
 }
 
 pub fn to_spirv_module<'a>(ast: ast::Module<'a>) -> Result<Module, TranslateError> {
@@ -969,6 +971,7 @@ fn convert_dynamic_shared_memory_usage<'input>(
     new_id: &mut impl FnMut() -> spirv::Word,
 ) -> Vec<Directive<'input>> {
     let mut extern_shared_decls = HashMap::new();
+    let mut extern_shared_sizes = HashMap::new();
     for dir in module.iter() {
         match dir {
             Directive::Variable(
@@ -979,8 +982,17 @@ fn convert_dynamic_shared_memory_usage<'input>(
                     name,
                     ..
                 },
-            ) if linking.contains(ast::LinkingDirective::EXTERN) && dims.len() == 0 => {
+            ) if linking.contains(ast::LinkingDirective::EXTERN) => {
                 extern_shared_decls.insert(*name, *p_type);
+                // The window is dynamic even when a size is written down: a
+                // lifted kernel flattens its static and dynamic shared memory
+                // into one symbol, and the size it declares is only the static
+                // part of it, which the launch has to ask for on top of the
+                // dynamic request. Treating it as a static variable instead
+                // silently loses every access past that size.
+                let count: u32 = dims.iter().product();
+                let declared = count as usize * p_type.size_of() as usize;
+                extern_shared_sizes.insert(*name, declared);
             }
             _ => {}
         }
@@ -1054,6 +1066,10 @@ fn convert_dynamic_shared_memory_usage<'input>(
                 {
                     let mut func_decl = (*func_decl).borrow_mut();
                     func_decl.shared_mem = Some(shared_id_param);
+                    // The largest declared size is the static prefix the
+                    // kernel's own addressing assumes.
+                    func_decl.shared_mem_prefix =
+                        extern_shared_sizes.values().copied().max().unwrap_or(0);
                 }
                 let statements = replace_uses_of_shared_memory(
                     new_id,
@@ -1290,6 +1306,7 @@ fn emit_function_header<'a>(
             KernelInfo {
                 arguments_sizes: args_lens,
                 uses_shared_mem: func_decl.shared_mem.is_some(),
+                shared_mem_prefix: func_decl.shared_mem_prefix,
             },
         );
     }
@@ -2348,6 +2365,7 @@ fn register_external_fn_call(
                 name: ast::MethodName::Func(fn_id),
                 input_arguments,
                 shared_mem: None,
+                shared_mem_prefix: 0,
             };
             let func = Function {
                 func_decl: Rc::new(RefCell::new(func_decl)),
@@ -8412,6 +8430,7 @@ impl<'input> GlobalStringIdResolver<'input> {
             name,
             input_arguments,
             shared_mem: None,
+            shared_mem_prefix: 0,
         };
         let new_fn_decl = if !fn_decl.name.is_kernel() {
             let resolver = FnSigMapper::remap_to_spirv_repr(fn_decl);

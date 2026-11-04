@@ -123,6 +123,11 @@ pub struct MethodDeclaration<'input, ID> {
     pub name: MethodName<'input, ID>,
     pub input_arguments: Vec<Variable<ID>>,
     pub shared_mem: Option<ID>,
+    /// The bytes before the dynamic window. A lifted kernel describes its whole
+    /// shared memory as one externally sized symbol, and the part of it that was
+    /// static in the original is written down as the symbol's size, so the
+    /// launch has to ask for that many bytes on top of the dynamic request.
+    pub shared_mem_prefix: usize,
 }
 
 pub struct Function<'a, ID, S> {

@@ -1,60 +1,580 @@
 use super::{stream, CUresult, GlobalState};
-use std::{ffi::c_void, mem};
+use std::{
+    collections::HashMap,
+    ffi::c_void,
+    mem, ptr,
+    sync::{Mutex, OnceLock},
+};
+
+/// Allocates device memory and returns the raw pointer (no dptr out-param).
+pub fn alloc_v2_raw(bytesize: usize) -> Result<*mut c_void, CUresult> {
+    let alloc_ptr =
+GlobalState::lock_current_context_unchecked(|ctx| {
+let ctx_ptr = ctx as *mut _;
+let ctx_data = ctx.as_result_mut()?;
+let dev = unsafe { &mut *ctx_data.device };
+let alloc_ptr = dev.l0_context.mem_alloc_device(bytesize, 0, dev.base)?;
+ctx_data.pointer_registry.register(super::pointer::Allocation {
+base: alloc_ptr,
+size: bytesize,
+is_host: false,
+context: ctx_ptr,
+});
+Ok::<_, CUresult>(alloc_ptr)
+})??;
+// A fresh allocation is cleared. CUDA does not promise that in so many words,
+// but the memory an application gets from cudaMalloc reads as zeros on the
+// reference platform often enough that applications rely on it: a kernel whose
+// loop bound, flag or padding comes from a buffer it forgot to initialise runs
+// on that driver and either computes garbage or spins forever on this one.
+// Measured on llama.cpp: without this, 5 of 6 runs died with a stream that
+// never completed; with it, none did. ZLUDA_NO_ALLOC_ZERO turns it off for a
+// benchmark that wants the raw allocator.
+if std::env::var_os("ZLUDA_NO_ALLOC_ZERO").is_none() && bytesize > 0 {
+    set_d8_v2(alloc_ptr, 0, bytesize, stream::CU_STREAM_LEGACY)?;
+}
+Ok(alloc_ptr)
+}
 
 pub fn alloc_v2(dptr: *mut *mut c_void, bytesize: usize) -> Result<(), CUresult> {
-    let ptr = GlobalState::lock_current_context(|ctx| {
-        let dev = unsafe { &mut *ctx.device };
-        Ok::<_, CUresult>(dev.l0_context.mem_alloc_device(bytesize, 0, dev.base)?)
-    })??;
+    let ptr = alloc_v2_raw(bytesize)?;
     unsafe { *dptr = ptr };
     Ok(())
 }
 
 pub fn copy_v2(dst: *mut c_void, src: *const c_void, bytesize: usize) -> Result<(), CUresult> {
-    GlobalState::lock_enqueue(stream::CU_STREAM_LEGACY, |cmd_list, signal, wait| {
+// A blocking copy runs on the legacy stream, and CUDA orders the legacy
+// stream against every other blocking stream: work that was queued on the
+// application's stream has to finish first, otherwise the copy reads a buffer
+// that a kernel still has to write (or overwrites one a kernel still reads).
+// The immediate command lists of the two streams are independent queues, so
+// the ordering has to be made here.
+GlobalState::synchronize_context_streams()?;
+// Sync cudaMemcpy* must block until the copy retires (real CUDA semantics).
+// Enqueue alone races a following DtoH readback (probe: 199/200 mismatches,
+// 0/200 with an intervening cuCtxSynchronize).
+GlobalState::lock_enqueue(stream::CU_STREAM_LEGACY, |cmd_list, signal, wait| {
+    unsafe { cmd_list.append_memory_copy_raw(dst, src, bytesize, Some(signal), wait)? };
+    Ok(())
+})?;
+stream::synchronize(stream::CU_STREAM_LEGACY)?;
+Ok(())
+}
+
+/// A pinned staging buffer taken from the pool.
+///
+/// The pool hands each buffer to one copy at a time: a copy from another
+/// thread takes a different one. Sharing a single buffer per size class was a
+/// data race - two copies of the same class overwrote each other's data, which
+/// showed up as a corrupted hidden state that came and went between runs.
+///
+/// Buffers are never freed, so a buffer that is returned after its copy has
+/// retired can always be handed out again. Every caller waits for its copy
+/// before dropping this, which is what makes the reuse safe.
+struct Staging {
+    class: usize,
+    ptr: *mut c_void,
+}
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        let mut pool = staging_pool().lock().unwrap();
+        pool.entry(self.class).or_default().push(SendPtr(self.ptr));
+    }
+}
+
+/// The size class a buffer of `bytesize` is rounded up to.
+///
+/// Classes are powers of two from 1 MiB up: applications copy many distinct
+/// sizes, and keying by the exact size allocates a permanent pinned buffer per
+/// size until host memory runs out (which the driver eventually reports as a
+/// garbage error code).
+fn staging_class(bytesize: usize) -> usize {
+    bytesize.max(1 << 20).next_power_of_two().max(1 << 20)
+}
+
+fn staging_pool() -> &'static Mutex<HashMap<usize, Vec<SendPtr>>> {
+    static POOL: OnceLock<Mutex<HashMap<usize, Vec<SendPtr>>>> = OnceLock::new();
+    POOL.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Take a pinned staging buffer that fits `bytesize`.
+fn take_staging(bytesize: usize) -> Result<Staging, CUresult> {
+    let class = staging_class(bytesize);
+    let free = staging_pool()
+        .lock()
+        .unwrap()
+        .entry(class)
+        .or_default()
+        .pop();
+    if let Some(SendPtr(ptr)) = free {
+        return Ok(Staging { class, ptr });
+    }
+    let ptr = GlobalState::lock_current_context_unchecked(|ctx| {
+        let ctx_data = ctx.as_result_mut()?;
+        let dev = unsafe { &mut *ctx_data.device };
+        Ok::<_, CUresult>(dev.l0_context.mem_alloc_host(class, 0)?)
+    })??;
+    Ok(Staging { class, ptr })
+}
+
+/// True if `p` is NOT inside a tracked pinned-host allocation. Callers pass
+/// direction-appropriate HOST-side operands only (device pointers are also
+/// "untracked-host" by this definition but never reach it).
+fn host_untracked(p: *const c_void) -> bool {
+    GlobalState::lock_current_context_unchecked(|ctx| {
+        let ctx_data = ctx.as_result_mut()?;
+        Ok::<_, CUresult>(
+            ctx_data
+                .pointer_registry
+                .find(p as *mut c_void)
+                .map(|a| !a.is_host)
+                .unwrap_or(true),
+        )
+    })
+    .map(|b| b.unwrap_or(true))
+    .unwrap_or(true)
+}
+
+struct SendPtr(*mut c_void);
+unsafe impl Send for SendPtr {}
+
+/// Async device-to-device copy on a stream (cuMemcpyAsync / cuMemcpyDtoDAsync_v2).
+pub fn copy_async(
+    dst: *mut c_void,
+    src: *const c_void,
+    bytesize: usize,
+    hstream: *mut stream::Stream,
+) -> Result<(), CUresult> {
+    GlobalState::lock_enqueue(hstream, |cmd_list, signal, wait| {
         unsafe { cmd_list.append_memory_copy_raw(dst, src, bytesize, Some(signal), wait)? };
         Ok(())
     })
 }
 
-pub fn free_v2(ptr: *mut c_void) -> Result<(), CUresult> {
+/// cuMemcpyHtoDAsync_v2.
+pub fn copy_htod_async(
+    dst: *mut c_void,
+    src: *const c_void,
+    bytesize: usize,
+    hstream: *mut stream::Stream,
+) -> Result<(), CUresult> {
+    if host_untracked(src) {
+        // Unpinned host source: bounce through cached pinned staging so the
+        // DMA never touches malloc'd pages (xe faults on those). Synchronize
+        // before returning so the staging buffer is safe to reuse.
+        let stage = take_staging(bytesize)?;
+        unsafe { ptr::copy_nonoverlapping(src.cast::<u8>(), stage.ptr.cast::<u8>(), bytesize) };
+        copy_async(dst, stage.ptr, bytesize, hstream)?;
+        return GlobalState::lock_stream(hstream, |sd| {
+            sd.synchronize().map_err(|_| CUresult::CUDA_ERROR_UNKNOWN)
+        })
+        ?;
+    }
+    copy_async(dst, src, bytesize, hstream)
+}
+
+/// cuMemcpyDtoHAsync_v2.
+pub fn copy_dtoh_async(
+    dst: *mut c_void,
+    src: *const c_void,
+    bytesize: usize,
+    hstream: *mut stream::Stream,
+) -> Result<(), CUresult> {
+    if host_untracked(dst) {
+        // Unpinned host destination: bounce through cached pinned staging.
+        let stage = take_staging(bytesize)?;
+        copy_async(stage.ptr, src, bytesize, hstream)?;
+        GlobalState::lock_stream(hstream, |sd| {
+            sd.synchronize().map_err(|_| CUresult::CUDA_ERROR_UNKNOWN)
+        })??;
+        unsafe { ptr::copy_nonoverlapping(stage.ptr.cast::<u8>(), dst.cast::<u8>(), bytesize) };
+        return Ok(());
+    }
+    copy_async(dst, src, bytesize, hstream)
+}
+
+/// cuMemcpyDtoDAsync_v2.
+pub fn copy_dtod_async(
+    dst: *mut c_void,
+    src: *const c_void,
+    bytesize: usize,
+    hstream: *mut stream::Stream,
+) -> Result<(), CUresult> {
+    copy_async(dst, src, bytesize, hstream)
+}
+
+/// Sync HtoD on the legacy stream; bounces unpinned host sources.
+pub fn copy_htod(
+    dst: *mut c_void,
+    src: *const c_void,
+    bytesize: usize,
+) -> Result<(), CUresult> {
+    // A blocking copy on the legacy stream is ordered against every other
+    // blocking stream, so the work the application queued has to finish
+    // first: the immediate lists are independent queues.
+    GlobalState::synchronize_context_streams()?;
+    if host_untracked(src) {
+        // Unpinned host source: bounce through cached pinned staging.
+        let stage = take_staging(bytesize)?;
+        unsafe { ptr::copy_nonoverlapping(src.cast::<u8>(), stage.ptr.cast::<u8>(), bytesize) };
+        copy_async(dst, stage.ptr, bytesize, stream::CU_STREAM_LEGACY)?;
+    } else {
+        copy_async(dst, src, bytesize, stream::CU_STREAM_LEGACY)?;
+    }
+    stream::synchronize(stream::CU_STREAM_LEGACY)
+}
+
+/// Sync DtoH on the legacy stream; bounces unpinned host destinations.
+pub fn copy_dtoh(
+    dst: *mut c_void,
+    src: *const c_void,
+    bytesize: usize,
+) -> Result<(), CUresult> {
+    GlobalState::synchronize_context_streams()?;
+    if host_untracked(dst) {
+        // Unpinned host destination: bounce through cached pinned staging.
+        let stage = take_staging(bytesize)?;
+        copy_async(stage.ptr, src, bytesize, stream::CU_STREAM_LEGACY)?;
+        stream::synchronize(stream::CU_STREAM_LEGACY)?;
+        unsafe { ptr::copy_nonoverlapping(stage.ptr.cast::<u8>(), dst.cast::<u8>(), bytesize) };
+        Ok(())
+    } else {
+        copy_async(dst, src, bytesize, stream::CU_STREAM_LEGACY)?;
+        stream::synchronize(stream::CU_STREAM_LEGACY)
+    }
+}
+pub fn copy_dtod(dst: *mut c_void, src: *const c_void, bytesize: usize) -> Result<(), CUresult> {
+    copy_async(dst, src, bytesize, stream::CU_STREAM_LEGACY)?;
+    stream::synchronize(stream::CU_STREAM_LEGACY)
+}
+
+    pub fn free_v2(ptr: *mut c_void) -> Result<(), CUresult> {
+    // cuMemFree(NULL) is a no-op on real CUDA; cuBLAS sometimes frees NULL.
+    if ptr.is_null() {
+        return Ok(());
+    }
+    // ZLUDA_LEAK_FREE is a diagnostic: a freed buffer is never handed back to
+    // the driver, so no later allocation can land on it. If a difference
+    // between runs disappears with this on, the allocator was reusing memory
+    // that something still referenced.
+    if std::env::var_os("ZLUDA_LEAK_FREE").is_some() {
+        return Ok(());
+    }
+    // Real CUDA defers unmapping a buffer until queued work touching it
+    // retires; freeing early wedges the engine with a page fault on the
+    // pending DMA (observed as 'engine reset' + all later immediate lists
+    // never executing). Drain all context streams before unmapping.
+    GlobalState::synchronize_context_streams()?;
     GlobalState::lock_current_context(|ctx| {
         let dev = unsafe { &mut *ctx.device };
+        ctx.pointer_registry.unregister(ptr);
         Ok::<_, CUresult>(dev.l0_context.mem_free(ptr)?)
     })
     .map_err(|_| CUresult::CUDA_ERROR_INVALID_VALUE)?
 }
 
-pub(crate) fn set_d32_v2(dst: *mut c_void, mut ui: u32, n: usize) -> Result<(), CUresult> {
-    GlobalState::lock_enqueue(stream::CU_STREAM_LEGACY, |cmd_list, signal, wait| {
-        unsafe {
-            cmd_list.append_memory_fill_raw(
-                dst,
-                &mut ui as *mut _ as *mut _,
-                mem::size_of::<u32>(),
-                mem::size_of::<u32>() * n,
-                Some(signal),
-                wait,
-            )
-        }?;
-        Ok(())
-    })
+/// cuMemPoolCreate: return an opaque dummy handle. ZLUDA allocs bypass pools.
+pub fn pool_create(pool: *mut crate::cuda::CUmemoryPool) -> Result<(), CUresult> {
+    if pool == ptr::null_mut() {
+        return Err(CUresult::CUDA_ERROR_INVALID_VALUE);
+    }
+    static DUMMY_POOL: crate::cuda::CUmemPoolHandle_st = unsafe { mem::zeroed() };
+    unsafe { *pool = &DUMMY_POOL as *const _ as *mut crate::cuda::CUmemPoolHandle_st };
+    Ok(())
 }
 
-pub(crate) fn set_d8_v2(dst: *mut c_void, mut uc: u8, n: usize) -> Result<(), CUresult> {
-    GlobalState::lock_enqueue(stream::CU_STREAM_LEGACY, |cmd_list, signal, wait| {
+pub fn pool_destroy(_pool: crate::cuda::CUmemoryPool) -> Result<(), CUresult> {
+    Ok(())
+}
+
+pub fn get_info_v2(free: *mut usize, total: *mut usize) -> Result<(), CUresult> {
+    if free == ptr::null_mut() || total == ptr::null_mut() {
+        return Err(CUresult::CUDA_ERROR_INVALID_VALUE);
+    }
+    let (free_bytes, total_bytes) = GlobalState::lock_current_context(|ctx| {
+        let dev = unsafe { &mut *ctx.device };
+        let mem_props = dev.get_memory_properties().map_err(|_| CUresult::CUDA_ERROR_UNKNOWN)?;
+        let total_bytes = mem_props.iter().map(|p| p.totalSize).max().unwrap_or(0) as usize;
+        // L0 doesn't expose free memory; report total as free (pessimistic
+        // but avoids apps refusing to run because they think we're out of mem)
+        Ok::<_, CUresult>((total_bytes, total_bytes))
+    })??;
+    unsafe {
+        *free = free_bytes;
+        *total = total_bytes;
+    }
+    Ok(())
+}
+
+pub fn alloc_host_v2(pp: *mut *mut c_void, bytesize: usize) -> Result<(), CUresult> {
+    if pp == ptr::null_mut() {
+        return Err(CUresult::CUDA_ERROR_INVALID_VALUE);
+    }
+    let ptr = GlobalState::lock_current_context_unchecked(|ctx| {
+        let ctx_ptr = ctx as *mut _;
+        let ctx_data = ctx.as_result_mut()?;
+        let dev = unsafe { &mut *ctx_data.device };
+        let ptr = dev.l0_context.mem_alloc_host(bytesize, 0)?;
+        ctx_data.pointer_registry.register(super::pointer::Allocation {
+            base: ptr,
+            size: bytesize,
+            is_host: true,
+            context: ctx_ptr,
+        });
+        Ok::<_, CUresult>(ptr)
+    })??;
+    unsafe { *pp = ptr };
+    Ok(())
+}
+
+pub fn host_alloc(
+    pp: *mut *mut c_void,
+    bytesize: usize,
+    _flags: u32,
+) -> Result<(), CUresult> {
+    // L0 host allocations are directly accessible from the device, so the
+    // CU_MEMHOSTALLOC_* flag combinations collapse to the same allocation.
+    alloc_host_v2(pp, bytesize)
+}
+
+pub fn host_get_device_pointer_v2(
+    pdptr: *mut *mut c_void,
+    p: *mut c_void,
+    _flags: u32,
+) -> Result<(), CUresult> {
+    if pdptr == ptr::null_mut() {
+        return Err(CUresult::CUDA_ERROR_INVALID_VALUE);
+    }
+    // L0 host allocations are directly accessible from the device, so the
+    // device pointer is the host pointer itself.
+    unsafe { *pdptr = p };
+    Ok(())
+}
+
+pub fn host_get_flags(pflags: *mut u32, _p: *mut c_void) -> Result<(), CUresult> {
+    if pflags == ptr::null_mut() {
+        return Err(CUresult::CUDA_ERROR_INVALID_VALUE);
+    }
+    unsafe { *pflags = 0 };
+    Ok(())
+}
+
+pub fn free_host(p: *mut c_void) -> Result<(), CUresult> {
+if p == ptr::null_mut() {
+return Ok(());
+}
+// Real CUDA defers unmapping host-pinned pages until queued DMA touching
+// them retires; L0 unmaps immediately, which faults in-flight copies and
+// wedges the engine. Drain all context streams before freeing.
+GlobalState::synchronize_context_streams()?;
+GlobalState::lock_current_context(|ctx| {
+        let dev = unsafe { &mut *ctx.device };
+        ctx.pointer_registry.unregister(p);
+Ok::<_, CUresult>(dev.l0_context.mem_free(p)?)
+})
+.map_err(|_| CUresult::CUDA_ERROR_INVALID_VALUE)?
+}
+
+/// A fill runs on the stream the caller named, not on the legacy stream: two
+/// streams of this driver are two independent command lists, so a fill that
+/// lands on the wrong one has no ordering relationship with the work that reads
+/// it. The pattern value points at the caller's stack, which is why the fill is
+/// waited for before returning.
+fn set_pattern(
+    dst: *mut c_void,
+    pattern: *mut c_void,
+    pattern_size: usize,
+    size: usize,
+    hstream: *mut stream::Stream,
+) -> Result<(), CUresult> {
+    if hstream == stream::CU_STREAM_LEGACY {
+        // A fill on the legacy stream is ordered against every other stream,
+        // the same way a copy on it is.
+        GlobalState::synchronize_context_streams()?;
+    }
+    GlobalState::lock_enqueue(hstream, |cmd_list, signal, wait| {
         unsafe {
-            cmd_list.append_memory_fill_raw(
-                dst,
-                &mut uc as *mut _ as *mut _,
-                mem::size_of::<u8>(),
-                mem::size_of::<u8>() * n,
-                Some(signal),
-                wait,
-            )
+            cmd_list.append_memory_fill_raw(dst, pattern, pattern_size, size, Some(signal), wait)
         }?;
         Ok(())
-    })
+    })?;
+    stream::synchronize(hstream)
+}
+
+pub(crate) fn set_d32_v2(
+    dst: *mut c_void,
+    mut ui: u32,
+    n: usize,
+    hstream: *mut stream::Stream,
+) -> Result<(), CUresult> {
+    set_pattern(
+        dst,
+        &mut ui as *mut _ as *mut _,
+        mem::size_of::<u32>(),
+        mem::size_of::<u32>() * n,
+        hstream,
+    )
+}
+
+pub(crate) fn set_d8_v2(
+    dst: *mut c_void,
+    mut uc: u8,
+    n: usize,
+    hstream: *mut stream::Stream,
+) -> Result<(), CUresult> {
+    set_pattern(
+        dst,
+        &mut uc as *mut _ as *mut _,
+        mem::size_of::<u8>(),
+        mem::size_of::<u8>() * n,
+        hstream,
+    )
+}
+
+pub(crate) fn set_d16_v2(
+    dst: *mut c_void,
+    mut us: u16,
+    n: usize,
+    hstream: *mut stream::Stream,
+) -> Result<(), CUresult> {
+    set_pattern(
+        dst,
+        &mut us as *mut _ as *mut _,
+        mem::size_of::<u16>(),
+        mem::size_of::<u16>() * n,
+        hstream,
+    )
+}
+
+
+fn src_ptr(mem_type: u32, host: *const c_void, dev: usize) -> *const c_void {
+    // CU_MEMORYTYPE_HOST = 1, CU_MEMORYTYPE_DEVICE = 2
+    if mem_type == 1 {
+        host
+    } else {
+        dev as *const c_void
+    }
+}
+
+fn dst_ptr(mem_type: u32, host: *mut c_void, dev: usize) -> *mut c_void {
+    if mem_type == 1 {
+        host
+    } else {
+        dev as *mut c_void
+    }
+}
+
+/// cuMemcpy2D_v2 / cuMemcpy2DUnaligned_v2 via L0 region copy.
+pub fn memcpy2d(
+    src_x: usize,
+    src_y: usize,
+    src_type: u32,
+    src_host: *const c_void,
+    src_dev: usize,
+    src_pitch: usize,
+    dst_x: usize,
+    dst_y: usize,
+    dst_type: u32,
+    dst_host: *mut c_void,
+    dst_dev: usize,
+    dst_pitch: usize,
+    width: usize,
+    height: usize,
+    hstream: *mut stream::Stream,
+) -> Result<(), CUresult> {
+    let src_base = src_ptr(src_type, src_host, src_dev);
+    let dst_base = dst_ptr(dst_type, dst_host, dst_dev);
+    // Intel's L0 driver mishandles region copies where the destination pitch
+    // is larger than the region width (padded rows come out zeroed). Decompose
+    // into one contiguous copy per row, which is always correct.
+    GlobalState::lock_enqueue(hstream, |cmd_list, signal, wait| {
+        for row in 0..height {
+            let src_row = unsafe { src_base.add((src_y + row) * src_pitch + src_x) };
+            let dst_row = unsafe { dst_base.add((dst_y + row) * dst_pitch + dst_x) };
+            let last = row == height - 1;
+            unsafe {
+                cmd_list.append_memory_copy_raw(
+                    dst_row,
+                    src_row,
+                    width,
+                    if last { Some(signal) } else { None },
+                    wait,
+                )?;
+            }
+        }
+        Ok(())
+    })?;
+    // The sync (legacy-stream) variants must block until the copies complete,
+    // otherwise a follow-up host readback can race the last row.
+    if hstream == stream::CU_STREAM_LEGACY || hstream == stream::CU_STREAM_PER_THREAD {
+        stream::synchronize(hstream)?;
+    }
+    Ok(())
+}
+
+/// cuMemcpy3D_v2 via L0 region copy.
+#[allow(clippy::too_many_arguments)]
+pub fn memcpy3d(
+    src_x: usize,
+    src_y: usize,
+    src_z: usize,
+    src_type: u32,
+    src_host: *const c_void,
+    src_dev: usize,
+    src_pitch: usize,
+    src_height: usize,
+    dst_x: usize,
+    dst_y: usize,
+    dst_z: usize,
+    dst_type: u32,
+    dst_host: *mut c_void,
+    dst_dev: usize,
+    dst_pitch: usize,
+    dst_height: usize,
+    width: usize,
+    height: usize,
+    depth: usize,
+    hstream: *mut stream::Stream,
+) -> Result<(), CUresult> {
+    let src_base = src_ptr(src_type, src_host, src_dev);
+    let dst_base = dst_ptr(dst_type, dst_host, dst_dev);
+    // Decompose into per-row copies (see memcpy2d): Intel's L0 region copy is
+    // unreliable, so a 3D copy is just slices of 2D row loops.
+    let src_slice = src_pitch * src_height;
+    let dst_slice = dst_pitch * dst_height;
+    GlobalState::lock_enqueue(hstream, |cmd_list, signal, wait| {
+        let mut last_signal = None;
+        for z in 0..depth {
+            for row in 0..height {
+                let src_row = unsafe {
+                    src_base.add((src_z + z) * src_slice + (src_y + row) * src_pitch + src_x)
+                };
+                let dst_row = unsafe {
+                    dst_base.add((dst_z + z) * dst_slice + (dst_y + row) * dst_pitch + dst_x)
+                };
+                let is_last = z == depth - 1 && row == height - 1;
+                unsafe {
+                    cmd_list.append_memory_copy_raw(
+                        dst_row,
+                        src_row,
+                        width,
+                        if is_last { Some(signal) } else { None },
+                        wait,
+                    )?;
+                }
+                if is_last {
+                    last_signal = Some(());
+                }
+            }
+        }
+        debug_assert!(last_signal.is_some(), "depth*height must be > 0");
+        Ok(())
+    })?;
+    if hstream == stream::CU_STREAM_LEGACY || hstream == stream::CU_STREAM_PER_THREAD {
+        stream::synchronize(hstream)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

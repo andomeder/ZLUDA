@@ -1,4 +1,4 @@
-use super::{device, stream::Stream, stream::StreamData, HasLivenessCookie, LiveCheck};
+use super::{device, pointer::PointerRegistry, stream::Stream, stream::StreamData, HasLivenessCookie, LiveCheck};
 use super::{CUresult, GlobalState};
 use crate::{cuda::CUcontext, cuda_impl};
 use l0::sys::ze_result_t;
@@ -12,7 +12,28 @@ thread_local! {
     pub static CONTEXT_STACK: RefCell<Vec<*mut Context>> = RefCell::new(Vec::new());
 }
 
+// Process-global fallback context (the primary context). Used when a thread's
+// CONTEXT_STACK is empty (e.g. a worker thread spawned by the runtime that never
+// pushed a context, or the child after fork). cuMemAlloc/cuMemFree and friends
+// rely on a current context; on real CUDA the primary context is the implicit
+// current one for all threads after cuDevicePrimaryCtxRetain.
+static PRIMARY_CONTEXT: std::sync::atomic::AtomicPtr<Context> = std::sync::atomic::AtomicPtr::new(ptr::null_mut());
+
+pub fn set_primary_context(ctx: *mut Context) {
+    PRIMARY_CONTEXT.store(ctx, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn get_primary_context() -> *mut Context {
+    PRIMARY_CONTEXT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub type Context = LiveCheck<ContextData>;
+
+#[derive(Clone, Copy)]
+pub struct LocalStorageEntry {
+    pub value: usize,
+    pub reset_cb: Option<extern "system" fn(CUcontext, *mut std::ffi::c_void, *mut std::ffi::c_void)>,
+}
 
 impl HasLivenessCookie for ContextData {
     #[cfg(target_pointer_width = "64")]
@@ -82,8 +103,9 @@ pub struct ContextData {
     // This pointer is null only for a moment when constructing primary context
     pub device: *mut device::Device,
     ref_count: ContextRefCount,
-    pub default_stream: StreamData,
+pub default_stream: StreamData,
     pub streams: HashSet<*mut StreamData>,
+    pub pointer_registry: PointerRegistry,
     // All the fields below are here to support internal CUDA driver API
     pub cuda_manager: *mut cuda_impl::rt::ContextStateManager,
     pub cuda_state: *mut cuda_impl::rt::ContextState,
@@ -94,6 +116,11 @@ pub struct ContextData {
             *mut cuda_impl::rt::ContextState,
         ),
     >,
+    // Keyed per-context storage backing the CONTEXT_LOCAL_STORAGE dark API
+    // ({put, delete, get}). cudart 12.x stores its per-context runtime state
+    // here and reads it back with the same key; legacy ctor/get_state are not
+    // used by modern runtimes.
+    pub local_storage: std::collections::HashMap<usize, LocalStorageEntry>,
 }
 
 impl ContextData {
@@ -106,19 +133,38 @@ impl ContextData {
         dev: *mut device::Device,
     ) -> Result<Self, CUresult> {
         let default_stream = StreamData::new_unitialized(l0_ctx, l0_dev, host_event)?;
-        Ok(ContextData {
+        // cuBLAS validates the context by reading [ctx+0x80] (cuda_manager) and
+        // checking a non-zero value at [+0x58]. cublasLt also reads deep offsets
+        // like [+0x34c] (a feature/version field used in its handle registry
+        // walk). Allocate a larger dummy block so those reads stay in-bounds,
+        // and seed [+0x58]=1 (the cuBLAS validation check).
+        let mgr = unsafe { std::alloc::alloc(std::alloc::Layout::from_size_align(0x800, 8).unwrap()) };
+        if !mgr.is_null() {
+            unsafe { std::ptr::write_bytes(mgr, 0, 0x800);
+                std::ptr::write_unaligned((mgr as *mut u64).add(0x58 / 8), 1u64);
+                std::ptr::write_unaligned((mgr as *mut u32).add(0x34c / 4), 0u32); };
+        }
+        let result = ContextData {
             flags: AtomicU32::new(flags),
             device: dev,
             ref_count: ContextRefCount::new(is_primary),
             default_stream,
             streams: HashSet::new(),
-            cuda_manager: ptr::null_mut(),
-            cuda_state: ptr::null_mut(),
+            pointer_registry: PointerRegistry::new(),
+            cuda_manager: mgr.cast(),
+            // Point cuda_state at the same dummy block as cuda_manager: cuBLAS's
+            // context_local_storage_get_state only checks non-NULL here (it does
+            // not dereference the state), and the dummy block satisfies the
+            // [+0x58] validation. This covers the child process after fork where
+            // the runtime's context_local_storage_ctor may not run for the new
+            // context, leaving cuda_state NULL and breaking cublasCreate.
+            cuda_state: mgr.cast(),
             cuda_dtor_cb: None,
-        })
+            local_storage: std::collections::HashMap::new(),
+        };
+        Ok(result)
     }
 }
-
 impl Context {
     pub fn late_init(&mut self) {
         let ctx_data = self.as_option_mut().unwrap();

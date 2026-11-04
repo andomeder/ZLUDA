@@ -2,9 +2,66 @@ use super::{
     context::{Context, ContextData},
     CUresult, GlobalState,
 };
-use std::{collections::VecDeque, mem, ptr};
+use std::{
+    collections::VecDeque,
+    ffi::c_void,
+    mem,
+    ptr,
+    sync::Mutex,
+};
 
 use super::{HasLivenessCookie, LiveCheck};
+
+/// The name of the kernel that was launched most recently, for diagnostics
+/// only: when a synchronize never completes, the kernel that is still running
+/// is the one that named itself last.
+static LAST_KERNEL: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn remember_launched_kernel(name: &str) {
+    if let Ok(mut last) = LAST_KERNEL.lock() {
+        *last = Some(name.to_string());
+    }
+    if let Ok(mut guard) = PENDING_OPS.lock() {
+        let queue = guard.get_or_insert_with(VecDeque::new);
+        if queue.len() < 64 {
+            queue.push_back(name.to_string());
+        }
+    }
+}
+
+/// The kernels enqueued since the last synchronize that completed, oldest
+/// first: the oldest one is the operation that never retired.
+static PENDING_OPS: Mutex<Option<VecDeque<String>>> = Mutex::new(None);
+
+fn pending_kernels() -> Vec<String> {
+    let mut guard = match PENDING_OPS.lock() {
+        Ok(g) => g,
+        Err(_) => return Vec::new(),
+    };
+    let queue = guard.get_or_insert_with(VecDeque::new);
+    queue.iter().take(3).cloned().collect()
+}
+
+fn clear_pending_kernels() {
+    if let Ok(mut guard) = PENDING_OPS.lock() {
+        if let Some(queue) = guard.as_mut() {
+            queue.clear();
+        }
+    }
+}
+
+fn last_launched_kernel() -> String {
+    LAST_KERNEL
+        .lock()
+        .ok()
+        .and_then(|last| last.clone())
+        .unwrap_or_default()
+}
+
+fn transmute_lifetime<T>(x: &T) -> &'static T {
+    unsafe { mem::transmute(x) }
+}
+
 
 pub type Stream = LiveCheck<StreamData>;
 
@@ -32,13 +89,14 @@ impl HasLivenessCookie for StreamData {
 }
 
 pub struct StreamData {
-    pub context: *mut ContextData,
-    // Immediate CommandList
-    pub cmd_list: l0::CommandList<'static>,
-    pub busy_events: VecDeque<(l0::Event<'static>, u64)>,
-    // This could be a Vec, but I'd rather reuse earliest enqueued event not the one recently enqueued
-    pub free_events: VecDeque<(l0::Event<'static>, u64)>,
+pub context: *mut ContextData,
+// Immediate CommandList
+pub cmd_list: l0::CommandList<'static>,
+pub busy_events: VecDeque<(l0::Event<'static>, u64)>,
+// This could be a Vec, but I'd rather reuse earliest enqueued event not the one recently enqueued
+pub free_events: VecDeque<(l0::Event<'static>, u64)>,
     pub synchronization_event: (l0::Event<'static>, u64),
+    pub flags: u32,
 }
 
 impl StreamData {
@@ -53,20 +111,23 @@ impl StreamData {
             busy_events: VecDeque::new(),
             free_events: VecDeque::new(),
             synchronization_event: host_event,
-        })
+            flags: 0,
+    })
     }
-    pub fn new(ctx: &mut ContextData) -> Result<Self, CUresult> {
+    pub fn new(ctx: &mut ContextData, flags: u32) -> Result<Self, CUresult> {
         let l0_ctx = &mut unsafe { &mut *ctx.device }.l0_context;
         let device = unsafe { &*ctx.device }.base;
         let synchronization_event = unsafe { &mut *ctx.device }
             .host_event_pool
             .get(device, l0_ctx)?;
+        let cmd_list = l0::CommandList::new_immediate(l0_ctx, device)?;
         Ok(StreamData {
             context: ctx as *mut _,
-            cmd_list: l0::CommandList::new_immediate(l0_ctx, device)?,
+            cmd_list,
             busy_events: VecDeque::new(),
             free_events: VecDeque::new(),
             synchronization_event,
+            flags,
         })
     }
 
@@ -105,17 +166,46 @@ impl StreamData {
     }
 
     pub fn synchronize(&mut self) -> l0::Result<()> {
+        let trace = std::env::var_os("ZLUDA_TRACE_STREAM").is_some();
         let empty = [];
         let busy_event_arr = self.busy_events.back().map(|(ev, _)| [ev]);
         let wait_events = busy_event_arr.as_ref().map_or(&empty[..], |arr| &arr[..]);
         unsafe {
-            self.cmd_list
-                .append_barrier(Some(&self.synchronization_event.0), wait_events)?
+            if let Err(e) = self
+                .cmd_list
+                .append_barrier(Some(&self.synchronization_event.0), wait_events)
+            {
+                if trace {
+                    eprintln!("stream sync: append_barrier -> {:?}", e);
+                }
+                return Err(e);
+            }
         };
-        self.synchronization_event
+        if let Err(e) = self
+            .synchronization_event
             .0
-            .host_synchronize(u64::max_value())?;
+            .host_synchronize(60_000_000_000)
+        {
+            if trace {
+                let last_ready = self
+                    .busy_events
+                    .back()
+                    .map(|(ev, _)| ev.is_ready().map(|r| r).unwrap_or(false));
+                let sync_ready = self.synchronization_event.0.is_ready().unwrap_or(false);
+                eprintln!(
+                    "stream sync: host_synchronize -> {:?} (busy {}, last busy ready {:?}, sync event ready {}, last kernel {})",
+                    e,
+                    self.busy_events.len(),
+                    last_ready,
+                    sync_ready,
+                    last_launched_kernel()
+                );
+                eprintln!("stream sync: oldest pending kernels {:?}", pending_kernels());
+            }
+            return Err(e);
+        }
         self.synchronization_event.0.host_reset()?;
+        clear_pending_kernels();
         self.reuse_all_finished_events()?;
         Ok(())
     }
@@ -160,9 +250,9 @@ pub(crate) fn get_ctx(hstream: *mut Stream, pctx: *mut *mut Context) -> Result<(
     Ok(())
 }
 
-pub(crate) fn create(phstream: *mut *mut Stream, _flags: u32) -> Result<(), CUresult> {
-    let stream_ptr = GlobalState::lock_current_context(|ctx| {
-        let mut stream_box = Box::new(Stream::new(StreamData::new(ctx)?));
+pub(crate) fn create(phstream: *mut *mut Stream, flags: u32) -> Result<(), CUresult> {
+        let stream_ptr = GlobalState::lock_current_context(|ctx| {
+        let mut stream_box = Box::new(Stream::new(StreamData::new(ctx, flags)?));
         let stream_ptr = stream_box.as_mut().as_option_mut().unwrap() as *mut _;
         if !ctx.streams.insert(stream_ptr) {
             return Err(CUresult::CUDA_ERROR_UNKNOWN);
@@ -183,7 +273,78 @@ pub(crate) fn destroy_v2(pstream: *mut Stream) -> Result<(), CUresult> {
 }
 
 pub(crate) fn synchronize(pstream: *mut Stream) -> Result<(), CUresult> {
-    GlobalState::lock_stream(pstream, |stream_data| Ok(stream_data.synchronize()?))?
+GlobalState::lock_stream(pstream, |stream_data| Ok(stream_data.synchronize()?))?
+}
+
+pub(crate) fn query(pstream: *mut Stream) -> Result<(), CUresult> {
+// Returns SUCCESS if all work in the stream has completed, NOT_READY
+// otherwise. We check the last busy event.
+let ready = GlobalState::lock_stream(pstream, |stream_data| {
+stream_data.try_reuse_finished_events().map_err(|_| CUresult::CUDA_ERROR_UNKNOWN)?;
+Ok::<_, CUresult>(stream_data.busy_events.is_empty())
+})??;
+if ready {
+Ok(())
+} else {
+Err(CUresult::CUDA_ERROR_NOT_READY)
+}
+}
+
+pub(crate) fn get_flags(pstream: *mut Stream, flags: *mut u32) -> Result<(), CUresult> {
+    if flags == ptr::null_mut() {
+        return Err(CUresult::CUDA_ERROR_INVALID_VALUE);
+    }
+    let stored = GlobalState::lock_stream(pstream, |stream_data| stream_data.flags)?;
+    unsafe { *flags = stored };
+    Ok(())
+}
+
+pub(crate) fn wait_event(
+    pstream: *mut Stream,
+    hevent: *mut super::event::Event,
+    _flags: u32,
+) -> Result<(), CUresult> {
+    if hevent == ptr::null_mut() {
+        return Ok(());
+    }
+    // Enqueue a barrier that waits on the event's L0 signal. The stream's
+    // subsequent work will only run after the event fires.
+    GlobalState::lock_stream(pstream, |stream_data| {
+        let l0_ev = unsafe { &*hevent }.as_result()?.l0_event();
+        let ev = match l0_ev {
+            Some(e) => e,
+            None => return Ok::<(), CUresult>(()),
+        };
+        let cmd_list = unsafe { transmute_lifetime(&stream_data.cmd_list) };
+        unsafe {
+            cmd_list.append_barrier(None, &[ev])?;
+        }
+        Ok(())
+    })?
+}
+
+pub(crate) fn add_callback(
+    pstream: *mut Stream,
+    callback: super::super::cuda::CUstreamCallback,
+    user_data: *mut c_void,
+    _flags: u32,
+) -> Result<(), CUresult> {
+    let cb = match callback {
+        Some(cb) => cb,
+        None => return Err(CUresult::CUDA_ERROR_INVALID_VALUE),
+    };
+    // L0 has no host-callback primitive; the closest semantics is: after all
+    // currently-enqueued work in the stream completes, invoke the callback
+    // from the host. We synchronize the stream, then call back.
+    GlobalState::lock_stream(pstream, |stream_data| Ok::<(), CUresult>(stream_data.synchronize()?))??;
+    unsafe {
+        cb(
+            pstream as *mut _,
+            CUresult::CUDA_SUCCESS,
+            user_data,
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]

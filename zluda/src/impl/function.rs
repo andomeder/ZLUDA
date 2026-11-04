@@ -29,6 +29,8 @@ pub struct FunctionData {
     pub use_shared_mem: bool,
     pub properties: Option<Box<l0::sys::ze_kernel_properties_t>>,
     pub legacy_args: LegacyArguments,
+    /// The name the kernel was looked up with, for the launch trace.
+    pub name: std::ffi::CString,
 }
 
 pub struct LegacyArguments {
@@ -75,20 +77,58 @@ pub fn launch_kernel(
     kernel_params: *mut *mut c_void,
     extra: *mut *mut c_void,
 ) -> Result<(), CUresult> {
+    let trace = std::env::var_os("ZLUDA_TRACE_FUNC").is_some();
     if f == ptr::null_mut()
         || (kernel_params == ptr::null_mut() && extra == ptr::null_mut())
         || (kernel_params != ptr::null_mut() && extra != ptr::null_mut())
     {
+        if trace {
+            eprintln!(
+                "launch_kernel: bad arguments f={:?} kernel_params={:?} extra={:?}",
+                f, kernel_params, extra
+            );
+        }
         return Err(CUresult::CUDA_ERROR_INVALID_VALUE);
     }
+    if trace {
+        if let Ok(func) = unsafe { &mut *f }.as_result_mut() {
+            eprintln!(
+                "launch_kernel: {} grid=({},{},{}) block=({},{},{}) shared={}",
+                func.name.to_string_lossy(),
+                grid_dim_x,
+                grid_dim_y,
+                grid_dim_z,
+                block_dim_x,
+                block_dim_y,
+                block_dim_z,
+                shared_mem_bytes
+            );
+        }
+    }
     GlobalState::lock_enqueue(hstream, |cmd_list, signal, wait| {
-        let func: &mut FunctionData = unsafe { &mut *f }.as_result_mut()?;
+        let func: &mut FunctionData = match unsafe { &mut *f }.as_result_mut() {
+            Ok(func) => func,
+            Err(e) => {
+                if trace {
+                    eprintln!("launch_kernel: handle {:?} is not a live function: {:?}", f, e);
+                }
+                return Err(e);
+            }
+        };
         if kernel_params != ptr::null_mut() {
             for (i, arg_size) in func.arg_size.iter().enumerate() {
-                unsafe {
+                if let Err(e) = unsafe {
                     func.base
-                        .set_arg_raw(i as u32, *arg_size, *kernel_params.add(i))?
-                };
+                        .set_arg_raw(i as u32, *arg_size, *kernel_params.add(i))
+                } {
+                    if trace {
+                        eprintln!(
+                            "launch_kernel: set_arg_raw({}, {}) failed: {:?}",
+                            i, arg_size, e
+                        );
+                    }
+                    return Err(e.into());
+                }
             }
         } else {
             let mut offset = 0;
@@ -103,7 +143,12 @@ pub fn launch_kernel(
                     CU_LAUNCH_PARAM_BUFFER_SIZE => {
                         buffer_size = Some(unsafe { *(*extra.add(offset + 1) as *mut usize) });
                     }
-                    _ => return Err(CUresult::CUDA_ERROR_INVALID_VALUE),
+                    _ => {
+                        if trace {
+                            eprintln!("launch_kernel: unknown launch parameter");
+                        }
+                        return Err(CUresult::CUDA_ERROR_INVALID_VALUE);
+                    }
                 }
                 offset += 2;
             }
@@ -114,6 +159,12 @@ pub fn launch_kernel(
                             size_of_arg + round_up_to_multiple(offset, *size_of_arg)
                         });
                     if buffer_size < sum_of_kernel_argument_sizes {
+                        if trace {
+                            eprintln!(
+                                "launch_kernel: buffer too small {} < {}",
+                                buffer_size, sum_of_kernel_argument_sizes
+                            );
+                        }
                         return Err(CUresult::CUDA_ERROR_INVALID_VALUE);
                     }
                     let mut offset = 0;
@@ -141,19 +192,46 @@ pub fn launch_kernel(
                 )?
             };
         }
-        func.base
-            .set_group_size(block_dim_x, block_dim_y, block_dim_z)?;
+        if let Err(e) = func.base.set_group_size(block_dim_x, block_dim_y, block_dim_z) {
+            if trace {
+                eprintln!(
+                    "launch_kernel: set_group_size({}, {}, {}) failed: {:?}",
+                    block_dim_x, block_dim_y, block_dim_z, e
+                );
+            }
+            return Err(e.into());
+        }
         func.legacy_args.reset();
         unsafe {
-            cmd_list.append_launch_kernel(
+            if let Err(e) = cmd_list.append_launch_kernel(
                 &mut func.base,
                 &[grid_dim_x, grid_dim_y, grid_dim_z],
                 Some(signal),
                 wait,
-            )?;
+            ) {
+                if trace {
+                    eprintln!(
+                        "launch_kernel: append_launch_kernel grid ({}, {}, {}) failed: {:?}",
+                        grid_dim_x, grid_dim_y, grid_dim_z, e
+                    );
+                }
+                return Err(e.into());
+            }
         }
         Ok::<_, CUresult>(())
-    })
+    })?;
+    // ZLUDA_SYNC_LAUNCH makes every launch block until it retires. It is a
+    // diagnostic: a difference between running with it and without it is the
+    // difference between a missing ordering and a wrong value.
+    if std::env::var_os("ZLUDA_TRACE_STREAM").is_some() {
+        if let Ok(func) = unsafe { &mut *f }.as_result_mut() {
+            super::stream::remember_launched_kernel(&func.name.to_string_lossy());
+        }
+    }
+    if std::env::var_os("ZLUDA_SYNC_LAUNCH").is_some() {
+        crate::r#impl::stream::synchronize(hstream)?;
+    }
+    Ok(())
 }
 
 fn round_up_to_multiple(x: usize, multiple: usize) -> usize {
@@ -168,17 +246,74 @@ pub(crate) fn get_attribute(
     if pi == ptr::null_mut() || func == ptr::null_mut() {
         return Err(CUresult::CUDA_ERROR_INVALID_VALUE);
     }
-    match attrib {
-        CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK => {
-            let max_threads = GlobalState::lock_function(func, |func| {
-                let props = func.get_properties()?;
-                Ok::<_, CUresult>(props.maxSubgroupSize * props.maxNumSubgroups)
-            })??;
-            unsafe { *pi = max_threads as i32 };
-            Ok(())
-        }
-        _ => Err(CUresult::CUDA_ERROR_NOT_SUPPORTED),
+    let trace = std::env::var_os("ZLUDA_TRACE_FUNC").is_some();
+    let value = GlobalState::lock_function(func, |func| {
+        let props = match func.get_properties() {
+            Ok(p) => p,
+            Err(e) => {
+                if trace {
+                    eprintln!("cuFuncGetAttribute: kernel properties failed: {:?}", e);
+                }
+                return Err(CUresult::from(e));
+            }
+        };
+        Ok::<_, CUresult>(match attrib {
+            CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK => {
+                props.maxSubgroupSize * props.maxNumSubgroups
+            }
+            CUfunction_attribute::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES => props.localMemSize,
+            CUfunction_attribute::CU_FUNC_ATTRIBUTE_CONST_SIZE_BYTES => 0,
+            CUfunction_attribute::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES => props.privateMemSize,
+            CUfunction_attribute::CU_FUNC_ATTRIBUTE_NUM_REGS => 0,
+            CUfunction_attribute::CU_FUNC_ATTRIBUTE_PTX_VERSION => 80,
+            CUfunction_attribute::CU_FUNC_ATTRIBUTE_BINARY_VERSION => 80,
+            CUfunction_attribute::CU_FUNC_ATTRIBUTE_CACHE_MODE_CA => 0,
+            CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES => {
+                props.localMemSize
+            }
+            CUfunction_attribute::CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT => {
+                props.localMemSize
+            }
+            CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX => 0,
+            // Attributes ZLUDA does not model (the cluster scheduling ones,
+            // for instance) read as zero, the way CUDA reports the attributes
+            // that do not apply to a kernel. Returning "not supported" here
+            // breaks cudaFuncGetAttributes, which fills a whole struct.
+            _ => 0,
+        })
+    })??;
+    if trace {
+        eprintln!("cuFuncGetAttribute(attr={:?}) -> {}", attrib, value);
     }
+    unsafe { *pi = value as i32 };
+    Ok(())
+}
+
+pub(crate) fn set_attribute(
+    func: *mut Function,
+    attrib: CUfunction_attribute,
+    value: i32,
+) -> Result<(), CUresult> {
+    if func == ptr::null_mut() || value < 0 {
+        return Err(CUresult::CUDA_ERROR_INVALID_VALUE);
+    }
+    GlobalState::lock_function(func, |func| -> Result<(), CUresult> {
+        match attrib {
+            // The L0 driver sizes dynamic shared memory per-launch via the
+            // sharedMemBytes argument to cuLaunchKernel, so the setter has no
+            // per-function state to persist.
+            CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES
+            | CUfunction_attribute::CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT => {
+                Ok(())
+            }
+            // Unknown/advisory attributes (cluster dims, cache prefs,
+            // scheduling policy...) are safe to accept-and-ignore on our
+            // single-die in-order queues; rejecting them breaks runtimes
+            // that probe-set them unconditionally (e.g. MAX).
+            _ => Ok(())
+        }
+    })??;
+    Ok(())
 }
 
 pub(crate) fn set_block_shape(func: *mut Function, x: i32, y: i32, z: i32) -> Result<(), CUresult> {

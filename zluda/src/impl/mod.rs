@@ -1,5 +1,8 @@
 use crate::{
-    cuda::{CUctx_st, CUdevice, CUdeviceptr, CUfunc_st, CUmod_st, CUresult, CUstream_st},
+    cuda::{
+        CUctx_st, CUdevice, CUdeviceptr, CUevent_st, CUfunc_st, CUkern_st, CUlib_st, CUmod_st,
+        CUresult, CUstream_st,
+    },
     r#impl::device::Device,
 };
 use std::{
@@ -18,12 +21,19 @@ pub mod context;
 pub mod device;
 pub mod export_table;
 pub mod function;
+pub mod library;
 pub mod memory;
 pub mod module;
+pub(crate) mod occupancy;
+mod ptx_split;
 #[cfg_attr(windows, path = "os_win.rs")]
 #[cfg_attr(not(windows), path = "os_unix.rs")]
 pub(crate) mod os;
 pub mod stream;
+pub mod driver_proc_address;
+pub mod event;
+pub mod fatbin;
+pub mod pointer;
 
 #[cfg(debug_assertions)]
 pub fn unimplemented() -> CUresult {
@@ -32,6 +42,9 @@ pub fn unimplemented() -> CUresult {
 
 #[cfg(not(debug_assertions))]
 pub fn unimplemented() -> CUresult {
+    if std::env::var_os("ZLUDA_TRACE_STUBS").is_some() {
+        eprintln!("unimplemented entry point called");
+    }
     CUresult::CUDA_ERROR_NOT_SUPPORTED
 }
 
@@ -136,6 +149,11 @@ impl<T: CudaRepr> Decuda<*mut T::Impl> for *mut T {
 
 impl From<l0::sys::ze_result_t> for CUresult {
     fn from(result: l0::sys::ze_result_t) -> Self {
+        if result != l0::sys::ze_result_t::ZE_RESULT_SUCCESS
+            && std::env::var_os("ZLUDA_TRACE_L0").is_some()
+        {
+            eprintln!("level zero returned {}", result.0);
+        }
         match result {
             l0::sys::ze_result_t::ZE_RESULT_SUCCESS => CUresult::CUDA_SUCCESS,
             l0_sys::ze_result_t::ZE_RESULT_ERROR_UNINITIALIZED => {
@@ -248,11 +266,22 @@ impl GlobalState {
         f: F,
     ) -> Result<R, CUresult> {
         context::CONTEXT_STACK.with(|stack| {
-            stack
-                .borrow_mut()
-                .last_mut()
-                .ok_or(CUresult::CUDA_ERROR_INVALID_CONTEXT)
-                .map(|ctx| GlobalState::lock(|_| f(unsafe { &mut **ctx })))?
+            let mut stack = stack.borrow_mut();
+            let ctx = match stack.last_mut() {
+                Some(ctx) => ctx,
+                None => {
+                    // Thread has no pushed context (worker thread / child after
+                    // fork). Fall back to the process-global primary context so
+                    // cuMemFree/cuMemAlloc etc. still work, matching real CUDA's
+                    // implicit-primary-context behavior.
+                    let primary = context::get_primary_context();
+                    if primary.is_null() {
+                        return Err(CUresult::CUDA_ERROR_INVALID_CONTEXT);
+                    }
+                    return GlobalState::lock(|_| f(unsafe { &mut *primary }));
+                }
+            };
+            GlobalState::lock(|_| f(unsafe { &mut **ctx }))
         })
     }
 
@@ -271,6 +300,25 @@ impl GlobalState {
                 Ok(f(stream))
             })?
         }
+    }
+
+    /// Drain every stream of the current context (default + all created).
+    /// Safe to call while holding the global lock (StreamData::synchronize
+    /// takes no locks of its own); must NOT be called with another
+    /// lock_current_context/lock_stream closure active on this thread.
+    pub(crate) fn synchronize_context_streams() -> Result<(), CUresult> {
+        Self::lock_current_context(|ctx| {
+            // A drain that timed out has to be reported: its callers unmap
+            // memory afterwards, and unmapping memory that a queued kernel
+            // still references resets the execution queue.
+            ctx.default_stream.synchronize()?;
+            for s in ctx.streams.iter() {
+                let stream_data = unsafe { &mut **s };
+                stream_data.synchronize()?;
+            }
+            Ok::<_, CUresult>(())
+        })??;
+        Ok(())
     }
 
     fn lock_enqueue(
@@ -351,6 +399,66 @@ macro_rules! stringify_curesult {
             _ => None
         }
     }
+}
+
+pub(crate) fn get_error_name(error: CUresult, str: *mut *const i8) -> CUresult {
+    if str == ptr::null_mut() {
+        return CUresult::CUDA_ERROR_INVALID_VALUE;
+    }
+    let text = match error {
+        CUresult::CUDA_SUCCESS => "CUDA_SUCCESS",
+        CUresult::CUDA_ERROR_INVALID_VALUE => "CUDA_ERROR_INVALID_VALUE",
+        CUresult::CUDA_ERROR_OUT_OF_MEMORY => "CUDA_ERROR_OUT_OF_MEMORY",
+        CUresult::CUDA_ERROR_NOT_INITIALIZED => "CUDA_ERROR_NOT_INITIALIZED",
+        CUresult::CUDA_ERROR_INVALID_DEVICE => "CUDA_ERROR_INVALID_DEVICE",
+        CUresult::CUDA_ERROR_INVALID_IMAGE => "CUDA_ERROR_INVALID_IMAGE",
+        CUresult::CUDA_ERROR_INVALID_CONTEXT => "CUDA_ERROR_INVALID_CONTEXT",
+        CUresult::CUDA_ERROR_NOT_FOUND => "CUDA_ERROR_NOT_FOUND",
+        CUresult::CUDA_ERROR_NOT_READY => "CUDA_ERROR_NOT_READY",
+        CUresult::CUDA_ERROR_LAUNCH_FAILED => "CUDA_ERROR_LAUNCH_FAILED",
+        CUresult::CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES => {
+            "CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES"
+        }
+        CUresult::CUDA_ERROR_INVALID_PTX => "CUDA_ERROR_INVALID_PTX",
+        CUresult::CUDA_ERROR_UNKNOWN => "CUDA_ERROR_UNKNOWN",
+        CUresult::CUDA_ERROR_NOT_SUPPORTED => "CUDA_ERROR_NOT_SUPPORTED",
+        CUresult::CUDA_ERROR_ILLEGAL_STATE => "CUDA_ERROR_ILLEGAL_STATE",
+        CUresult::CUDA_ERROR_INVALID_HANDLE => "CUDA_ERROR_INVALID_HANDLE",
+        CUresult::CUDA_ERROR_FILE_NOT_FOUND => "CUDA_ERROR_FILE_NOT_FOUND",
+        CUresult::CUDA_ERROR_SHARED_OBJECT_SYMBOL_NOT_FOUND => {
+            "CUDA_ERROR_SHARED_OBJECT_SYMBOL_NOT_FOUND"
+        }
+        CUresult::CUDA_ERROR_NO_BINARY_FOR_GPU => "CUDA_ERROR_NO_BINARY_FOR_GPU",
+        CUresult::CUDA_ERROR_DEINITIALIZED => "CUDA_ERROR_DEINITIALIZED",
+        _ => "CUDA_ERROR_UNKNOWN",
+    };
+    // The names are static, NUL terminated strings.
+    let text: &'static [u8] = match text {
+        "CUDA_SUCCESS" => b"CUDA_SUCCESS\0",
+        "CUDA_ERROR_INVALID_VALUE" => b"CUDA_ERROR_INVALID_VALUE\0",
+        "CUDA_ERROR_OUT_OF_MEMORY" => b"CUDA_ERROR_OUT_OF_MEMORY\0",
+        "CUDA_ERROR_NOT_INITIALIZED" => b"CUDA_ERROR_NOT_INITIALIZED\0",
+        "CUDA_ERROR_INVALID_DEVICE" => b"CUDA_ERROR_INVALID_DEVICE\0",
+        "CUDA_ERROR_INVALID_IMAGE" => b"CUDA_ERROR_INVALID_IMAGE\0",
+        "CUDA_ERROR_INVALID_CONTEXT" => b"CUDA_ERROR_INVALID_CONTEXT\0",
+        "CUDA_ERROR_NOT_FOUND" => b"CUDA_ERROR_NOT_FOUND\0",
+        "CUDA_ERROR_NOT_READY" => b"CUDA_ERROR_NOT_READY\0",
+        "CUDA_ERROR_LAUNCH_FAILED" => b"CUDA_ERROR_LAUNCH_FAILED\0",
+        "CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES" => b"CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES\0",
+        "CUDA_ERROR_INVALID_PTX" => b"CUDA_ERROR_INVALID_PTX\0",
+        "CUDA_ERROR_NOT_SUPPORTED" => b"CUDA_ERROR_NOT_SUPPORTED\0",
+        "CUDA_ERROR_ILLEGAL_STATE" => b"CUDA_ERROR_ILLEGAL_STATE\0",
+        "CUDA_ERROR_INVALID_HANDLE" => b"CUDA_ERROR_INVALID_HANDLE\0",
+        "CUDA_ERROR_FILE_NOT_FOUND" => b"CUDA_ERROR_FILE_NOT_FOUND\0",
+        "CUDA_ERROR_SHARED_OBJECT_SYMBOL_NOT_FOUND" => {
+            b"CUDA_ERROR_SHARED_OBJECT_SYMBOL_NOT_FOUND\0"
+        }
+        "CUDA_ERROR_NO_BINARY_FOR_GPU" => b"CUDA_ERROR_NO_BINARY_FOR_GPU\0",
+        "CUDA_ERROR_DEINITIALIZED" => b"CUDA_ERROR_DEINITIALIZED\0",
+        _ => b"CUDA_ERROR_UNKNOWN\0",
+    };
+    unsafe { *str = text.as_ptr() as *const i8 };
+    CUresult::CUDA_SUCCESS
 }
 
 pub(crate) fn get_error_string(error: CUresult, str: *mut *const i8) -> CUresult {
@@ -486,10 +594,22 @@ impl<'a> CudaRepr for CUmod_st {
     type Impl = module::Module;
 }
 
+impl<'a> CudaRepr for CUlib_st {
+    type Impl = library::Library;
+}
+
+impl<'a> CudaRepr for CUkern_st {
+    type Impl = library::Kernel;
+}
+
 impl<'a> CudaRepr for CUfunc_st {
     type Impl = function::Function;
 }
 
 impl<'a> CudaRepr for CUstream_st {
     type Impl = stream::Stream;
+}
+
+impl<'a> CudaRepr for CUevent_st {
+    type Impl = event::Event;
 }

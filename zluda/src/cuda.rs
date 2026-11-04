@@ -21,10 +21,29 @@ pub struct CUctx_st {
 pub type CUcontext = *mut CUctx_st;
 #[repr(C)]
 #[derive(Copy, Clone)]
+pub struct CUmemPoolHandle_st {
+    _unused: [u8; 0],
+}
+pub type CUmemoryPool = *mut CUmemPoolHandle_st;
+
+#[repr(C)]
+#[derive(Copy, Clone)]
 pub struct CUmod_st {
     _unused: [u8; 0],
 }
 pub type CUmodule = *mut CUmod_st;
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CUlib_st {
+    _unused: [u8; 0],
+}
+pub type CUlibrary = *mut CUlib_st;
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CUkern_st {
+    _unused: [u8; 0],
+}
+pub type CUkernel = *mut CUkern_st;
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct CUfunc_st {
@@ -67,6 +86,30 @@ pub struct CUstream_st {
     _unused: [u8; 0],
 }
 pub type CUstream = *mut CUstream_st;
+
+// CUDA 12.4+ extended launch config (used by cuLaunchKernelEx).
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CUlaunchAttribute_st {
+    _unused: [u8; 0],
+}
+
+pub type CUlaunchAttribute = CUlaunchAttribute_st;
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CUlaunchConfig {
+    pub gridDimX: ::std::os::raw::c_uint,
+    pub gridDimY: ::std::os::raw::c_uint,
+    pub gridDimZ: ::std::os::raw::c_uint,
+    pub blockDimX: ::std::os::raw::c_uint,
+    pub blockDimY: ::std::os::raw::c_uint,
+    pub blockDimZ: ::std::os::raw::c_uint,
+    pub sharedMemBytes: ::std::os::raw::c_uint,
+    pub hStream: CUstream,
+    pub attrs: *mut CUlaunchAttribute,
+    pub numAttrs: ::std::os::raw::c_uint,
+}
+
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct CUgraphicsResource_st {
@@ -1468,6 +1511,11 @@ impl cudaError_enum {
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct cudaError_enum(pub ::std::os::raw::c_uint);
 pub use self::cudaError_enum as CUresult;
+
+#[repr(transparent)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct CUdriverProcAddressQueryResult(pub ::std::os::raw::c_uint);
+
 impl CUdevice_P2PAttribute_enum {
     pub const CU_DEVICE_P2P_ATTRIBUTE_PERFORMANCE_RANK: CUdevice_P2PAttribute_enum =
         CUdevice_P2PAttribute_enum(1);
@@ -2194,7 +2242,7 @@ pub extern "system" fn cuGetErrorName(
     error: CUresult,
     pStr: *mut *const ::std::os::raw::c_char,
 ) -> CUresult {
-    r#impl::unimplemented()
+    r#impl::get_error_name(error, pStr as *mut *const i8).encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -2250,6 +2298,26 @@ pub extern "system" fn cuDeviceTotalMem_v2(bytes: *mut usize, dev: CUdevice) -> 
 }
 
 #[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuDeviceTotalMem(bytes: *mut usize, dev: CUdevice) -> CUresult {
+    r#impl::device::total_mem_v2(bytes, dev.decuda()).encuda()
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuDeviceGetDefaultMemPool(pool_out: *mut CUmemoryPool, dev: CUdevice) -> CUresult {
+    r#impl::device::get_default_mem_pool(pool_out, dev.decuda()).encuda()
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuDeviceGetMemPool(pool: *mut CUmemoryPool, dev: CUdevice) -> CUresult {
+    r#impl::device::get_default_mem_pool(pool, dev.decuda()).encuda()
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuDeviceSetMemPool(_dev: CUdevice, _pool: CUmemoryPool) -> CUresult {
+    CUresult::CUDA_SUCCESS
+}
+
+#[cfg_attr(not(test), no_mangle)]
 pub extern "system" fn cuDeviceGetAttribute(
     pi: *mut ::std::os::raw::c_int,
     attrib: CUdevice_attribute,
@@ -2269,7 +2337,7 @@ pub extern "system" fn cuDeviceGetNvSciSyncAttributes(
 
 #[cfg_attr(not(test), no_mangle)]
 pub extern "system" fn cuDeviceGetProperties(prop: *mut CUdevprop, dev: CUdevice) -> CUresult {
-    r#impl::unimplemented()
+    r#impl::device::get_properties(prop, dev.decuda()).encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -2278,7 +2346,7 @@ pub extern "system" fn cuDeviceComputeCapability(
     minor: *mut ::std::os::raw::c_int,
     dev: CUdevice,
 ) -> CUresult {
-    r#impl::unimplemented()
+    r#impl::device::compute_capability(major, minor, dev.decuda()).encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -2341,7 +2409,21 @@ pub extern "system" fn cuCtxCreate_v2(
 }
 
 #[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuCtxCreate(
+    pctx: *mut CUcontext,
+    flags: ::std::os::raw::c_uint,
+    dev: CUdevice,
+) -> CUresult {
+    r#impl::context::create_v2(pctx.decuda(), flags, dev.decuda()).encuda()
+}
+
+#[cfg_attr(not(test), no_mangle)]
 pub extern "system" fn cuCtxDestroy_v2(ctx: CUcontext) -> CUresult {
+    r#impl::context::destroy_v2(ctx.decuda()).encuda()
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuCtxDestroy(ctx: CUcontext) -> CUresult {
     r#impl::context::destroy_v2(ctx.decuda()).encuda()
 }
 
@@ -2355,13 +2437,25 @@ pub extern "system" fn cuCtxPopCurrent_v2(pctx: *mut CUcontext) -> CUresult {
     r#impl::context::pop_current_v2(pctx.decuda())
 }
 
+// Non-v2 aliases: libcublasLt/cudnn dlopen libcuda.so.1 and resolve the
+// plain names (they fail at load with "symbol lookup error" if missing).
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuCtxPushCurrent(ctx: CUcontext) -> CUresult {
+    r#impl::context::push_current_v2(ctx.decuda())
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuCtxPopCurrent(pctx: *mut CUcontext) -> CUresult {
+    r#impl::context::pop_current_v2(pctx.decuda())
+}
+
 #[cfg_attr(not(test), no_mangle)]
 pub extern "system" fn cuCtxSetCurrent(ctx: CUcontext) -> CUresult {
     r#impl::context::set_current(ctx.decuda())
 }
 
 #[cfg_attr(not(test), no_mangle)]
-pub extern "system" fn cuCtxGetCurrent(pctx: *mut CUcontext) -> CUresult {
+    pub extern "system" fn cuCtxGetCurrent(pctx: *mut CUcontext) -> CUresult {
     r#impl::context::get_current(pctx.decuda()).encuda()
 }
 
@@ -2423,7 +2517,16 @@ pub extern "system" fn cuCtxGetStreamPriorityRange(
     leastPriority: *mut ::std::os::raw::c_int,
     greatestPriority: *mut ::std::os::raw::c_int,
 ) -> CUresult {
-    r#impl::unimplemented()
+    // Both out-pointers are optional; cuDNN passes NULL for both.
+    unsafe {
+        if !leastPriority.is_null() {
+            *leastPriority = 0;
+        }
+        if !greatestPriority.is_null() {
+            *greatestPriority = 0;
+        }
+    }
+    CUresult::CUDA_SUCCESS
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -2471,13 +2574,12 @@ pub extern "system" fn cuModuleLoadDataEx(
 ) -> CUresult {
     r#impl::module::load_data(module.decuda(), image).encuda()
 }
-
 #[cfg_attr(not(test), no_mangle)]
 pub extern "system" fn cuModuleLoadFatBinary(
     module: *mut CUmodule,
     fatCubin: *const ::std::os::raw::c_void,
 ) -> CUresult {
-    r#impl::unimplemented()
+    r#impl::module::load_fatbin(module.decuda(), fatCubin).encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -2485,13 +2587,176 @@ pub extern "system" fn cuModuleUnload(hmod: CUmodule) -> CUresult {
     r#impl::module::unload(hmod.decuda()).encuda()
 }
 
+// CUDA 12 "library" API.
+//
+// libcudart 12.4 resolves the module loader with plain dlsym() on
+// libcuda.so.1 instead of going through the CUDART_INTERFACE dark API:
+//
+//     dlsym(handle, "cuLibraryLoadData")
+//     dlsym(handle, "cuLibraryLoadFromFile")
+//
+// When those symbols are missing, the runtime falls back to an internal stub
+// that fails with cudaErrorNotSupported (801) and every runtime-API kernel
+// launch dies with it. These entry points therefore have to exist in
+// libnvcuda.so for the runtime API to work at all.
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuLibraryLoadData(
+    library: *mut CUlibrary,
+    code: *const ::std::os::raw::c_void,
+    jitOptions: *mut CUjit_option,
+    jitOptionsValues: *mut *mut ::std::os::raw::c_void,
+    numJitOptions: ::std::os::raw::c_uint,
+    libraryOptions: *mut ::std::os::raw::c_uint,
+    libraryOptionValues: *mut *mut ::std::os::raw::c_void,
+    numLibraryOptions: ::std::os::raw::c_uint,
+) -> CUresult {
+    let rc = r#impl::library::load_data(
+        library.decuda(),
+        code,
+        jitOptions,
+        jitOptionsValues,
+        numJitOptions,
+        libraryOptions,
+        libraryOptionValues,
+        numLibraryOptions,
+    )
+    .encuda();
+    if std::env::var_os("ZLUDA_TRACE_LIBRARY").is_some() {
+        eprintln!("cuLibraryLoadData -> {:?}", rc);
+    }
+    rc
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuLibraryLoadFromFile(
+    library: *mut CUlibrary,
+    fileName: *const ::std::os::raw::c_char,
+    jitOptions: *mut CUjit_option,
+    jitOptionsValues: *mut *mut ::std::os::raw::c_void,
+    numJitOptions: ::std::os::raw::c_uint,
+    libraryOptions: *mut ::std::os::raw::c_uint,
+    libraryOptionValues: *mut *mut ::std::os::raw::c_void,
+    numLibraryOptions: ::std::os::raw::c_uint,
+) -> CUresult {
+    r#impl::library::load_from_file(
+        library.decuda(),
+        fileName,
+        jitOptions,
+        jitOptionsValues,
+        numJitOptions,
+        libraryOptions,
+        libraryOptionValues,
+        numLibraryOptions,
+    )
+    .encuda()
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuLibraryUnload(library: CUlibrary) -> CUresult {
+    r#impl::library::unload(library.decuda()).encuda()
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuLibraryGetKernel(
+    pKernel: *mut CUkernel,
+    library: CUlibrary,
+    name: *const ::std::os::raw::c_char,
+) -> CUresult {
+    r#impl::library::get_kernel(
+        pKernel.decuda() as *mut *mut ::std::os::raw::c_void,
+        library.decuda(),
+        name,
+    )
+    .encuda()
+}
+
+/// `cuKernelGetFunction(function, kernel)` - the CUkernel handle of a
+/// library kernel and the CUfunction handle of the same kernel are the same
+/// object here, so the conversion is the identity.
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuKernelGetFunction(
+    function: *mut CUfunction,
+    kernel: CUkernel,
+) -> CUresult {
+    if function.is_null() {
+        return CUresult::CUDA_ERROR_INVALID_VALUE;
+    }
+    unsafe { *function = kernel as CUfunction };
+    CUresult::CUDA_SUCCESS
+}
+
+/// `cuLibraryGetFunction(function, library, name)` - look up a function of a
+/// loaded library.
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuLibraryGetFunction(
+    function: *mut CUfunction,
+    library: CUlibrary,
+    name: *const ::std::os::raw::c_char,
+) -> CUresult {
+    r#impl::library::get_kernel(
+        function as *mut *mut ::std::os::raw::c_void,
+        library.decuda(),
+        name,
+    )
+    .encuda()
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuLibraryGetModule(
+    module: *mut CUmodule,
+    library: CUlibrary,
+) -> CUresult {
+    r#impl::library::get_module(module, library.decuda()).encuda()
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuLibraryGetGlobal(
+    dptr: *mut CUdeviceptr,
+    library: CUlibrary,
+    name: *const ::std::os::raw::c_char,
+    size: *mut usize,
+) -> CUresult {
+    r#impl::library::get_global(dptr, library.decuda(), name, size).encuda()
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuLibraryGetGlobalSize(
+    size: *mut usize,
+    library: CUlibrary,
+    name: *const ::std::os::raw::c_char,
+) -> CUresult {
+    r#impl::library::get_global(std::ptr::null_mut(), library.decuda(), name, size).encuda()
+}
+
+// cudart calls this during its lazy global init; missing it used to trip the
+// cuGetProcAddress fallback. CUDA 12 default module loading mode is LAZY.
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuModuleGetLoadingMode(
+    psm: *mut ::std::os::raw::c_uint,
+) -> CUresult {
+    if psm.is_null() {
+        return CUresult::CUDA_ERROR_INVALID_VALUE;
+    }
+    unsafe {
+        *psm = 2; // CU_MODULE_LAZY_LOADING
+    }
+    CUresult::CUDA_SUCCESS
+}
+
+
 #[cfg_attr(not(test), no_mangle)]
 pub extern "system" fn cuModuleGetFunction(
     hfunc: *mut CUfunction,
     hmod: CUmodule,
     name: *const ::std::os::raw::c_char,
 ) -> CUresult {
-    r#impl::module::get_function(hfunc.decuda(), hmod.decuda(), name).encuda()
+    let name_str = unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy().into_owned();
+    let rc = r#impl::module::get_function(hfunc.decuda(), hmod.decuda(), name).encuda();
+    if std::env::var_os("ZLUDA_TRACE_LIBRARY").is_some() {
+        eprintln!("cuModuleGetFunction({:?}) -> {:?}", name_str, rc);
+    }
+    rc
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -2574,7 +2839,12 @@ pub extern "system" fn cuLinkDestroy(state: CUlinkState) -> CUresult {
 
 #[cfg_attr(not(test), no_mangle)]
 pub extern "system" fn cuMemGetInfo_v2(free: *mut usize, total: *mut usize) -> CUresult {
-    r#impl::unimplemented()
+    r#impl::memory::get_info_v2(free, total).encuda()
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuMemGetInfo(free: *mut usize, total: *mut usize) -> CUresult {
+    r#impl::memory::get_info_v2(free, total).encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -2583,6 +2853,12 @@ pub extern "system" fn cuMemAlloc_v2(dptr: *mut CUdeviceptr, bytesize: usize) ->
 }
 
 #[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuMemAlloc(dptr: *mut CUdeviceptr, bytesize: usize) -> CUresult {
+    r#impl::memory::alloc_v2(dptr.decuda(), bytesize).encuda()
+}
+
+#[cfg_attr(not(test), no_mangle)]
+#[cfg_attr(not(test), no_mangle)]
 pub extern "system" fn cuMemAllocPitch_v2(
     dptr: *mut CUdeviceptr,
     pPitch: *mut usize,
@@ -2590,12 +2866,70 @@ pub extern "system" fn cuMemAllocPitch_v2(
     Height: usize,
     ElementSizeBytes: ::std::os::raw::c_uint,
 ) -> CUresult {
-    r#impl::unimplemented()
+    if dptr == ::std::ptr::null_mut() || pPitch == ::std::ptr::null_mut() {
+        return CUresult::CUDA_ERROR_INVALID_VALUE;
+    }
+    // CUDA aligns pitches to 512 bytes. ElementSizeBytes is a hint; we use
+    // it to round the pitch to a multiple of the element size.
+    let mut pitch = (WidthInBytes + 511) & !511usize;
+    if ElementSizeBytes > 1 {
+        let esz = ElementSizeBytes as usize;
+        pitch = (pitch + esz - 1) / esz * esz;
+    }
+    let bytesize = match pitch.checked_mul(Height) {
+        Some(b) => b,
+        None => return CUresult::CUDA_ERROR_INVALID_VALUE,
+    };
+    match r#impl::memory::alloc_v2_raw(bytesize) {
+        Ok(ptr) => {
+            unsafe {
+                *dptr = CUdeviceptr(ptr as usize);
+                *pPitch = pitch;
+            }
+            CUresult::CUDA_SUCCESS
+        }
+        Err(e) => e.encuda(),
+    }
 }
 
 #[cfg_attr(not(test), no_mangle)]
 pub extern "system" fn cuMemFree_v2(dptr: CUdeviceptr) -> CUresult {
     r#impl::memory::free_v2(dptr.decuda()).encuda()
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuMemFree(dptr: CUdeviceptr) -> CUresult {
+    r#impl::memory::free_v2(dptr.decuda()).encuda()
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuMemAllocAsync(dptr: *mut CUdeviceptr, bytesize: usize, _hStream: CUstream) -> CUresult {
+    r#impl::memory::alloc_v2(dptr.decuda(), bytesize).encuda()
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuMemFreeAsync(dptr: CUdeviceptr, _hStream: CUstream) -> CUresult {
+    r#impl::memory::free_v2(dptr.decuda()).encuda()
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuMemPoolCreate(pool: *mut CUmemoryPool, _poolProps: *const ::std::os::raw::c_void) -> CUresult {
+    r#impl::memory::pool_create(pool).encuda()
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuMemPoolDestroy(pool: CUmemoryPool) -> CUresult {
+    r#impl::memory::pool_destroy(pool).encuda()
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuMemPoolGetAttribute(_pool: CUmemoryPool, _attr: ::std::os::raw::c_int, _value: *mut ::std::os::raw::c_void) -> CUresult {
+    CUresult::CUDA_SUCCESS
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuMemPoolSetAttribute(_pool: CUmemoryPool, _attr: ::std::os::raw::c_int, _value: *const ::std::os::raw::c_void) -> CUresult {
+    CUresult::CUDA_SUCCESS
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -2612,12 +2946,12 @@ pub extern "system" fn cuMemAllocHost_v2(
     pp: *mut *mut ::std::os::raw::c_void,
     bytesize: usize,
 ) -> CUresult {
-    r#impl::unimplemented()
+    r#impl::memory::alloc_host_v2(pp, bytesize).encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
 pub extern "system" fn cuMemFreeHost(p: *mut ::std::os::raw::c_void) -> CUresult {
-    r#impl::unimplemented()
+    r#impl::memory::free_host(p).encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -2626,7 +2960,7 @@ pub extern "system" fn cuMemHostAlloc(
     bytesize: usize,
     Flags: ::std::os::raw::c_uint,
 ) -> CUresult {
-    r#impl::unimplemented()
+    r#impl::memory::host_alloc(pp, bytesize, Flags).encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -2635,7 +2969,16 @@ pub extern "system" fn cuMemHostGetDevicePointer_v2(
     p: *mut ::std::os::raw::c_void,
     Flags: ::std::os::raw::c_uint,
 ) -> CUresult {
-    r#impl::unimplemented()
+    r#impl::memory::host_get_device_pointer_v2(pdptr.decuda(), p, Flags).encuda()
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuMemHostGetDevicePointer(
+    pdptr: *mut CUdeviceptr,
+    p: *mut ::std::os::raw::c_void,
+    Flags: ::std::os::raw::c_uint,
+) -> CUresult {
+    r#impl::memory::host_get_device_pointer_v2(pdptr.decuda(), p, Flags).encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -2643,7 +2986,7 @@ pub extern "system" fn cuMemHostGetFlags(
     pFlags: *mut ::std::os::raw::c_uint,
     p: *mut ::std::os::raw::c_void,
 ) -> CUresult {
-    r#impl::unimplemented()
+    r#impl::memory::host_get_flags(pFlags, p).encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -2669,7 +3012,7 @@ pub extern "system" fn cuDeviceGetPCIBusId(
     len: ::std::os::raw::c_int,
     dev: CUdevice,
 ) -> CUresult {
-    r#impl::unimplemented()
+    r#impl::device::get_pci_bus_id(pciBusId, len, dev.decuda()).encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -2755,7 +3098,16 @@ pub extern "system" fn cuMemcpyHtoD_v2(
     srcHost: *const ::std::os::raw::c_void,
     ByteCount: usize,
 ) -> CUresult {
-    r#impl::memory::copy_v2(dstDevice.decuda(), srcHost, ByteCount).encuda()
+    r#impl::memory::copy_htod(dstDevice.decuda(), srcHost, ByteCount).encuda()
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuMemcpyHtoD(
+    dstDevice: CUdeviceptr,
+    srcHost: *const ::std::os::raw::c_void,
+    ByteCount: usize,
+) -> CUresult {
+    r#impl::memory::copy_htod(dstDevice.decuda(), srcHost, ByteCount).encuda()
 }
 
 // TODO: implement default stream semantics
@@ -2765,7 +3117,7 @@ pub extern "system" fn cuMemcpyHtoD_v2_ptds(
     srcHost: *const ::std::os::raw::c_void,
     ByteCount: usize,
 ) -> CUresult {
-    r#impl::memory::copy_v2(dstDevice.decuda(), srcHost, ByteCount).encuda()
+    r#impl::memory::copy_htod(dstDevice.decuda(), srcHost, ByteCount).encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -2774,7 +3126,16 @@ pub extern "system" fn cuMemcpyDtoH_v2(
     srcDevice: CUdeviceptr,
     ByteCount: usize,
 ) -> CUresult {
-    r#impl::memory::copy_v2(dstHost, srcDevice.decuda(), ByteCount).encuda()
+    r#impl::memory::copy_dtoh(dstHost, srcDevice.decuda(), ByteCount).encuda()
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuMemcpyDtoH(
+    dstHost: *mut ::std::os::raw::c_void,
+    srcDevice: CUdeviceptr,
+    ByteCount: usize,
+) -> CUresult {
+    r#impl::memory::copy_dtoh(dstHost, srcDevice.decuda(), ByteCount).encuda()
 }
 
 // TODO: implement default stream semantics
@@ -2784,7 +3145,7 @@ pub extern "system" fn cuMemcpyDtoH_v2_ptds(
     srcDevice: CUdeviceptr,
     ByteCount: usize,
 ) -> CUresult {
-    r#impl::memory::copy_v2(dstHost, srcDevice.decuda(), ByteCount).encuda()
+    r#impl::memory::copy_dtoh(dstHost, srcDevice.decuda(), ByteCount).encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -2793,7 +3154,16 @@ pub extern "system" fn cuMemcpyDtoD_v2(
     srcDevice: CUdeviceptr,
     ByteCount: usize,
 ) -> CUresult {
-    r#impl::unimplemented()
+    r#impl::memory::copy_dtod(dstDevice.decuda(), srcDevice.decuda(), ByteCount).encuda()
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuMemcpyDtoD(
+    dstDevice: CUdeviceptr,
+    srcDevice: CUdeviceptr,
+    ByteCount: usize,
+) -> CUresult {
+    r#impl::memory::copy_dtod(dstDevice.decuda(), srcDevice.decuda(), ByteCount).encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -2849,17 +3219,52 @@ pub extern "system" fn cuMemcpyAtoA_v2(
 
 #[cfg_attr(not(test), no_mangle)]
 pub extern "system" fn cuMemcpy2D_v2(pCopy: *const CUDA_MEMCPY2D) -> CUresult {
-    r#impl::unimplemented()
+    if pCopy == ::std::ptr::null() {
+        return CUresult::CUDA_ERROR_INVALID_VALUE;
+    }
+    let c = unsafe { &*pCopy };
+    r#impl::memory::memcpy2d(
+        c.srcXInBytes, c.srcY, c.srcMemoryType.0, c.srcHost, c.srcDevice.0,
+        c.srcPitch, c.dstXInBytes, c.dstY, c.dstMemoryType.0, c.dstHost,
+        c.dstDevice.0, c.dstPitch, c.WidthInBytes, c.Height,
+        r#impl::stream::CU_STREAM_LEGACY,
+    )
+    .encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
 pub extern "system" fn cuMemcpy2DUnaligned_v2(pCopy: *const CUDA_MEMCPY2D) -> CUresult {
-    r#impl::unimplemented()
+    cuMemcpy2D_v2(pCopy)
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuMemcpy2D(pCopy: *const CUDA_MEMCPY2D) -> CUresult {
+    cuMemcpy2D_v2(pCopy)
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuMemcpy2DUnaligned(pCopy: *const CUDA_MEMCPY2D) -> CUresult {
+    cuMemcpy2D_v2(pCopy)
 }
 
 #[cfg_attr(not(test), no_mangle)]
 pub extern "system" fn cuMemcpy3D_v2(pCopy: *const CUDA_MEMCPY3D) -> CUresult {
-    r#impl::unimplemented()
+    if pCopy == ::std::ptr::null() {
+        return CUresult::CUDA_ERROR_INVALID_VALUE;
+    }
+    let c = unsafe { &*pCopy };
+    r#impl::memory::memcpy3d(
+        c.srcXInBytes, c.srcY, c.srcZ, c.srcMemoryType.0, c.srcHost, c.srcDevice.0,
+        c.srcPitch, c.srcHeight, c.dstXInBytes, c.dstY, c.dstZ,
+        c.dstMemoryType.0, c.dstHost, c.dstDevice.0, c.dstPitch, c.dstHeight,
+        c.WidthInBytes, c.Height, c.Depth, r#impl::stream::CU_STREAM_LEGACY,
+    )
+    .encuda()
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuMemcpy3D(pCopy: *const CUDA_MEMCPY3D) -> CUresult {
+    cuMemcpy3D_v2(pCopy)
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -2874,7 +3279,7 @@ pub extern "system" fn cuMemcpyAsync(
     ByteCount: usize,
     hStream: CUstream,
 ) -> CUresult {
-    r#impl::unimplemented()
+    r#impl::memory::copy_async(dst.decuda(), src.decuda(), ByteCount, hStream.decuda()).encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -2896,7 +3301,8 @@ pub extern "system" fn cuMemcpyHtoDAsync_v2(
     ByteCount: usize,
     hStream: CUstream,
 ) -> CUresult {
-    r#impl::unimplemented()
+    r#impl::memory::copy_htod_async(dstDevice.decuda(), srcHost, ByteCount, hStream.decuda())
+        .encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -2906,7 +3312,8 @@ pub extern "system" fn cuMemcpyDtoHAsync_v2(
     ByteCount: usize,
     hStream: CUstream,
 ) -> CUresult {
-    r#impl::unimplemented()
+    r#impl::memory::copy_dtoh_async(dstHost, srcDevice.decuda(), ByteCount, hStream.decuda())
+        .encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -2916,7 +3323,41 @@ pub extern "system" fn cuMemcpyDtoDAsync_v2(
     ByteCount: usize,
     hStream: CUstream,
 ) -> CUresult {
-    r#impl::unimplemented()
+    r#impl::memory::copy_dtod_async(dstDevice.decuda(), srcDevice.decuda(), ByteCount, hStream.decuda())
+        .encuda()
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuMemcpyHtoDAsync(
+    dstDevice: CUdeviceptr,
+    srcHost: *const ::std::os::raw::c_void,
+    ByteCount: usize,
+    hStream: CUstream,
+) -> CUresult {
+    r#impl::memory::copy_htod_async(dstDevice.decuda(), srcHost, ByteCount, hStream.decuda())
+        .encuda()
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuMemcpyDtoHAsync(
+    dstHost: *mut ::std::os::raw::c_void,
+    srcDevice: CUdeviceptr,
+    ByteCount: usize,
+    hStream: CUstream,
+) -> CUresult {
+    r#impl::memory::copy_dtoh_async(dstHost, srcDevice.decuda(), ByteCount, hStream.decuda())
+        .encuda()
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuMemcpyDtoDAsync(
+    dstDevice: CUdeviceptr,
+    srcDevice: CUdeviceptr,
+    ByteCount: usize,
+    hStream: CUstream,
+) -> CUresult {
+    r#impl::memory::copy_dtod_async(dstDevice.decuda(), srcDevice.decuda(), ByteCount, hStream.decuda())
+        .encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -2946,7 +3387,24 @@ pub extern "system" fn cuMemcpy2DAsync_v2(
     pCopy: *const CUDA_MEMCPY2D,
     hStream: CUstream,
 ) -> CUresult {
-    r#impl::unimplemented()
+    if pCopy == ::std::ptr::null() {
+        return CUresult::CUDA_ERROR_INVALID_VALUE;
+    }
+    let c = unsafe { &*pCopy };
+    r#impl::memory::memcpy2d(
+        c.srcXInBytes, c.srcY, c.srcMemoryType.0, c.srcHost, c.srcDevice.0,
+        c.srcPitch, c.dstXInBytes, c.dstY, c.dstMemoryType.0, c.dstHost,
+        c.dstDevice.0, c.dstPitch, c.WidthInBytes, c.Height, hStream.decuda(),
+    )
+    .encuda()
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuMemcpy2DAsync(
+    pCopy: *const CUDA_MEMCPY2D,
+    hStream: CUstream,
+) -> CUresult {
+    cuMemcpy2DAsync_v2(pCopy, hStream)
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -2954,7 +3412,25 @@ pub extern "system" fn cuMemcpy3DAsync_v2(
     pCopy: *const CUDA_MEMCPY3D,
     hStream: CUstream,
 ) -> CUresult {
-    r#impl::unimplemented()
+    if pCopy == ::std::ptr::null() {
+        return CUresult::CUDA_ERROR_INVALID_VALUE;
+    }
+    let c = unsafe { &*pCopy };
+    r#impl::memory::memcpy3d(
+        c.srcXInBytes, c.srcY, c.srcZ, c.srcMemoryType.0, c.srcHost, c.srcDevice.0,
+        c.srcPitch, c.srcHeight, c.dstXInBytes, c.dstY, c.dstZ,
+        c.dstMemoryType.0, c.dstHost, c.dstDevice.0, c.dstPitch, c.dstHeight,
+        c.WidthInBytes, c.Height, c.Depth, hStream.decuda(),
+    )
+    .encuda()
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuMemcpy3DAsync(
+    pCopy: *const CUDA_MEMCPY3D,
+    hStream: CUstream,
+) -> CUresult {
+    cuMemcpy3DAsync_v2(pCopy, hStream)
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -2971,7 +3447,16 @@ pub extern "system" fn cuMemsetD8_v2(
     uc: ::std::os::raw::c_uchar,
     N: usize,
 ) -> CUresult {
-    r#impl::memory::set_d8_v2(dstDevice.decuda(), uc, N).encuda()
+    r#impl::memory::set_d8_v2(dstDevice.decuda(), uc, N, r#impl::stream::CU_STREAM_LEGACY).encuda()
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuMemsetD8(
+    dstDevice: CUdeviceptr,
+    uc: ::std::os::raw::c_uchar,
+    N: usize,
+) -> CUresult {
+    r#impl::memory::set_d8_v2(dstDevice.decuda(), uc, N, r#impl::stream::CU_STREAM_LEGACY).encuda()
 }
 
 // TODO: implement default stream semantics
@@ -2981,7 +3466,7 @@ pub extern "system" fn cuMemsetD8_v2_ptds(
     uc: ::std::os::raw::c_uchar,
     N: usize,
 ) -> CUresult {
-    r#impl::memory::set_d8_v2(dstDevice.decuda(), uc, N).encuda()
+    r#impl::memory::set_d8_v2(dstDevice.decuda(), uc, N, r#impl::stream::CU_STREAM_LEGACY).encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -2990,7 +3475,7 @@ pub extern "system" fn cuMemsetD16_v2(
     us: ::std::os::raw::c_ushort,
     N: usize,
 ) -> CUresult {
-    r#impl::unimplemented()
+    r#impl::memory::set_d16_v2(dstDevice.decuda(), us, N, r#impl::stream::CU_STREAM_LEGACY).encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -2999,9 +3484,18 @@ pub extern "system" fn cuMemsetD32_v2(
     ui: ::std::os::raw::c_uint,
     N: usize,
 ) -> CUresult {
-    r#impl::memory::set_d32_v2(dstDevice.decuda(), ui, N).encuda()
+    r#impl::memory::set_d32_v2(dstDevice.decuda(), ui, N, r#impl::stream::CU_STREAM_LEGACY).encuda()
 }
 
+// Non-v2 alias: some host apps (and our test shims) dlsym the plain name.
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuMemsetD32(
+    dstDevice: CUdeviceptr,
+    ui: ::std::os::raw::c_uint,
+    N: usize,
+) -> CUresult {
+    r#impl::memory::set_d32_v2(dstDevice.decuda(), ui, N, r#impl::stream::CU_STREAM_LEGACY).encuda()
+}
 // TODO: implement default stream semantics
 #[cfg_attr(not(test), no_mangle)]
 pub extern "system" fn cuMemsetD32_v2_ptds(
@@ -3009,7 +3503,7 @@ pub extern "system" fn cuMemsetD32_v2_ptds(
     ui: ::std::os::raw::c_uint,
     N: usize,
 ) -> CUresult {
-    r#impl::memory::set_d32_v2(dstDevice.decuda(), ui, N).encuda()
+    r#impl::memory::set_d32_v2(dstDevice.decuda(), ui, N, r#impl::stream::CU_STREAM_LEGACY).encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -3052,7 +3546,7 @@ pub extern "system" fn cuMemsetD8Async(
     N: usize,
     hStream: CUstream,
 ) -> CUresult {
-    r#impl::unimplemented()
+    r#impl::memory::set_d8_v2(dstDevice.decuda(), uc, N, hStream.decuda()).encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -3062,7 +3556,7 @@ pub extern "system" fn cuMemsetD16Async(
     N: usize,
     hStream: CUstream,
 ) -> CUresult {
-    r#impl::unimplemented()
+    r#impl::memory::set_d16_v2(dstDevice.decuda(), us, N, hStream.decuda()).encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -3072,7 +3566,7 @@ pub extern "system" fn cuMemsetD32Async(
     N: usize,
     hStream: CUstream,
 ) -> CUresult {
-    r#impl::unimplemented()
+    r#impl::memory::set_d32_v2(dstDevice.decuda(), ui, N, hStream.decuda()).encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -3262,7 +3756,11 @@ pub extern "system" fn cuMemGetAllocationGranularity(
     prop: *const CUmemAllocationProp,
     option: CUmemAllocationGranularity_flags,
 ) -> CUresult {
-    r#impl::unimplemented()
+    // Plausible VMM granularity: 2MiB recommended-class value.
+    if !granularity.is_null() {
+        unsafe { *granularity = 2 * 1024 * 1024; }
+    }
+    CUresult::CUDA_SUCCESS
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -3287,7 +3785,7 @@ pub extern "system" fn cuPointerGetAttribute(
     attribute: CUpointer_attribute,
     ptr: CUdeviceptr,
 ) -> CUresult {
-    r#impl::unimplemented()
+    r#impl::pointer::get_attribute(data, attribute.0, ptr.0 as *mut _).encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -3349,7 +3847,13 @@ pub extern "system" fn cuPointerGetAttributes(
     data: *mut *mut ::std::os::raw::c_void,
     ptr: CUdeviceptr,
 ) -> CUresult {
-    r#impl::unimplemented()
+    r#impl::pointer::get_attributes(
+        numAttributes,
+        attributes as *const u32,
+        data,
+        ptr.0 as *mut _,
+    )
+    .encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -3366,7 +3870,8 @@ pub extern "system" fn cuStreamCreateWithPriority(
     flags: ::std::os::raw::c_uint,
     priority: ::std::os::raw::c_int,
 ) -> CUresult {
-    r#impl::unimplemented()
+    // Priority is reported as flat 0 elsewhere; create an ordinary stream.
+    r#impl::stream::create(phStream.decuda(), flags).encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -3374,7 +3879,11 @@ pub extern "system" fn cuStreamGetPriority(
     hStream: CUstream,
     priority: *mut ::std::os::raw::c_int,
 ) -> CUresult {
-    r#impl::unimplemented()
+    if priority == ::std::ptr::null_mut() {
+        return CUresult::CUDA_ERROR_INVALID_VALUE;
+    }
+    unsafe { *priority = 0 };
+    CUresult::CUDA_SUCCESS
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -3382,7 +3891,7 @@ pub extern "system" fn cuStreamGetFlags(
     hStream: CUstream,
     flags: *mut ::std::os::raw::c_uint,
 ) -> CUresult {
-    r#impl::unimplemented()
+    r#impl::stream::get_flags(hStream.decuda(), flags).encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -3402,7 +3911,7 @@ pub extern "system" fn cuStreamWaitEvent(
     hEvent: CUevent,
     Flags: ::std::os::raw::c_uint,
 ) -> CUresult {
-    r#impl::unimplemented()
+    r#impl::stream::wait_event(hStream.decuda(), hEvent.decuda(), Flags).encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -3412,7 +3921,7 @@ pub extern "system" fn cuStreamAddCallback(
     userData: *mut ::std::os::raw::c_void,
     flags: ::std::os::raw::c_uint,
 ) -> CUresult {
-    r#impl::unimplemented()
+    r#impl::stream::add_callback(hStream.decuda(), callback, userData, flags).encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -3440,9 +3949,15 @@ pub extern "system" fn cuStreamIsCapturing(
     hStream: CUstream,
     captureStatus: *mut CUstreamCaptureStatus,
 ) -> CUresult {
-    r#impl::unimplemented()
+    // The out-pointer is optional.
+    if !captureStatus.is_null() {
+        unsafe {
+            *captureStatus = CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE;
+        }
+    }
+    // ZLUDA never captures streams; report NONE so callers proceed.
+    CUresult::CUDA_SUCCESS
 }
-
 #[cfg_attr(not(test), no_mangle)]
 pub extern "system" fn cuStreamGetCaptureInfo(
     hStream: CUstream,
@@ -3464,7 +3979,7 @@ pub extern "system" fn cuStreamAttachMemAsync(
 
 #[cfg_attr(not(test), no_mangle)]
 pub extern "system" fn cuStreamQuery(hStream: CUstream) -> CUresult {
-    r#impl::unimplemented()
+    r#impl::stream::query(hStream.decuda()).encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -3475,6 +3990,16 @@ pub extern "system" fn cuStreamSynchronize(hStream: CUstream) -> CUresult {
 #[cfg_attr(not(test), no_mangle)]
 pub extern "system" fn cuStreamDestroy_v2(hStream: CUstream) -> CUresult {
     r#impl::stream::destroy_v2(hStream.decuda()).encuda()
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuStreamDestroy(hStream: CUstream) -> CUresult {
+    r#impl::stream::destroy_v2(hStream.decuda()).encuda()
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuEventDestroy(hEvent: CUevent) -> CUresult {
+    r#impl::event::destroy_v2(hEvent.decuda()).encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -3505,27 +4030,27 @@ pub extern "system" fn cuEventCreate(
     phEvent: *mut CUevent,
     Flags: ::std::os::raw::c_uint,
 ) -> CUresult {
-    r#impl::unimplemented()
+    r#impl::event::create(phEvent.decuda(), Flags).encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
 pub extern "system" fn cuEventRecord(hEvent: CUevent, hStream: CUstream) -> CUresult {
-    r#impl::unimplemented()
+    r#impl::event::record(hEvent.decuda(), hStream.decuda()).encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
 pub extern "system" fn cuEventQuery(hEvent: CUevent) -> CUresult {
-    r#impl::unimplemented()
+    r#impl::event::query(hEvent.decuda()).encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
 pub extern "system" fn cuEventSynchronize(hEvent: CUevent) -> CUresult {
-    r#impl::unimplemented()
+    r#impl::event::synchronize(hEvent.decuda()).encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
 pub extern "system" fn cuEventDestroy_v2(hEvent: CUevent) -> CUresult {
-    r#impl::unimplemented()
+    r#impl::event::destroy_v2(hEvent.decuda()).encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -3534,7 +4059,7 @@ pub extern "system" fn cuEventElapsedTime(
     hStart: CUevent,
     hEnd: CUevent,
 ) -> CUresult {
-    r#impl::unimplemented()
+    r#impl::event::elapsed_time(pMilliseconds, hStart.decuda(), hEnd.decuda()).encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -3641,6 +4166,47 @@ pub extern "system" fn cuStreamWriteValue64(
     r#impl::unimplemented()
 }
 
+// CUDA 12-style _v2 spellings resolved by dlsym in newer clients
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuStreamWaitValue32_v2(
+    stream: CUstream,
+    addr: CUdeviceptr,
+    value: cuuint32_t,
+    flags: ::std::os::raw::c_uint,
+) -> CUresult {
+    r#impl::unimplemented()
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuStreamWaitValue64_v2(
+    stream: CUstream,
+    addr: CUdeviceptr,
+    value: cuuint64_t,
+    flags: ::std::os::raw::c_uint,
+) -> CUresult {
+    r#impl::unimplemented()
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuStreamWriteValue32_v2(
+    stream: CUstream,
+    addr: CUdeviceptr,
+    value: cuuint32_t,
+    flags: ::std::os::raw::c_uint,
+) -> CUresult {
+    r#impl::unimplemented()
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuStreamWriteValue64_v2(
+    stream: CUstream,
+    addr: CUdeviceptr,
+    value: cuuint64_t,
+    flags: ::std::os::raw::c_uint,
+) -> CUresult {
+    r#impl::unimplemented()
+}
+
 #[cfg_attr(not(test), no_mangle)]
 pub extern "system" fn cuStreamBatchMemOp(
     stream: CUstream,
@@ -3657,7 +4223,8 @@ pub extern "system" fn cuFuncGetAttribute(
     attrib: CUfunction_attribute,
     hfunc: CUfunction,
 ) -> CUresult {
-    r#impl::function::get_attribute(pi, attrib, hfunc.decuda()).encuda()
+    let rc = r#impl::function::get_attribute(pi, attrib, hfunc.decuda()).encuda();
+    rc
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -3666,7 +4233,7 @@ pub extern "system" fn cuFuncSetAttribute(
     attrib: CUfunction_attribute,
     value: ::std::os::raw::c_int,
 ) -> CUresult {
-    r#impl::unimplemented()
+    r#impl::function::set_attribute(hfunc.decuda(), attrib, value).encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -3696,7 +4263,14 @@ pub extern "system" fn cuLaunchKernel(
     kernelParams: *mut *mut ::std::os::raw::c_void,
     extra: *mut *mut ::std::os::raw::c_void,
 ) -> CUresult {
-    r#impl::function::launch_kernel(
+    let trace = std::env::var_os("ZLUDA_TRACE_LAUNCH").is_some();
+    if trace {
+        eprintln!(
+            "cuLaunchKernel f={:?} grid=({},{},{}) block=({},{},{}) shared={}",
+            f, gridDimX, gridDimY, gridDimZ, blockDimX, blockDimY, blockDimZ, sharedMemBytes
+        );
+    }
+    let rc = r#impl::function::launch_kernel(
         f.decuda(),
         gridDimX,
         gridDimY,
@@ -3709,7 +4283,63 @@ pub extern "system" fn cuLaunchKernel(
         kernelParams,
         extra,
     )
-    .encuda()
+    .encuda();
+    if std::env::var_os("ZLUDA_TRACE_LAUNCH").is_some() {
+        eprintln!("cuLaunchKernel -> {:?}", rc);
+    }
+    rc
+}
+
+// CUDA 12.4+: extended launch API. libcublasLt resolves this at dlopen
+// time; delegate to the plain launch path (attrs currently unsupported).
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuLaunchKernelEx(
+    config: *const CUlaunchConfig,
+    f: CUfunction,
+    kernelParams: *mut *mut ::std::os::raw::c_void,
+    extra: *mut *mut ::std::os::raw::c_void,
+) -> CUresult {
+    if config == ::std::ptr::null() {
+        return CUresult::CUDA_ERROR_INVALID_VALUE;
+    }
+    let config = unsafe { &*config };
+    // Ignore CU_LAUNCH_ATTRIBUTE_* (cluster dims, programmatic serialization,
+    // ...): our immediate-command-list streams are already in-order, and
+    // MAX passes attributes on every launch. Semantics are preserved for
+    // the attribute classes we don't implement by plain sequential launch.
+    let trace = std::env::var_os("ZLUDA_TRACE_LAUNCH").is_some();
+    if trace {
+        eprintln!(
+            "cuLaunchKernelEx f={:?} grid=({},{},{}) block=({},{},{}) shared={} attrs={}",
+            f,
+            config.gridDimX,
+            config.gridDimY,
+            config.gridDimZ,
+            config.blockDimX,
+            config.blockDimY,
+            config.blockDimZ,
+            config.sharedMemBytes,
+            config.numAttrs
+        );
+    }
+    let rc = r#impl::function::launch_kernel(
+        f.decuda(),
+        config.gridDimX,
+        config.gridDimY,
+        config.gridDimZ,
+        config.blockDimX,
+        config.blockDimY,
+        config.blockDimZ,
+        config.sharedMemBytes,
+        config.hStream.decuda(),
+        kernelParams,
+        extra,
+    )
+    .encuda();
+    if trace {
+        eprintln!("cuLaunchKernelEx -> {:?}", rc);
+    }
+    rc
 }
 
 // TODO: implement default stream semantics
@@ -4119,6 +4749,61 @@ pub extern "system" fn cuGraphInstantiate_v2(
 }
 
 #[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuGraphInstantiateWithFlags(
+    phGraphExec: *mut CUgraphExec,
+    hGraph: CUgraph,
+    flags: ::std::os::raw::c_ulonglong,
+) -> CUresult {
+    r#impl::unimplemented()
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuGraphInstantiateWithParams(
+    phGraphExec: *mut CUgraphExec,
+    hGraph: CUgraph,
+    params: *mut ::std::os::raw::c_void,
+) -> CUresult {
+    r#impl::unimplemented()
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuMulticastCreate(
+    mcObject: *mut ::std::os::raw::c_void,
+) -> CUresult {
+    r#impl::unimplemented()
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuMulticastGetGranularity(
+    granularity: *mut usize,
+    size: usize,
+    flags: ::std::os::raw::c_uint,
+) -> CUresult {
+    r#impl::unimplemented()
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuMulticastAddDevice(
+    mcHandle: ::std::os::raw::c_void,
+) -> CUresult {
+    r#impl::unimplemented()
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuMulticastBindMem(
+    mcHandle: ::std::os::raw::c_void,
+) -> CUresult {
+    r#impl::unimplemented()
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuMulticastUnbind(
+    mcHandle: ::std::os::raw::c_void,
+) -> CUresult {
+    r#impl::unimplemented()
+}
+
+#[cfg_attr(not(test), no_mangle)]
 pub extern "system" fn cuGraphExecKernelNodeSetParams(
     hGraphExec: CUgraphExec,
     hNode: CUgraphNode,
@@ -4198,6 +4883,122 @@ pub extern "system" fn cuGraphKernelNodeGetAttribute(
     r#impl::unimplemented()
 }
 
+// Symbols probed by name by modern clients; unsupported on this backend
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuGraphInstantiate(
+    phGraphExec: *mut CUgraphExec,
+    hGraph: CUgraph,
+    phErrorNode: *mut CUgraphNode,
+    logBuffer: *mut ::std::os::raw::c_char,
+    bufferSize: usize,
+) -> CUresult {
+    r#impl::unimplemented()
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuStreamBeginCapture(
+    hStream: CUstream,
+    mode: CUstreamCaptureMode,
+) -> CUresult {
+    r#impl::unimplemented()
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuMemGetAddressRange(
+    dbase: *mut CUdeviceptr,
+    pbytes: *mut usize,
+    dptr: CUdeviceptr,
+) -> CUresult {
+    r#impl::unimplemented()
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuMemPoolTrimTo(pool: CUmemoryPool, minBytesToKeep: usize) -> CUresult {
+    r#impl::unimplemented()
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuMemPoolSetAccess(
+    pool: CUmemoryPool,
+    map: *const CUmemAccessDesc,
+    count: usize,
+) -> CUresult {
+    r#impl::unimplemented()
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuMemGetHandleForAddressRange(
+    handle: *mut CUmemGenericAllocationHandle,
+    dptr: CUdeviceptr,
+    size: usize,
+    kind: cuuint32_t,
+) -> CUresult {
+    r#impl::unimplemented()
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuFuncGetParamInfo(
+    f: CUfunction,
+    paramOffset: usize,
+    paramBase: *mut usize,
+    paramSize: *mut usize,
+) -> CUresult {
+    r#impl::unimplemented()
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuDeviceGetGraphMemAttribute(
+    device: CUdevice,
+    attribute: cuuint32_t,
+    value: *mut ::std::os::raw::c_void,
+) -> CUresult {
+    r#impl::unimplemented()
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuGraphDebugDotPrint(hGraph: CUgraph, fname: *mut ::std::os::raw::c_char, flags: ::std::os::raw::c_uint) -> CUresult {
+    r#impl::unimplemented()
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuTensorMapEncodeTiled(
+    tensorMap: *mut ::std::os::raw::c_void,
+    tensorDataType: cuuint32_t,
+    tensorRank: cuuint32_t,
+    globalAddress: *mut ::std::os::raw::c_void,
+    globalDim: *const cuuint64_t,
+    globalStrides: *const cuuint64_t,
+    boxDim: *const cuuint32_t,
+    elementStrides: *const cuuint32_t,
+    interleave: cuuint32_t,
+    swizzle: cuuint32_t,
+    l2Promotion: cuuint32_t,
+    oobFill: cuuint32_t,
+) -> CUresult {
+    r#impl::unimplemented()
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuTensorMapEncodeIm2col(
+    tensorMap: *mut ::std::os::raw::c_void,
+    tensorDataType: cuuint32_t,
+    tensorRank: cuuint32_t,
+    globalAddress: *mut ::std::os::raw::c_void,
+    globalDim: *const cuuint64_t,
+    globalStrides: *const cuuint64_t,
+    pixelOffsetInLowerCorner: *const ::std::os::raw::c_int,
+    pixelOffsetInUpperCorner: *const ::std::os::raw::c_int,
+    channelsPerPixel: cuuint32_t,
+    pixelsPerColumn: cuuint32_t,
+    elementStrides: *const cuuint32_t,
+    interleave: cuuint32_t,
+    swizzle: cuuint32_t,
+    l2Promotion: cuuint32_t,
+    oobFill: cuuint32_t,
+) -> CUresult {
+    r#impl::unimplemented()
+}
+
 #[cfg_attr(not(test), no_mangle)]
 pub extern "system" fn cuGraphKernelNodeSetAttribute(
     hNode: CUgraphNode,
@@ -4214,7 +5015,13 @@ pub extern "system" fn cuOccupancyMaxActiveBlocksPerMultiprocessor(
     blockSize: ::std::os::raw::c_int,
     dynamicSMemSize: usize,
 ) -> CUresult {
-    r#impl::unimplemented()
+    r#impl::occupancy::max_active_blocks_per_multiprocessor(
+        numBlocks,
+        func.decuda(),
+        blockSize,
+        dynamicSMemSize,
+    )
+        .encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -4225,7 +5032,14 @@ pub extern "system" fn cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(
     dynamicSMemSize: usize,
     flags: ::std::os::raw::c_uint,
 ) -> CUresult {
-    r#impl::unimplemented()
+    r#impl::occupancy::max_active_blocks_per_multiprocessor_with_flags(
+        numBlocks,
+        func.decuda(),
+        blockSize,
+        dynamicSMemSize,
+        flags,
+    )
+    .encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -4237,7 +5051,15 @@ pub extern "system" fn cuOccupancyMaxPotentialBlockSize(
     dynamicSMemSize: usize,
     blockSizeLimit: ::std::os::raw::c_int,
 ) -> CUresult {
-    r#impl::unimplemented()
+    r#impl::occupancy::max_potential_block_size(
+        minGridSize,
+        blockSize,
+        func.decuda(),
+        blockSizeToDynamicSMemSize,
+        dynamicSMemSize,
+        blockSizeLimit,
+    )
+    .encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -4250,7 +5072,16 @@ pub extern "system" fn cuOccupancyMaxPotentialBlockSizeWithFlags(
     blockSizeLimit: ::std::os::raw::c_int,
     flags: ::std::os::raw::c_uint,
 ) -> CUresult {
-    r#impl::unimplemented()
+    let _ = flags;
+    r#impl::occupancy::max_potential_block_size(
+        minGridSize,
+        blockSize,
+        func.decuda(),
+        blockSizeToDynamicSMemSize,
+        dynamicSMemSize,
+        blockSizeLimit,
+    )
+    .encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -4260,7 +5091,13 @@ pub extern "system" fn cuOccupancyAvailableDynamicSMemPerBlock(
     numBlocks: ::std::os::raw::c_int,
     blockSize: ::std::os::raw::c_int,
 ) -> CUresult {
-    r#impl::unimplemented()
+    r#impl::occupancy::available_dynamic_smem_per_block(
+        dynamicSmemSize,
+        func.decuda(),
+        numBlocks,
+        blockSize,
+    )
+    .encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -4643,6 +5480,28 @@ pub extern "system" fn cuGetExportTable(
     pExportTableId: *const CUuuid,
 ) -> CUresult {
     r#impl::export_table::get(ppExportTable, pExportTableId)
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuGetProcAddress(
+    symbol: *const ::std::os::raw::c_char,
+    pfn: *mut *mut ::std::os::raw::c_void,
+    cudaVersion: ::std::os::raw::c_int,
+    flags: cuuint64_t,
+    symbolStatus: *mut CUdriverProcAddressQueryResult,
+) -> CUresult {
+    r#impl::driver_proc_address::get(symbol, pfn, cudaVersion, flags, symbolStatus).encuda()
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuGetProcAddress_v2(
+    symbol: *const ::std::os::raw::c_char,
+    pfn: *mut *mut ::std::os::raw::c_void,
+    cudaVersion: ::std::os::raw::c_int,
+    flags: cuuint64_t,
+    symbolStatus: *mut CUdriverProcAddressQueryResult,
+) -> CUresult {
+    r#impl::driver_proc_address::get(symbol, pfn, cudaVersion, flags, symbolStatus).encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]

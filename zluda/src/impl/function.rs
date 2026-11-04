@@ -115,12 +115,26 @@ pub fn launch_kernel(
                 return Err(e);
             }
         };
+        // ZLUDA_DUMP_PARAMS=<substring> prints the bytes of every argument of a
+        // matching launch. A kernel that only misbehaves for some inputs cannot
+        // be diagnosed from the source alone, and the parameter block is the
+        // only place the difference shows.
+        let dump_this = std::env::var("ZLUDA_DUMP_PARAMS")
+            .map(|want| func.name.to_string_lossy().contains(want.as_str()))
+            .unwrap_or(false);
         if kernel_params != ptr::null_mut() {
             for (i, arg_size) in func.arg_size.iter().enumerate() {
-                if let Err(e) = unsafe {
-                    func.base
-                        .set_arg_raw(i as u32, *arg_size, *kernel_params.add(i))
-                } {
+                let value = unsafe { *kernel_params.add(i) };
+                if dump_this {
+                    if value.is_null() {
+                        eprintln!("param[{}] size={} null", i, arg_size);
+                    } else {
+                        let bytes =
+                            unsafe { std::slice::from_raw_parts(value as *const u8, *arg_size) };
+                        eprintln!("param[{}] size={} {:02x?}", i, arg_size, bytes);
+                    }
+                }
+                if let Err(e) = unsafe { func.base.set_arg_raw(i as u32, *arg_size, value) } {
                     if trace {
                         eprintln!(
                             "launch_kernel: set_arg_raw({}, {}) failed: {:?}",

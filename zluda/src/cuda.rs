@@ -2590,15 +2590,8 @@ pub extern "system" fn cuModuleUnload(hmod: CUmodule) -> CUresult {
 // CUDA 12 "library" API.
 //
 // libcudart 12.4 resolves the module loader with plain dlsym() on
-// libcuda.so.1 instead of going through the CUDART_INTERFACE dark API:
-//
-//     dlsym(handle, "cuLibraryLoadData")
-//     dlsym(handle, "cuLibraryLoadFromFile")
-//
-// When those symbols are missing, the runtime falls back to an internal stub
-// that fails with cudaErrorNotSupported (801) and every runtime-API kernel
-// launch dies with it. These entry points therefore have to exist in
-// libnvcuda.so for the runtime API to work at all.
+// libcuda.so.1; without these symbols it falls back to a stub that fails with
+// cudaErrorNotSupported and the runtime API cannot launch anything.
 
 #[cfg_attr(not(test), no_mangle)]
 pub extern "system" fn cuLibraryLoadData(
@@ -2729,8 +2722,8 @@ pub extern "system" fn cuLibraryGetGlobalSize(
     r#impl::library::get_global(std::ptr::null_mut(), library.decuda(), name, size).encuda()
 }
 
-// cudart calls this during its lazy global init; missing it used to trip the
-// cuGetProcAddress fallback. CUDA 12 default module loading mode is LAZY.
+// cudart calls this during its lazy global init. CUDA 12 defaults to LAZY
+// module loading mode.
 #[cfg_attr(not(test), no_mangle)]
 pub extern "system" fn cuModuleGetLoadingMode(
     psm: *mut ::std::os::raw::c_uint,
@@ -2869,8 +2862,8 @@ pub extern "system" fn cuMemAllocPitch_v2(
     if dptr == ::std::ptr::null_mut() || pPitch == ::std::ptr::null_mut() {
         return CUresult::CUDA_ERROR_INVALID_VALUE;
     }
-    // CUDA aligns pitches to 512 bytes. ElementSizeBytes is a hint; we use
-    // it to round the pitch to a multiple of the element size.
+    // CUDA aligns pitches to 512 bytes; ElementSizeBytes rounds the pitch up to
+    // a multiple of the element size.
     let mut pitch = (WidthInBytes + 511) & !511usize;
     if ElementSizeBytes > 1 {
         let esz = ElementSizeBytes as usize;
@@ -4290,8 +4283,8 @@ pub extern "system" fn cuLaunchKernel(
     rc
 }
 
-// CUDA 12.4+: extended launch API. libcublasLt resolves this at dlopen
-// time; delegate to the plain launch path (attrs currently unsupported).
+// CUDA 12.4+: extended launch API. libcublasLt resolves this at dlopen time;
+// it delegates to the plain launch path.
 #[cfg_attr(not(test), no_mangle)]
 pub extern "system" fn cuLaunchKernelEx(
     config: *const CUlaunchConfig,
@@ -4303,10 +4296,9 @@ pub extern "system" fn cuLaunchKernelEx(
         return CUresult::CUDA_ERROR_INVALID_VALUE;
     }
     let config = unsafe { &*config };
-    // Ignore CU_LAUNCH_ATTRIBUTE_* (cluster dims, programmatic serialization,
-    // ...): our immediate-command-list streams are already in-order, and
-    // MAX passes attributes on every launch. Semantics are preserved for
-    // the attribute classes we don't implement by plain sequential launch.
+    // CU_LAUNCH_ATTRIBUTE_* (cluster dims, programmatic serialization, ...) are
+    // ignored: the immediate-command-list streams are already in-order, and
+    // MAX passes attributes on every launch.
     let trace = std::env::var_os("ZLUDA_TRACE_LAUNCH").is_some();
     if trace {
         eprintln!(

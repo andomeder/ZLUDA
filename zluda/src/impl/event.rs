@@ -1,11 +1,8 @@
 //! CUDA event (cuEvent*) support on top of Level Zero events.
 //!
-//! Events are pooled per-device. `cuEventCreate` allocates an L0 event from
-//! the device's host-visible event pool, `cuEventRecord` appends a barrier to
-//! the given stream that signals that event, and `cuEventQuery` /
-//! `cuEventSynchronize` wait on it. `cuEventElapsedTime` uses host wall-clock
-//! timestamps captured at record time, which is accurate enough for the
-//! millisecond-scale results CUDA apps expect from this API.
+//! Events come from the device's host-visible pool; `cuEventRecord` appends a
+//! barrier to the stream that signals the event. `cuEventElapsedTime` uses host
+//! wall-clock timestamps captured at record time.
 
 use super::{
     stream::Stream,
@@ -64,19 +61,17 @@ impl EventData {
             .inner
             .as_ref()
             .ok_or(CUresult::CUDA_ERROR_INVALID_HANDLE)?;
-        // Only take the stream lock here; the caller must NOT hold the global
-        // lock, otherwise lock_stream's Self::lock would deadlock (std Mutex
-        // is not reentrant).
+        // Only the stream lock is taken here; the caller must not hold the
+        // global lock, because lock_stream would deadlock (not reentrant).
         GlobalState::lock_stream(stream, |stream_data| {
             let empty = [];
             let last_event = stream_data.get_last_event();
             let last_event_array = last_event.map(|e| [e]);
             let wait = last_event_array.as_ref().map_or(&empty[..], |arr| &arr[..]);
-            // CUDA semantics: recording an event re-arms it. L0 events stay
-            // signaled until explicitly reset, so reset BEFORE appending the
-            // signaling barrier - otherwise a reused event reports stale
-            // readiness instantly and callers free buffers while DMA is still
-            // in flight (GPU page faults / engine wedges downstream).
+            // Recording re-arms the event: L0 events stay signaled until
+            // explicitly reset, so reset BEFORE appending the signaling
+            // barrier, or a reused event reports stale readiness and callers
+            // free buffers while DMA is still in flight.
             let _ = ev.host_reset();
             let cmd_list = unsafe { transmute_lifetime(&stream_data.cmd_list) };
             unsafe {
@@ -84,9 +79,8 @@ impl EventData {
                     return Err(e).map_err(|_| CUresult::CUDA_ERROR_UNKNOWN);
                 }
             }
-            // Note: we don't push this event into the stream's busy_events
-            // because the stream would then try to reuse it via the pool.
-            // cuEventRecord semantics are satisfied by the barrier above.
+            // The event is not pushed into the stream's busy_events, because
+            // the stream would then recycle it through the pool.
             Ok::<(), CUresult>(())
         })?;
         self.recorded = true;
@@ -133,9 +127,8 @@ impl EventData {
 
 impl Drop for EventData {
     fn drop(&mut self) {
-        // The L0 Event's Drop destroys the underlying handle; the pool's
-        // slot bitmap entry for this event is never freed, but that is
-        // acceptable given the small leak per event lifetime.
+        // The L0 Event's Drop destroys the handle; the pool's slot bitmap entry
+        // is never freed, a small leak per event lifetime.
         let _ = self.inner.take();
     }
 }
@@ -207,11 +200,10 @@ pub(crate) fn destroy_v2(ev: *mut Event) -> Result<(), CUresult> {
     if ev == ptr::null_mut() {
         return Err(CUresult::CUDA_ERROR_INVALID_HANDLE);
     }
-    // Read the pool slot id while the object is still alive, drop the L0
-    // event FIRST, and only then return the slot. Reordering this (free
-    // slot before zeEventDestroy) lets a recycled index get a new
-    // zeEventCreate while the old event still exists on that index,
-    // violating L0's one-event-per-pool-index and wedging the queue.
+    // Drop the L0 event FIRST and only then return the pool slot: reordering
+    // this lets a recycled index get a new zeEventCreate while the old event
+    // still exists on it, which violates one-event-per-pool-index and wedges
+    // the queue.
     let marker = GlobalState::lock(|_| {
         unsafe { &*ev }
             .as_result()

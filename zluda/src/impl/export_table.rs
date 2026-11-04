@@ -17,9 +17,8 @@ pub fn get(table: *mut *const std::os::raw::c_void, id: *const CUuuid) -> CUresu
     if table == ptr::null_mut() {
         return CUresult::CUDA_ERROR_INVALID_VALUE;
     }
-    // Some cudart versions call cuGetExportTable with a null GUID (e.g. during
-    // the integrity-check probe). Return the CUDART_INTERFACE table in that
-    // case rather than erroring out.
+    // Some cudart versions call cuGetExportTable with a null GUID and expect
+    // the CUDART_INTERFACE table rather than an error.
     if id == ptr::null_mut() {
         unsafe { *table = CUDART_INTERFACE_VTABLE.as_ptr() as *const _ };
         return CUresult::CUDA_SUCCESS;
@@ -88,10 +87,8 @@ static TOOLS_RUNTIME_CALLBACK_HOOKS_VTABLE: [VTableEntry; TOOLS_RUNTIME_CALLBACK
         ptr: runtime_callback_hooks_fn1 as *const (),
     },
     VTableEntry {
-        // cudaLaunchKernel calls this slot with three pointers and ignores
-        // the return value. It is part of the tools-callback plumbing whose
-        // exact contract the driver does not need to fulfil for a launch to
-        // work, so it is a no-op.
+        // A no-op: cudart calls this slot with three pointers during a launch
+        // and ignores the result.
         ptr: runtime_callback_hooks_fn3 as *const (),
     },
     VTableEntry {
@@ -103,15 +100,11 @@ static TOOLS_RUNTIME_CALLBACK_HOOKS_VTABLE: [VTableEntry; TOOLS_RUNTIME_CALLBACK
     },
 ];
 
-// Scratch space handed to cudart through the "unknown buffer" hooks. cudart
+// Scratch space handed to cudart through the "unknown buffer" hooks: cudart
 // treats it as an opaque driver-owned block and reads a capability word out of
-// it before it will run a kernel through the runtime API.
-//
-// The block is 4096 bytes (512 u64). cudart 12.4 reads a u32 at offset 0x34c
-// and refuses to launch (cudaErrorNotSupported, 801) when it is zero, so the
-// driver has to publish a non-zero value there. We report the highest CUDA
-// driver version we emulate (see `driver_get_version`), which is a stable
-// non-zero marker for "this driver supports runtime launches".
+// it. cudart 12.4 reads a u32 at 0x34c and refuses to launch
+// (cudaErrorNotSupported) while it is zero, so a non-zero value is published
+// there.
 const TOOLS_RUNTIME_CALLBACK_HOOKS_FN1_CAPABILITY_OFFSET: usize = 0x34c;
 const TOOLS_RUNTIME_CALLBACK_HOOKS_FN1_CAPABILITY_VALUE: u32 = 1;
 static mut TOOLS_RUNTIME_CALLBACK_HOOKS_FN1_SPACE: [usize; 512] = [0; 512];
@@ -139,10 +132,8 @@ unsafe extern "system" fn runtime_callback_hooks_fn1(ptr: *mut *mut usize, size:
     *size = TOOLS_RUNTIME_CALLBACK_HOOKS_FN1_SPACE.len();
 }
 
-// Slot 1 of the runtime-callback-hooks table. cudart calls this with a
-// message code, a pointer to a status slot and a count, expecting the
-// driver to publish a per-thread status. We always report success (0):
-// every operation the runtime asks us about is one we support.
+// Publish a per-thread status for the runtime's callback hooks. Every
+// operation cudart asks about here is one we support, so the status is 0.
 unsafe extern "system" fn runtime_callback_hooks_fn2(
     _code: c_int,
     status: *mut c_int,
@@ -154,11 +145,9 @@ unsafe extern "system" fn runtime_callback_hooks_fn2(
     0
 }
 
-// Slot 4 of the runtime-callback-hooks table. cudart calls it with the same
-// shape as slot 1: a status code, a pointer to a status slot and a size.
-// The runtime only reads the status slot, so publishing 0 (success) is
-// enough. Leaving the slot untouched makes cudart read a stale value and
-// abort the launch.
+// Same shape as fn2 and used while cudart builds a launch config. The status
+// slot must be written: leaving it untouched makes cudart read a stale value
+// and abort the launch.
 unsafe extern "system" fn runtime_callback_hooks_fn4(
     _code: c_int,
     status: *mut c_int,
@@ -172,9 +161,9 @@ unsafe extern "system" fn runtime_callback_hooks_fn4(
 
 static mut TOOLS_RUNTIME_CALLBACK_HOOKS_FN5_SPACE: [u8; 16] = [0; 16];
 
-// cudart requires the size reported here to be > 13 (0xd), otherwise
-// it treats the tools-callback-hooks interface as invalid and fails init
-// with cudaErrorInsufficientDriver (35).
+// The size reported here has to be > 13 (0xd), otherwise cudart treats the
+// tools-callback-hooks interface as invalid and fails init with
+// cudaErrorInsufficientDriver.
 unsafe extern "system" fn runtime_callback_hooks_fn5(
     ptr: *mut *mut u8,
     size: *mut usize,
@@ -205,8 +194,8 @@ static CONTEXT_CHECKS_VTABLE: [VTableEntry; CONTEXT_CHECKS_LENGTH] = [
     },
 ];
 
-// cudart calls these during init; both are documented in upstream ZLUDA's
-// dark_api as "seems to always return 0".
+// cudart calls both of these during init; both answer the same way upstream
+// ZLUDA's dark_api does (zero and one).
 unsafe extern "system" fn context_check(
     _ctx_in: CUcontext,
     result1: *mut u32,
@@ -278,33 +267,6 @@ fn cudart_interface_fn1_impl(
     Ok(())
 }
 
-/*
-fat_cubin:
-typedef struct {
-  int magic;
-  int version;
-  const unsigned long long* data;
-  void *filename_or_fatbins;  /* version 1: offline filename,
-                               * version 2: array of prelinked fatbins */
-} __fatBinC_Wrapper_t;
-
-data start with this header:
-#define FATBIN_MAGIC 0xBA55ED50U
-#define OLD_STYLE_FATBIN_MAGIC 0x1EE55A01U
-#define FATBIN_VERSION 0x0001U
-
-struct fatbinary_ALIGN_(8) fatBinaryHeader
-{
-  unsigned int           magic;   // FATBIN_MAGIC
-  unsigned short         version; // FATBIN_VERSION
-  unsigned short         headerSize;
-  unsigned long long int fatSize; // size of the entire fat binary excluding this header
-};
-
-there's binary data after header
-
-*/
-
 const FATBINC_MAGIC: c_uint = 0x466243B1;
 const FATBINC_VERSION: c_uint = 0x1;
 
@@ -339,21 +301,14 @@ unsafe extern "system" fn get_module_from_cubin(
     {
         return CUresult::CUDA_ERROR_INVALID_VALUE;
     }
-    // The fatbin parsing lives in one place (impl::fatbin); it knows the
-    // variable-size record headers, the LZ4-compressed PTX records and the
-    // difference between a fatbinc wrapper and a bare fatbin frame.
+    // The parsing itself lives in impl::fatbin: one source of truth for the
+    // variable-size record headers and the LZ4-compressed PTX records.
     module::load_fatbin(result.decuda(), fatbinc_wrapper as *const c_void).encuda()
 }
 
-// Slot 6 of the CUDART_INTERFACE table.
-//
-// cudart 12.4 calls this with the fatbinc wrapper and three extra
-// out-parameters (the last one is a u32 flag that is zero in practice).
-// Upstream ZLUDA rejects the call when the extra pointers are non-null,
-// which works for the cudart versions upstream was tested against but not
-// for 12.4: the runtime always passes them. The extra arguments are only
-// outputs, so we load the module regardless and let the caller overwrite
-// them.
+// Cudart 12.4 calls this with the fatbinc wrapper plus three extra
+// out-parameters that are always non-null; they are outputs only, so the
+// module is loaded regardless and the caller overwrites them.
 unsafe extern "system" fn get_module_from_cubin_ext(
     result: *mut CUmodule,
     fatbinc_wrapper: *const FatbincWrapper,
@@ -381,16 +336,14 @@ static TOOLS_TLS_VTABLE: [VTableEntry; TOOLS_TLS_LENGTH] = [
     VTableEntry { ptr: tools_tls_get as *const () },
 ];
 
-// Per-thread slots used by cudart's runtime to stash context-local state
-// while it assembles a launch configuration. The keys are opaque pointers
-// owned by cudart; we only need to give every key a stable, per-thread home
-// so a later get() returns what set() stored.
+// Per-thread slots used by cudart's runtime to stash context-local state while
+// it assembles a launch configuration. The keys are opaque pointers owned by
+// cudart.
 //
-// Slot layout (as used by cudart 12.4):
-//   [1] get(key)           -> stored value, or NULL if nothing was stored
+//   [1] get(key)          -> stored value, or NULL
 //   [2] set(key, value)   -> stores the value for the calling thread
-//   [3] destroy(value)     -> releases a value handed out by get()
-//   [4] get(key)          -> same accessor, used for a second key domain
+//   [3] destroy(value)    -> releases a value handed out by get()
+//   [4] get(key)          -> same accessor, second key domain
 thread_local! {
     static TOOLS_TLS_VALUES: std::cell::RefCell<std::collections::HashMap<usize, usize>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
@@ -426,10 +379,9 @@ const CONTEXT_LOCAL_STORAGE_INTERFACE_V0301_GUID: CUuuid = CUuuid {
 };
 
 // cudart 12.x uses the modern keyed interface (upstream ZLUDA dark_api):
-//   [0] = put(context, key, value, dtor_cb)
-//   [1] = delete(context, key)
-//   [2] = get(value_out, context, key)
-// The 2021-era {ctor, dtor, get_state} layout is NOT what modern runtimes call.
+//   [0] put(context, key, value, dtor_cb)
+//   [1] delete(context, key)
+//   [2] get(value_out, context, key)
 static CONTEXT_LOCAL_STORAGE_INTERFACE_V0301_VTABLE: [VTableEntry; 4] = [
     VTableEntry {
         ptr: context_local_storage_put as *const (),
@@ -513,12 +465,9 @@ fn context_local_storage_get_impl(
     }
 }
 
-// The runtime stores its per-context state in the driver's context local
-// storage, keyed by an opaque address. The key is a process wide address (the
-// runtime passes the address of its own variable), and the runtime stores
-// into it while it registers its fatbins - that is before any CUDA context
-// exists. The store therefore cannot live in the context: it has to be
-// reachable without one.
+// The runtime stores its per-context state here keyed by the address of its
+// own variable, and does so while registering fatbins - before any CUDA
+// context exists. The storage therefore cannot live in the context.
 fn local_storage() -> &'static std::sync::Mutex<std::collections::HashMap<usize, context::LocalStorageEntry>> {
     static STORAGE: std::sync::LazyLock<
         std::sync::Mutex<std::collections::HashMap<usize, context::LocalStorageEntry>>,
@@ -560,8 +509,7 @@ static CTX_CREATE_BYPASS_VTABLE: [VTableEntry; CTX_CREATE_BYPASS_LENGTH] = [
     },
 ];
 
-// I have no idea what is the difference between this function and
-// cuCtxCreate_v2, but PhysX uses both interchangeably
+// PhysX uses this and cuCtxCreate_v2 interchangeably, so it forwards.
 extern "system" fn ctx_create_v2_bypass(
     pctx: *mut CUcontext,
     flags: ::std::os::raw::c_uint,
@@ -598,7 +546,8 @@ static HEAP_ACCESS_VTABLE: [VTableEntry; HEAP_ACCESS_LENGTH] = [
     },
 ];
 
-// TODO: reverse and implement for Linux
+// Not modelled: the heap is a null allocator (see os_unix), so these only
+// keep the table's shape for callers that fetch it.
 unsafe extern "system" fn heap_alloc(
     halloc_ptr: *mut *const HeapAllocRecord,
     arg1: usize,
@@ -628,7 +577,7 @@ unsafe extern "system" fn heap_alloc(
     }
 }
 
-// TODO: reverse and implement for Linux
+// See heap_alloc.
 unsafe extern "system" fn heap_free(halloc: *mut HeapAllocRecord, arg1: *mut usize) -> CUresult {
     if halloc == ptr::null_mut() {
         return CUresult::CUDA_ERROR_INVALID_VALUE;
@@ -661,9 +610,9 @@ static INTEGRITY_CHECK_VTABLE: [VTableEntry; INTEGRITY_CHECK_LENGTH] = [
     VTableEntry { ptr: ptr::null() },
 ];
 
-// CUDA driver integrity check (NVIDIA's anti-tamper protocol). CUDA 12.x
-// libcudart requests this table from cuGetExportTable during init and
-// validates the returned hash. Ported from upstream ZLUDA's dark_api.
+// CUDA driver integrity check (NVIDIA's anti-tamper handshake): libcudart
+// requests this table during init and validates the returned hash. Ported from
+// upstream ZLUDA's dark_api.
 unsafe extern "system" fn integrity_check(
     version: u32,
     unix_seconds: u64,
@@ -766,7 +715,7 @@ fn integrity_check_impl(
         1 => return [0x1841181C03CB675C, 0x8ED383AA1F4CD1E8],
         _ => {}
     }
-    // There's first computation pass, but it does not use any input and effectively computes this
+    // The first pass uses no input, so its result is a constant.
     let pass1_result = [
         0x14u8, 0x6A, 0xDD, 0xAE, 0x53, 0xA9, 0xA7, 0x52, 0xAA, 0x08, 0x41, 0x36, 0x0B, 0xF5, 0x5A,
         0x9F,

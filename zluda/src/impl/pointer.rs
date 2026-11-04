@@ -12,10 +12,9 @@ pub struct Allocation {
     pub context: *mut context::Context,
 }
 
-/// Tracks allocations per context so cuPointerGetAttribute can classify an
-/// arbitrary pointer (base or interior) as device/host and report its range.
-/// The registry lives in ContextData and is only accessed under the global
-/// state lock, so no locking of its own is needed.
+/// Tracks allocations so cuPointerGetAttribute can classify an arbitrary
+/// pointer (base or interior) and report its range. Only accessed under the
+/// global state lock, so it needs no locking of its own.
 #[derive(Default)]
 pub struct PointerRegistry {
     /// Sorted by base address for range lookups.
@@ -31,7 +30,6 @@ impl PointerRegistry {
         self.ranges.insert(alloc.base as usize, alloc);
     }
 
-    /// Removes an allocation. Returns the removed metadata.
     pub fn unregister(&mut self, ptr: *mut c_void) -> Option<Allocation> {
         self.ranges.remove(&(ptr as usize))
     }
@@ -69,11 +67,10 @@ pub fn write_attribute(
     const RANGE_SIZE: u32 = 12;
     const MAPPED: u32 = 13;
     match attribute {
-        // CU_POINTER_ATTRIBUTE_CONTEXT: the context that owns the pointer.
         CONTEXT => unsafe {
             *(data as *mut *mut c_void) = alloc.context as *mut c_void;
         },
-        // CU_POINTER_ATTRIBUTE_MEMORY_TYPE: CU_MEMORYTYPE_DEVICE=2 / CU_MEMORYTYPE_HOST=1.
+        // CU_MEMORYTYPE_DEVICE=2 / CU_MEMORYTYPE_HOST=1.
         MEMORY_TYPE => unsafe {
             *(data as *mut c_int) = if alloc.is_host { 1 } else { 2 };
         },
@@ -96,15 +93,15 @@ pub fn write_attribute(
             *(data as *mut usize) = alloc.size;
         },
         MAPPED => unsafe {
-            // Managed-memory mapped flag; host-visible device mem maps to true.
+            // Host-visible memory counts as mapped.
             *(data as *mut c_int) = if alloc.is_host { 1 } else { 0 };
         },
         BUFFER_ID => unsafe {
             // Synthetic buffer id: the base address (stable, unique).
             *(data as *mut u64) = alloc.base as u64;
         },
-        // Unsupported attributes return INVALID_VALUE like real CUDA for
-        // attributes that don't apply to this pointer kind.
+        // Unsupported attributes return INVALID_VALUE, as CUDA does for an
+        // attribute that does not apply to the pointer.
         _ => return Err(CUresult::CUDA_ERROR_INVALID_VALUE),
     }
     Ok(())

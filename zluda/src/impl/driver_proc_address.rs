@@ -7,13 +7,11 @@ const CU_GET_PROC_ADDRESS_SUCCESS: u32 = 0;
 const CU_GET_PROC_ADDRESS_SYMBOL_NOT_FOUND: u32 = 1;
 const CU_GET_PROC_ADDRESS_VERSION_NOT_SUFFICIENT: u32 = 2;
 
-/// Driver entry points known to the CUDA driver API. Taken from upstream
-/// ZLUDA's generated process table. libcudart distinguishes
-/// VERSION_NOT_SUFFICIENT from SYMBOL_NOT_FOUND: if a symbol is "not found"
-/// but the runtime believes a driver of the reported version must have it,
-/// cudart treats the driver as non-compliant and bails with
-/// cudaErrorInsufficientDriver (35). Reporting VERSION_NOT_SUFFICIENT is the
-/// correct way to say "this driver is too old for that symbol".
+/// Driver entry points known to the CUDA driver API, from upstream ZLUDA's
+/// generated process table. libcudart distinguishes VERSION_NOT_SUFFICIENT from
+/// SYMBOL_NOT_FOUND: a symbol it expects a driver of the reported version to
+/// have, reported as missing, makes it treat the driver as non-compliant and
+/// bail with cudaErrorInsufficientDriver.
 const KNOWN_SYMBOLS: &[&str] = &[
     "cuArray3DCreate",
     "cuArray3DGetDescriptor",
@@ -498,9 +496,9 @@ const KNOWN_SYMBOLS: &[&str] = &[
 
 /// cuGetProcAddress_v2: resolve a driver entry point by name.
 ///
-/// libcudart (12.x) probes the driver through this API instead of dlsym'ing
-/// every symbol. All of our `cu*` functions are exported with their exact
-/// name, so we resolve by dlsym on our own shared object.
+/// libcudart 12.x probes the driver through this API instead of dlsym'ing
+/// every symbol; our `cu*` functions are exported under their exact names, so
+/// the lookup is a dlsym on our own shared object.
 pub fn get(
     symbol: *const c_char,
     pfn: *mut *mut c_void,
@@ -541,11 +539,10 @@ pub fn get(
             }
             Ok(())
         } else if KNOWN_SYMBOLS.contains(&base) {
-            // Known driver API that we have not implemented. Handing back a
-            // stub that fails at call time keeps libcudart's symbol table
-            // complete: reporting this as version-not-sufficient makes cudart
-            // flag the entire driver as too old (error 36 on every runtime
-            // call), while a call-time failure is handled per-API.
+            // Known driver API that is not implemented: hand back a stub that
+            // fails at call time. Reporting version-not-sufficient instead
+            // makes cudart flag the whole driver as too old, failing every
+            // runtime call.
             *pfn = unsupported_api_stub as *mut c_void;
             if !symbol_status.is_null() {
                 *symbol_status = CUdriverProcAddressQueryResult(CU_GET_PROC_ADDRESS_SUCCESS);
@@ -561,9 +558,9 @@ pub fn get(
     }
 }
 
-// Generic fallback for driver APIs we know of but have not implemented.
-// Any real signature is ABI-compatible on x86-64 (arguments are ignored,
-// CUresult is returned in eax), so one no-argument stub serves them all.
+// Generic fallback for driver APIs we know of but have not implemented. Every
+// real signature is ABI-compatible with this one on x86-64 (arguments ignored,
+// CUresult returned in eax).
 extern "system" fn unsupported_api_stub() -> CUresult {
     super::unimplemented()
 }

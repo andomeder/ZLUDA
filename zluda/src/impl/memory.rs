@@ -22,14 +22,8 @@ context: ctx_ptr,
 });
 Ok::<_, CUresult>(alloc_ptr)
 })??;
-// A fresh allocation is cleared. CUDA does not promise that in so many words,
-// but the memory an application gets from cudaMalloc reads as zeros on the
-// reference platform often enough that applications rely on it: a kernel whose
-// loop bound, flag or padding comes from a buffer it forgot to initialise runs
-// on that driver and either computes garbage or spins forever on this one.
-// Measured on llama.cpp: without this, 5 of 6 runs died with a stream that
-// never completed; with it, none did. ZLUDA_NO_ALLOC_ZERO turns it off for a
-// benchmark that wants the raw allocator.
+// A fresh allocation is cleared: applications rely on cudaMalloc memory
+// reading as zeros. ZLUDA_NO_ALLOC_ZERO=1 opts out.
 if std::env::var_os("ZLUDA_NO_ALLOC_ZERO").is_none() && bytesize > 0 {
     set_d8_v2(alloc_ptr, 0, bytesize, stream::CU_STREAM_LEGACY)?;
 }
@@ -43,16 +37,11 @@ pub fn alloc_v2(dptr: *mut *mut c_void, bytesize: usize) -> Result<(), CUresult>
 }
 
 pub fn copy_v2(dst: *mut c_void, src: *const c_void, bytesize: usize) -> Result<(), CUresult> {
-// A blocking copy runs on the legacy stream, and CUDA orders the legacy
-// stream against every other blocking stream: work that was queued on the
-// application's stream has to finish first, otherwise the copy reads a buffer
-// that a kernel still has to write (or overwrites one a kernel still reads).
-// The immediate command lists of the two streams are independent queues, so
-// the ordering has to be made here.
+// A blocking copy runs on the legacy stream, which CUDA orders against every
+// other blocking stream. The immediate command lists are independent queues,
+// so the ordering has to be made here.
 GlobalState::synchronize_context_streams()?;
-// Sync cudaMemcpy* must block until the copy retires (real CUDA semantics).
-// Enqueue alone races a following DtoH readback (probe: 199/200 mismatches,
-// 0/200 with an intervening cuCtxSynchronize).
+// A sync copy must block until it retires, or a following readback races it.
 GlobalState::lock_enqueue(stream::CU_STREAM_LEGACY, |cmd_list, signal, wait| {
     unsafe { cmd_list.append_memory_copy_raw(dst, src, bytesize, Some(signal), wait)? };
     Ok(())
@@ -61,16 +50,9 @@ stream::synchronize(stream::CU_STREAM_LEGACY)?;
 Ok(())
 }
 
-/// A pinned staging buffer taken from the pool.
-///
-/// The pool hands each buffer to one copy at a time: a copy from another
-/// thread takes a different one. Sharing a single buffer per size class was a
-/// data race - two copies of the same class overwrote each other's data, which
-/// showed up as a corrupted hidden state that came and went between runs.
-///
-/// Buffers are never freed, so a buffer that is returned after its copy has
-/// retired can always be handed out again. Every caller waits for its copy
-/// before dropping this, which is what makes the reuse safe.
+/// A pinned staging buffer taken from the pool. One copy holds a buffer at a
+/// time; the driver faults when a copy engine touches pageable host memory.
+/// Buffers are never freed, only returned once their copy has retired.
 struct Staging {
     class: usize,
     ptr: *mut c_void,
@@ -83,12 +65,9 @@ impl Drop for Staging {
     }
 }
 
-/// The size class a buffer of `bytesize` is rounded up to.
-///
-/// Classes are powers of two from 1 MiB up: applications copy many distinct
-/// sizes, and keying by the exact size allocates a permanent pinned buffer per
-/// size until host memory runs out (which the driver eventually reports as a
-/// garbage error code).
+/// The size class a buffer of `bytesize` is rounded up to. Classes are powers
+/// of two from 1 MiB up: keying by the exact size pins a buffer per size until
+/// host memory runs out.
 fn staging_class(bytesize: usize) -> usize {
     bytesize.max(1 << 20).next_power_of_two().max(1 << 20)
 }
@@ -119,8 +98,7 @@ fn take_staging(bytesize: usize) -> Result<Staging, CUresult> {
 }
 
 /// True if `p` is NOT inside a tracked pinned-host allocation. Callers pass
-/// direction-appropriate HOST-side operands only (device pointers are also
-/// "untracked-host" by this definition but never reach it).
+/// direction-appropriate host-side operands only.
 fn host_untracked(p: *const c_void) -> bool {
     GlobalState::lock_current_context_unchecked(|ctx| {
         let ctx_data = ctx.as_result_mut()?;
@@ -160,9 +138,9 @@ pub fn copy_htod_async(
     hstream: *mut stream::Stream,
 ) -> Result<(), CUresult> {
     if host_untracked(src) {
-        // Unpinned host source: bounce through cached pinned staging so the
-        // DMA never touches malloc'd pages (xe faults on those). Synchronize
-        // before returning so the staging buffer is safe to reuse.
+        // Unpinned host source: bounce through the pinned staging pool, since
+        // the engine faults on pageable pages. Synchronize before returning so
+        // the staging buffer is safe to reuse.
         let stage = take_staging(bytesize)?;
         unsafe { ptr::copy_nonoverlapping(src.cast::<u8>(), stage.ptr.cast::<u8>(), bytesize) };
         copy_async(dst, stage.ptr, bytesize, hstream)?;
@@ -210,9 +188,8 @@ pub fn copy_htod(
     src: *const c_void,
     bytesize: usize,
 ) -> Result<(), CUresult> {
-    // A blocking copy on the legacy stream is ordered against every other
-    // blocking stream, so the work the application queued has to finish
-    // first: the immediate lists are independent queues.
+    // Work queued on the application's streams has to finish first, or the
+    // copy reads a buffer a kernel still has to write.
     GlobalState::synchronize_context_streams()?;
     if host_untracked(src) {
         // Unpinned host source: bounce through cached pinned staging.
@@ -254,17 +231,13 @@ pub fn copy_dtod(dst: *mut c_void, src: *const c_void, bytesize: usize) -> Resul
     if ptr.is_null() {
         return Ok(());
     }
-    // ZLUDA_LEAK_FREE is a diagnostic: a freed buffer is never handed back to
-    // the driver, so no later allocation can land on it. If a difference
-    // between runs disappears with this on, the allocator was reusing memory
-    // that something still referenced.
+    // ZLUDA_LEAK_FREE is a diagnostic: freed memory is never handed back to
+    // the driver, so no later allocation can land on it.
     if std::env::var_os("ZLUDA_LEAK_FREE").is_some() {
         return Ok(());
     }
-    // Real CUDA defers unmapping a buffer until queued work touching it
-    // retires; freeing early wedges the engine with a page fault on the
-    // pending DMA (observed as 'engine reset' + all later immediate lists
-    // never executing). Drain all context streams before unmapping.
+    // Unmapping memory that queued work still references faults the engine and
+    // wedges every later immediate list, so drain the context first.
     GlobalState::synchronize_context_streams()?;
     GlobalState::lock_current_context(|ctx| {
         let dev = unsafe { &mut *ctx.device };
@@ -296,8 +269,8 @@ pub fn get_info_v2(free: *mut usize, total: *mut usize) -> Result<(), CUresult> 
         let dev = unsafe { &mut *ctx.device };
         let mem_props = dev.get_memory_properties().map_err(|_| CUresult::CUDA_ERROR_UNKNOWN)?;
         let total_bytes = mem_props.iter().map(|p| p.totalSize).max().unwrap_or(0) as usize;
-        // L0 doesn't expose free memory; report total as free (pessimistic
-        // but avoids apps refusing to run because they think we're out of mem)
+        // L0 does not expose free memory; report total as free so apps do not
+        // refuse to run thinking the device is out of memory.
         Ok::<_, CUresult>((total_bytes, total_bytes))
     })??;
     unsafe {
@@ -364,9 +337,8 @@ pub fn free_host(p: *mut c_void) -> Result<(), CUresult> {
 if p == ptr::null_mut() {
 return Ok(());
 }
-// Real CUDA defers unmapping host-pinned pages until queued DMA touching
-// them retires; L0 unmaps immediately, which faults in-flight copies and
-// wedges the engine. Drain all context streams before freeing.
+// Real CUDA defers unmapping host-pinned pages until queued DMA touching them
+// retires; L0 unmaps immediately, so drain the context first.
 GlobalState::synchronize_context_streams()?;
 GlobalState::lock_current_context(|ctx| {
         let dev = unsafe { &mut *ctx.device };
@@ -376,11 +348,10 @@ Ok::<_, CUresult>(dev.l0_context.mem_free(p)?)
 .map_err(|_| CUresult::CUDA_ERROR_INVALID_VALUE)?
 }
 
-/// A fill runs on the stream the caller named, not on the legacy stream: two
-/// streams of this driver are two independent command lists, so a fill that
-/// lands on the wrong one has no ordering relationship with the work that reads
-/// it. The pattern value points at the caller's stack, which is why the fill is
-/// waited for before returning.
+/// A fill runs on the stream the caller named: two streams of this driver are
+/// two independent command lists, so a fill on the wrong one has no ordering
+/// relationship with the work that reads it. The pattern points at the
+/// caller's stack, so the fill is waited for before returning.
 fn set_pattern(
     dst: *mut c_void,
     pattern: *mut c_void,
@@ -389,8 +360,7 @@ fn set_pattern(
     hstream: *mut stream::Stream,
 ) -> Result<(), CUresult> {
     if hstream == stream::CU_STREAM_LEGACY {
-        // A fill on the legacy stream is ordered against every other stream,
-        // the same way a copy on it is.
+        // A fill on the legacy stream is ordered against every other stream.
         GlobalState::synchronize_context_streams()?;
     }
     GlobalState::lock_enqueue(hstream, |cmd_list, signal, wait| {
@@ -485,9 +455,9 @@ pub fn memcpy2d(
 ) -> Result<(), CUresult> {
     let src_base = src_ptr(src_type, src_host, src_dev);
     let dst_base = dst_ptr(dst_type, dst_host, dst_dev);
-    // Intel's L0 driver mishandles region copies where the destination pitch
-    // is larger than the region width (padded rows come out zeroed). Decompose
-    // into one contiguous copy per row, which is always correct.
+    // Intel's L0 driver mishandles region copies whose destination pitch is
+    // larger than the width (padded rows come out zeroed), so one contiguous
+    // copy per row is issued instead.
     GlobalState::lock_enqueue(hstream, |cmd_list, signal, wait| {
         for row in 0..height {
             let src_row = unsafe { src_base.add((src_y + row) * src_pitch + src_x) };
@@ -505,8 +475,7 @@ pub fn memcpy2d(
         }
         Ok(())
     })?;
-    // The sync (legacy-stream) variants must block until the copies complete,
-    // otherwise a follow-up host readback can race the last row.
+    // The sync variants must block, or a host readback races the last row.
     if hstream == stream::CU_STREAM_LEGACY || hstream == stream::CU_STREAM_PER_THREAD {
         stream::synchronize(hstream)?;
     }
@@ -539,8 +508,7 @@ pub fn memcpy3d(
 ) -> Result<(), CUresult> {
     let src_base = src_ptr(src_type, src_host, src_dev);
     let dst_base = dst_ptr(dst_type, dst_host, dst_dev);
-    // Decompose into per-row copies (see memcpy2d): Intel's L0 region copy is
-    // unreliable, so a 3D copy is just slices of 2D row loops.
+    // Per-row copies, for the reason given in memcpy2d.
     let src_slice = src_pitch * src_height;
     let dst_slice = dst_pitch * dst_height;
     GlobalState::lock_enqueue(hstream, |cmd_list, signal, wait| {

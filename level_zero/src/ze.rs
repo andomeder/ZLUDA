@@ -434,11 +434,9 @@ impl<'a> Module<'a> {
         Self(NonNull::new_unchecked(x), PhantomData)
     }
 
-    // HACK ALERT
-    // We use OpenCL for now to do SPIR-V linking, because Level0
-    // does not allow linking. Don't let presence of zeModuleDynamicLink fool
-    // you, it's not currently possible to create non-compiled modules.
-    // zeModuleCreate always compiles (builds and links).
+    // OpenCL is used for SPIR-V linking because Level Zero cannot link:
+    // zeModuleCreate always compiles (builds and links), so there is no
+    // non-compiled module to link later.
     pub fn build_link_spirv<'buffers>(
         ctx: &'a Context,
         d: Device,
@@ -515,7 +513,7 @@ impl<'a> Module<'a> {
             None => CString::default(),
         };
         // The programs hold SPIR-V that the linker compiles itself; building
-        // them separately first only adds a step that can fail on its own.
+        // them separately first only adds a failing step.
         ocl_core::link_program::<ocl_core::DeviceId, _>(
             &ocl_ctx,
             Some(&[device]),
@@ -527,11 +525,10 @@ impl<'a> Module<'a> {
         )
     }
 
-    /// The build options that the PTX translator produces mix OpenCL options
-    /// ("-cl-opt-disable") with Level Zero ones ("-ze-denorms-are-zero"). The
-    /// OpenCL calls only accept the former, the module creation only the
-    /// latter: handing a Level Zero option to the OpenCL compiler makes it
-    /// reject the whole build.
+    /// The build options mix OpenCL ones ("-cl-opt-disable") with Level Zero
+    /// ones ("-ze-denorms-are-zero"). The OpenCL calls only accept the former
+    /// and the module creation only the latter: a Level Zero option makes the
+    /// OpenCL compiler reject the whole build.
     fn split_build_options(opts: Option<&CStr>) -> (CString, CString) {
         let opts = match opts {
             Some(o) => o.to_string_lossy().into_owned(),

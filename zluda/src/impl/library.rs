@@ -1,22 +1,12 @@
 //! CUDA 12 "library" API (`cuLibraryLoadData` and friends).
 //!
-//! libcudart 12.4 does not use the `CUDART_INTERFACE` dark API to load a
-//! fatbin. It resolves the driver entry points with plain `dlsym` on
-//! `libcuda.so.1`:
-//!
-//! ```text
-//! dlsym(handle, "cuLibraryLoadData")     -> used to load the module
-//! dlsym(handle, "cuLibraryLoadFromFile") -> used to load a module from disk
-//! ```
-//!
-//! When the symbol is missing, libcudart falls back to an internal stub that
-//! fails with `cudaErrorNotSupported` (801), and every runtime-API kernel
-//! launch dies with that error before any driver work happens. So these
-//! entry points have to exist in `libnvcuda.so` for the runtime API to work
-//! at all.
+//! libcudart 12.4 resolves the module loader with plain `dlsym` on
+//! `libcuda.so.1` rather than through the `CUDART_INTERFACE` dark API, and
+//! falls back to an internal stub failing with `cudaErrorNotSupported` when the
+//! symbol is missing. These entry points therefore have to exist for the
+//! runtime API to work at all.
 //!
 //! A `CUlibrary` is a loaded module; a `CUkernel` is a function inside one.
-//! The handles are opaque pointers that the runtime passes back to us.
 
 use super::module::{self, Module};
 use super::{CUresult, Decuda, Encuda, GlobalState};
@@ -131,8 +121,8 @@ pub(crate) fn get_kernel(
         return Err(e);
     }
     // The runtime hands this handle back to the driver as a CUfunction (for
-    // cuFuncGetAttribute and cuLaunchKernelEx), so the handle has to be the
-    // function handle itself, not a wrapper around it.
+    // cuFuncGetAttribute and cuLaunchKernelEx), so it has to be the function
+    // handle itself, not a wrapper around it.
     if std::env::var_os("ZLUDA_TRACE_LIBRARY").is_some() {
         eprintln!(
             "cuLibraryGetKernel({:?}) -> {:?}",
@@ -162,8 +152,8 @@ pub(crate) fn get_module(
 
 /// `cuLibraryGetGlobal(global, library, name, size)`
 ///
-/// Device globals are not tracked separately by the ZLUDA module loader
-/// (kernels are, globals are not), so there is nothing to hand back.
+/// Globals are not tracked by the module loader, so there is nothing to hand
+/// back.
 pub(crate) fn get_global(
     global_out: *mut crate::cuda::CUdeviceptr,
     library: *mut Library,

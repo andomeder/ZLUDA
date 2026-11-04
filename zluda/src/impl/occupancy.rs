@@ -1,12 +1,10 @@
 //! Occupancy queries (`cuOccupancy*`).
 //!
-//! Applications use these to pick a launch configuration, so they have to
-//! answer something a real device would: the number of blocks of a given size
-//! that fit on one multiprocessor, given the block's threads, registers and
-//! shared memory. The Level Zero properties give the thread and shared memory
-//! limits; the register file is not reported per kernel, so the limit that
-//! comes from it is not modelled (a kernel that is short of registers gets a
-//! group size the driver refuses at launch, which is loud rather than silent).
+//! Applications use these to pick a launch configuration, so they answer what a
+//! real device would from the Level Zero limits. The register file is not
+//! reported per kernel, so the limit that comes from it is not modelled: a
+//! kernel short of registers gets a group size the driver refuses at launch,
+//! which is loud rather than silent.
 
 use super::{device, function, CUresult, GlobalState};
 use crate::cuda::CUdevice_attribute;
@@ -117,8 +115,8 @@ pub fn max_active_blocks_per_multiprocessor_with_flags(
     dynamic_smem: usize,
     _flags: u32,
 ) -> Result<(), CUresult> {
-    // The flags only ask for the same query with the cache configuration
-    // fixed, which a kernel on this device does not choose.
+    // The flags only pin the cache configuration, which a kernel here does not
+    // choose.
     max_active_blocks_per_multiprocessor(num_blocks, func, block_size, dynamic_smem)
 }
 
@@ -151,8 +149,7 @@ pub fn max_potential_block_size(
         ceiling = ceiling.min(block_size_limit);
     }
     // Search in warp sized steps for the size that puts the most threads on a
-    // multiprocessor, the way the CUDA runtime does; the smallest size wins a
-    // tie so that a kernel that is not limited by threads keeps a small block.
+    // multiprocessor; the smallest size wins a tie.
     let mut best_size = 32;
     let mut best_threads = 0;
     let mut best_blocks = 0;

@@ -220,9 +220,9 @@ pub fn launch_kernel(
         }
         Ok::<_, CUresult>(())
     })?;
-    // ZLUDA_SYNC_LAUNCH makes every launch block until it retires. It is a
-    // diagnostic: a difference between running with it and without it is the
-    // difference between a missing ordering and a wrong value.
+    // ZLUDA_SYNC_LAUNCH makes every launch block until it retires, a
+    // diagnostic: a difference with it on separates a missing ordering from a
+    // wrong value.
     if std::env::var_os("ZLUDA_TRACE_STREAM").is_some() {
         if let Ok(func) = unsafe { &mut *f }.as_result_mut() {
             super::stream::remember_launched_kernel(&func.name.to_string_lossy());
@@ -275,10 +275,10 @@ pub(crate) fn get_attribute(
                 props.localMemSize
             }
             CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX => 0,
-            // Attributes ZLUDA does not model (the cluster scheduling ones,
-            // for instance) read as zero, the way CUDA reports the attributes
-            // that do not apply to a kernel. Returning "not supported" here
-            // breaks cudaFuncGetAttributes, which fills a whole struct.
+            // Attributes that are not modelled (the cluster scheduling ones,
+            // for instance) read as zero, the way CUDA reports an attribute
+            // that does not apply. Returning "not supported" breaks
+            // cudaFuncGetAttributes, which fills a whole struct.
             _ => 0,
         })
     })??;
@@ -299,17 +299,16 @@ pub(crate) fn set_attribute(
     }
     GlobalState::lock_function(func, |func| -> Result<(), CUresult> {
         match attrib {
-            // The L0 driver sizes dynamic shared memory per-launch via the
-            // sharedMemBytes argument to cuLaunchKernel, so the setter has no
-            // per-function state to persist.
+            // The L0 driver sizes dynamic shared memory per launch (the
+            // sharedMemBytes argument of cuLaunchKernel), so there is no
+            // per-function state to persist. The remaining attributes are
+            // advisory (cluster dims, cache prefs, scheduling policy) and are
+            // safe to accept-and-ignore on in-order queues; rejecting them
+            // breaks runtimes that set them unconditionally.
             CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES
             | CUfunction_attribute::CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT => {
                 Ok(())
             }
-            // Unknown/advisory attributes (cluster dims, cache prefs,
-            // scheduling policy...) are safe to accept-and-ignore on our
-            // single-die in-order queues; rejecting them breaks runtimes
-            // that probe-set them unconditionally (e.g. MAX).
             _ => Ok(())
         }
     })??;

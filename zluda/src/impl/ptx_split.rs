@@ -1,14 +1,10 @@
 //! Split a PTX translation unit into the part that one kernel needs.
 //!
-//! A fatbin record is a whole translation unit: a program's kernels plus the
-//! functions they share, and one record of llama.cpp is sixteen million SPIR-V
-//! words once translated. A run uses a handful of the kernels in it, so the
-//! record is kept as text and translated per kernel: the entry point that was
-//! asked for plus the functions it reaches through `call`.
-//!
-//! Everything outside the chosen blocks is dropped, including the other entry
-//! points, which keeps a kernel that this translator cannot compile from
-//! failing the whole record.
+//! A fatbin record is a whole translation unit, and one record of llama.cpp is
+//! sixteen million SPIR-V words once translated. A run uses a handful of its
+//! kernels, so the record is kept as text and translated per kernel: the entry
+//! point asked for plus the functions it reaches through `call`. Everything
+//! outside the chosen blocks is dropped, including the other entry points.
 
 /// The name of an entry point or function and the text of its body.
 struct Block<'a> {
@@ -37,11 +33,9 @@ fn strip_comment(line: &str) -> &str {
     }
 }
 
-/// The name of the function a line opens, if it opens one.
-///
-/// The forms are `.entry name(`, `.visible .entry name(`, `.func name(`,
-/// `.visible .func name(`, `.weak .func name(` and the same with a return
-/// value in front of the name: `.func (.param .b8 retval[2]) name(`.
+/// The name of the function a line opens, if it opens one. The forms include
+/// `.entry name(`, `.func name(` (with `.visible`/`.weak`/`.extern`/`.hidden`
+/// prefixes) and `.func (.param .b8 retval[2]) name(`.
 fn function_name(line: &str) -> Option<(&str, bool)> {
     let mut rest = line.trim_start();
     for prefix in [".visible ", ".weak ", ".extern ", ".hidden "] {
@@ -154,8 +148,7 @@ fn callees(body: &str) -> Vec<String> {
         let after = if let Some(after) = after.strip_prefix(".uni") {
             after.trim_start()
         } else if after.starts_with('(') || after.starts_with(';') || after.starts_with('.') {
-            // another `call` prefix (.prototype, .abs, ...) or an unrelated
-            // word that happens to contain "call"
+            // Another `call` prefix or an unrelated word containing "call".
             continue;
         } else {
             after
@@ -221,17 +214,14 @@ pub fn split_for_kernel(text: &str, kernel: &str) -> Option<String> {
     }
     keep.sort_unstable();
     // Every function the kept code calls has to be in the result, either as a
-    // kept block or as a declaration in the header. A function that the record
-    // defines but the closure missed would be replaced by a stub by the
-    // translator, which computes the wrong thing without saying so, so the
-    // split is checked before it is handed over and refused if it is not
-    // complete.
+    // kept block or as a declaration in the header. A callee the closure missed
+    // would be replaced by a stub that computes the wrong thing, so an
+    // incomplete split is refused rather than handed over.
     let defined = |name: &str| -> bool {
         parsed.blocks.iter().any(|block| block.name == name)
     };
     // The name has to appear as a whole identifier: a substring test also
-    // matches a longer symbol or a member of another declaration, and a split
-    // that drops a definition the header only looks like it declares leaves the
+    // matches a longer symbol, and a split that drops a definition leaves the
     // caller with the stub body that returns zero.
     let declared = |name: &str| -> bool {
         parsed
@@ -347,8 +337,7 @@ mod tests {
         assert!(!split.contains(".entry one"));
     }
 
-    // A temporary probe: split a real record and write it out, so it can be
-    // translated and compared with the whole.
+    // Probe: split a real record and write it out for comparison.
     #[test]
     fn dump_real_record() {
         let path = "/home/cloudsurfer/projects/intel-zluda/tmp/rasterizer_impl_app.ptx";

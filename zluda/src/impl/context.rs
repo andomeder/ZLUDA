@@ -12,11 +12,9 @@ thread_local! {
     pub static CONTEXT_STACK: RefCell<Vec<*mut Context>> = RefCell::new(Vec::new());
 }
 
-// Process-global fallback context (the primary context). Used when a thread's
-// CONTEXT_STACK is empty (e.g. a worker thread spawned by the runtime that never
-// pushed a context, or the child after fork). cuMemAlloc/cuMemFree and friends
-// rely on a current context; on real CUDA the primary context is the implicit
-// current one for all threads after cuDevicePrimaryCtxRetain.
+// Process-global fallback context (the primary context), used when a thread's
+// CONTEXT_STACK is empty - a worker thread the runtime spawned, or a child
+// after fork. cuMemAlloc and friends need a current context.
 static PRIMARY_CONTEXT: std::sync::atomic::AtomicPtr<Context> = std::sync::atomic::AtomicPtr::new(ptr::null_mut());
 
 pub fn set_primary_context(ctx: *mut Context) {
@@ -117,9 +115,7 @@ pub default_stream: StreamData,
         ),
     >,
     // Keyed per-context storage backing the CONTEXT_LOCAL_STORAGE dark API
-    // ({put, delete, get}). cudart 12.x stores its per-context runtime state
-    // here and reads it back with the same key; legacy ctor/get_state are not
-    // used by modern runtimes.
+    // ({put, delete, get}), whose entries cudart 12.x reads back by key.
     pub local_storage: std::collections::HashMap<usize, LocalStorageEntry>,
 }
 
@@ -134,10 +130,8 @@ impl ContextData {
     ) -> Result<Self, CUresult> {
         let default_stream = StreamData::new_unitialized(l0_ctx, l0_dev, host_event)?;
         // cuBLAS validates the context by reading [ctx+0x80] (cuda_manager) and
-        // checking a non-zero value at [+0x58]. cublasLt also reads deep offsets
-        // like [+0x34c] (a feature/version field used in its handle registry
-        // walk). Allocate a larger dummy block so those reads stay in-bounds,
-        // and seed [+0x58]=1 (the cuBLAS validation check).
+        // requiring a non-zero value at [+0x58]; cublasLt reads as deep as
+        // [+0x34c]. The dummy block is sized so those reads stay in bounds.
         let mgr = unsafe { std::alloc::alloc(std::alloc::Layout::from_size_align(0x800, 8).unwrap()) };
         if !mgr.is_null() {
             unsafe { std::ptr::write_bytes(mgr, 0, 0x800);
@@ -152,12 +146,9 @@ impl ContextData {
             streams: HashSet::new(),
             pointer_registry: PointerRegistry::new(),
             cuda_manager: mgr.cast(),
-            // Point cuda_state at the same dummy block as cuda_manager: cuBLAS's
-            // context_local_storage_get_state only checks non-NULL here (it does
-            // not dereference the state), and the dummy block satisfies the
-            // [+0x58] validation. This covers the child process after fork where
-            // the runtime's context_local_storage_ctor may not run for the new
-            // context, leaving cuda_state NULL and breaking cublasCreate.
+            // cuda_state points at the same dummy block: cuBLAS only checks it
+            // for non-NULL, and this covers the child process after fork, where
+            // the runtime's context_local_storage_ctor may not have run.
             cuda_state: mgr.cast(),
             cuda_dtor_cb: None,
             local_storage: std::collections::HashMap::new(),

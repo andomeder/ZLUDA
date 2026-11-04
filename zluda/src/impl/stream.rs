@@ -12,9 +12,9 @@ use std::{
 
 use super::{HasLivenessCookie, LiveCheck};
 
-/// The name of the kernel that was launched most recently, for diagnostics
-/// only: when a synchronize never completes, the kernel that is still running
-/// is the one that named itself last.
+/// The name of the kernel launched most recently, for diagnostics: when a
+/// synchronize never completes, the kernel still running is the one that named
+/// itself last.
 static LAST_KERNEL: Mutex<Option<String>> = Mutex::new(None);
 
 pub fn remember_launched_kernel(name: &str) {
@@ -93,7 +93,7 @@ pub context: *mut ContextData,
 // Immediate CommandList
 pub cmd_list: l0::CommandList<'static>,
 pub busy_events: VecDeque<(l0::Event<'static>, u64)>,
-// This could be a Vec, but I'd rather reuse earliest enqueued event not the one recently enqueued
+// A deque so the earliest enqueued event is reused first.
 pub free_events: VecDeque<(l0::Event<'static>, u64)>,
     pub synchronization_event: (l0::Event<'static>, u64),
     pub flags: u32,
@@ -277,8 +277,7 @@ GlobalState::lock_stream(pstream, |stream_data| Ok(stream_data.synchronize()?))?
 }
 
 pub(crate) fn query(pstream: *mut Stream) -> Result<(), CUresult> {
-// Returns SUCCESS if all work in the stream has completed, NOT_READY
-// otherwise. We check the last busy event.
+// SUCCESS when all work in the stream has completed, NOT_READY otherwise.
 let ready = GlobalState::lock_stream(pstream, |stream_data| {
 stream_data.try_reuse_finished_events().map_err(|_| CUresult::CUDA_ERROR_UNKNOWN)?;
 Ok::<_, CUresult>(stream_data.busy_events.is_empty())
@@ -333,9 +332,8 @@ pub(crate) fn add_callback(
         Some(cb) => cb,
         None => return Err(CUresult::CUDA_ERROR_INVALID_VALUE),
     };
-    // L0 has no host-callback primitive; the closest semantics is: after all
-    // currently-enqueued work in the stream completes, invoke the callback
-    // from the host. We synchronize the stream, then call back.
+    // L0 has no host-callback primitive, so the closest semantics is to
+    // synchronize the stream and then call back from the host.
     GlobalState::lock_stream(pstream, |stream_data| Ok::<(), CUresult>(stream_data.synchronize()?))??;
     unsafe {
         cb(

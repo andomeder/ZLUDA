@@ -34,8 +34,8 @@ pub struct Device {
 unsafe impl Send for Device {}
 
 impl Device {
-    // Unsafe because it does not fully initalize primary_context
-    // and we transmute lifetimes left and right
+    // Unsafe: primary_context is filled in by late_init, and the lifetimes are
+    // transmuted.
     unsafe fn new(drv: &l0::Driver, l0_dev: l0::Device, idx: usize) -> Result<Self, CUresult> {
         let ctx = l0::Context::new(*drv, Some(&[l0_dev]))?;
         let queue = l0::CommandQueue::new(mem::transmute(&ctx), l0_dev)?;
@@ -198,9 +198,8 @@ pub fn get_name(name: *mut c_char, len: i32, dev_idx: Index) -> Result<(), CUres
 }
 
 /// The PCI bus id of the device, in the "dddd:dd:dd.d" form that CUDA uses.
-///
-/// The bus id is read from sysfs: the DRM render node of the GPU points at
-/// its PCI device, and the PCI device's directory name is the bus id.
+/// It comes from sysfs: the DRM node of the GPU links to its PCI device, whose
+/// directory name is the bus id.
 fn read_pci_bus_id(dev_idx: Index) -> Option<String> {
     let mut candidates = Vec::new();
     // The DRM card nodes: /sys/class/drm/card*/device -> ../../devices/...
@@ -213,7 +212,6 @@ fn read_pci_bus_id(dev_idx: Index) -> Option<String> {
             let device_link = entry.path().join("device");
             if let Ok(target) = std::fs::read_link(&device_link) {
                 if let Some(bdf) = target.file_name().and_then(|f| f.to_str()) {
-                    // Only PCI devices have a bus id of this shape.
                     if bdf.contains(':') && bdf.contains('.') {
                         candidates.push(bdf.to_string());
                     }
@@ -222,7 +220,7 @@ fn read_pci_bus_id(dev_idx: Index) -> Option<String> {
         }
     }
     if candidates.is_empty() {
-        // Fall back to any PCI device of the display class.
+        // Fall back to any PCI device.
         if let Ok(entries) = std::fs::read_dir("/sys/bus/pci/devices") {
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();
@@ -277,8 +275,8 @@ pub fn get_default_mem_pool(pool: *mut cuda::CUmemoryPool, dev_idx: Index) -> Re
     if pool == ptr::null_mut() {
         return Err(CUresult::CUDA_ERROR_INVALID_VALUE);
     }
-    // Dummy opaque handle - ZLUDA allocs don't use pools, and libcudart
-    // only stores this handle (never dereferences it).
+    // Dummy opaque handle: allocations do not go through pools, and libcudart
+    // only stores the handle without dereferencing it.
     let _ = dev_idx;
     static DUMMY_POOL: cuda::CUmemPoolHandle_st = unsafe { mem::zeroed() };
     unsafe { *pool = &DUMMY_POOL as *const _ as *mut cuda::CUmemPoolHandle_st };
@@ -290,61 +288,53 @@ pub fn get_default_mem_pool(pool: *mut cuda::CUmemoryPool, dev_idx: Index) -> Re
 impl CUdevice_attribute {
     fn get_static_value(self) -> Option<i32> {
         match self {
-            // B580 is a discrete GPU, so overlap is plausible (it does have
-            // multiple hardware contexts that can run concurrently)
+            // Discrete GPU with several hardware contexts that can overlap.
             CUdevice_attribute::CU_DEVICE_ATTRIBUTE_GPU_OVERLAP => Some(1),
-            // Desktop driver doesn't enforce kernel exec timeouts
+            // The desktop driver does not enforce kernel exec timeouts.
             CUdevice_attribute::CU_DEVICE_ATTRIBUTE_KERNEL_EXEC_TIMEOUT => Some(1),
-            // Discrete (non-DG1) part, but ZLUDA runs on whatever the driver
-            // exposes; claim integrated=0 so apps pick the discrete path
+            // Claim discrete so applications pick the discrete path.
             CUdevice_attribute::CU_DEVICE_ATTRIBUTE_INTEGRATED => Some(0),
-            // We translate to SPIR-V and launch through Level Zero, so the
-            // effective capability is whatever IGC accepts. sm_80 is the
-            // lowest common denominator for PTX we parse.
+            // Answered from ZLUDA_FAKE_CC in get_attribute.
             CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR => None,
             CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR => None,
-            // cuMemHostAlloc/cuMemHostRegister are supported via L0 host mem
+            // Host memory is pinned through L0 host allocations.
             CUdevice_attribute::CU_DEVICE_ATTRIBUTE_CAN_MAP_HOST_MEMORY => Some(1),
-            // Constants live in the same address space as globals here
+            // Constants share the global address space here.
             CUdevice_attribute::CU_DEVICE_ATTRIBUTE_TOTAL_CONSTANT_MEMORY => Some(65536),
-            // Conservative max pitch (L0 doesn't report a pitch limit)
+            // L0 reports no pitch limit.
             CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_PITCH => Some(2147483647),
-            // Register file is not exposed by Level Zero
+            // The register file is not exposed by Level Zero.
             CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_REGISTERS_PER_BLOCK => Some(65536),
-            // 512-byte alignment is the CUDA convention for texture base
+            // 512-byte alignment is the CUDA convention.
             CUdevice_attribute::CU_DEVICE_ATTRIBUTE_TEXTURE_ALIGNMENT => Some(512),
-            // Copy engines and compute can overlap
             CUdevice_attribute::CU_DEVICE_ATTRIBUTE_CONCURRENT_KERNELS => Some(1),
-            // No ECC on consumer parts
+            // No ECC on consumer parts.
             CUdevice_attribute::CU_DEVICE_ATTRIBUTE_ECC_ENABLED => Some(0),
-            // This is not a TCC driver
             CUdevice_attribute::CU_DEVICE_ATTRIBUTE_TCC_DRIVER => Some(0),
-            // Host and device share the address space (host mem mapped)
             CUdevice_attribute::CU_DEVICE_ATTRIBUTE_UNIFIED_ADDRESSING => Some(1),
-            // Stream priorities are supported (see stream.rs)
+            // Priorities are accepted and ignored (see stream.rs).
             CUdevice_attribute::CU_DEVICE_ATTRIBUTE_STREAM_PRIORITIES_SUPPORTED => Some(1),
             CUdevice_attribute::CU_DEVICE_ATTRIBUTE_GLOBAL_L1_CACHE_SUPPORTED => Some(1),
             CUdevice_attribute::CU_DEVICE_ATTRIBUTE_LOCAL_L1_CACHE_SUPPORTED => Some(1),
 
             CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_REGISTERS_PER_MULTIPROCESSOR => Some(65536),
-            // No managed memory (no SVM on L0 here)
+            // No managed memory: no SVM on this L0 backend.
             CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MANAGED_MEMORY => Some(0),
             CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTI_GPU_BOARD => Some(0),
-            // Host atomics on mapped memory work through the same L0 device
+            // Host atomics on mapped memory are not implemented.
             CUdevice_attribute::CU_DEVICE_ATTRIBUTE_HOST_NATIVE_ATOMIC_SUPPORTED => Some(0),
-            // Compute preemption is generally available on Gen12+/Xe
             CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_PREEMPTION_SUPPORTED => Some(1),
             CUdevice_attribute::CU_DEVICE_ATTRIBUTE_CAN_USE_HOST_POINTER_FOR_REGISTERED_MEM => {
                 Some(1)
             }
             CUdevice_attribute::CU_DEVICE_ATTRIBUTE_CAN_USE_STREAM_MEM_OPS => Some(1),
             CUdevice_attribute::CU_DEVICE_ATTRIBUTE_CAN_USE_64_BIT_STREAM_MEM_OPS => Some(1),
-            // Cooperative launch is not implemented in ZLUDA
+            // Cooperative launch is not implemented.
             CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH => Some(0),
             CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COOPERATIVE_MULTI_DEVICE_LAUNCH => Some(0),
 
             CUdevice_attribute::CU_DEVICE_ATTRIBUTE_HOST_REGISTER_SUPPORTED => Some(1),
-            // Conservative blocks-per-multiprocessor
+            // The resident-block cap the occupancy queries model.
             CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_BLOCKS_PER_MULTIPROCESSOR => Some(16),
             _ => None,
         }
@@ -366,9 +356,9 @@ pub fn get_attribute(
     }
     let value: i32 = match attrib {
         CUdevice_attribute::CU_DEVICE_ATTRIBUTE_ASYNC_ENGINE_COUNT => 2,
-        // Streaming Multiprocessor corresponds roughly to a sub-slice (thread group can't cross either)
+        // A multiprocessor corresponds roughly to a sub-slice (a thread group
+        // cannot cross one either).
         CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT => 28,
-        // I honestly don't know how to answer this query
         CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR => {
             GlobalState::lock_device(dev_idx, |dev| {
                 let max_simd = dev.get_max_simd()?;
@@ -378,10 +368,9 @@ pub fn get_attribute(
                 )
             })??
         }
-        // The largest workgroup-local scratch the hardware has (128 KiB on the
-        // Arc B580). A kernel that asks for more dynamic shared memory than
-        // this is refused by the runtime before any driver call, so the value
-        // has to be the real one.
+        // The largest workgroup-local scratch the hardware has. A kernel that
+        // asks for more dynamic shared memory is refused by the runtime before
+        // any driver call, so the value has to be the real one.
         CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN
         | CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR => {
             GlobalState::lock_device(dev_idx, |dev| {
@@ -479,10 +468,8 @@ pub fn get_attribute(
                 Ok::<_, l0::sys::ze_result_t>(props.coreClockRate as i32)
             })??
         }
-        // ZLUDA_FAKE_CC=75 reports 7.5 instead of 8.0. It is a diagnostic:
-        // ggml (and other libraries) pick kernel configurations from the
-        // compute capability, so an effect that changes with it points at the
-        // configuration rather than at the GPU.
+        // ZLUDA_FAKE_CC=75 reports 7.5 instead of 8.0, a diagnostic: libraries
+        // pick kernel configurations from the capability.
         CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR => match std::env::var("ZLUDA_FAKE_CC").ok().as_deref() {
             Some(v) if v.len() >= 2 => v[..1].parse().unwrap_or(8),
             _ => 8,
@@ -491,8 +478,8 @@ pub fn get_attribute(
             Some(v) if v.len() >= 2 => v[1..2].parse().unwrap_or(0),
             _ => 0,
         },
-        // Unknown attributes: report 0 rather than leaving the output
-        // uninitialized (CUDA's own driver returns 0 for unsupported attrs)
+        // Unknown attributes read as 0, the way CUDA reports an attribute it
+        // does not support; leaving them uninitialized is worse.
         _ => 0,
     };
     unsafe { *pi = value };
@@ -507,8 +494,8 @@ pub fn compute_capability(
     if major == ptr::null_mut() || minor == ptr::null_mut() {
         return Err(CUresult::CUDA_ERROR_INVALID_VALUE);
     }
-    // The effective capability is the lowest common denominator for the PTX
-    // we parse (sm_80), regardless of the physical hardware.
+    // The reported capability is the lowest common denominator for the PTX we
+    // parse (sm_80), regardless of the physical hardware.
     unsafe {
         *major = 8;
         *minor = 0;
@@ -612,12 +599,12 @@ pub fn primary_ctx_retain(
         &mut dev.primary_context as *mut _
     })?;
     unsafe { *pctx = ctx_ptr };
-    // On real CUDA, retaining the primary context also makes it the current
-    // context for the calling thread; allocs/copies then use it implicitly.
+    // Retaining the primary context also makes it current for the calling
+    // thread, as CUDA does, so allocs and copies can use it implicitly.
     context::set_current(ctx_ptr);
-    // Also record it as the process-global fallback so worker threads with an
-    // empty CONTEXT_STACK (torch's CUDA worker after fork/spawn, cuBLAS internal
-    // threads) can still find a current context.
+    // Also record the process-global fallback, so a thread with an empty
+    // CONTEXT_STACK (a worker spawned by the runtime, a child after fork)
+    // still finds a current context.
     context::set_primary_context(ctx_ptr);
     Ok(())
 }

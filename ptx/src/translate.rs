@@ -7327,9 +7327,15 @@ fn generic_address(
     {
         return Ok(pointer);
     }
+    // The cast keeps the pointee: a pointer to a pointer becomes a generic
+    // pointer to the same thing, not a generic pointer to a pointer.
+    let pointee_type = match SpirvType::new(pointee.clone()) {
+        SpirvType::Pointer(inner, _) => *inner,
+        other => other,
+    };
     let generic_type = map.get_or_add(
         builder,
-        SpirvType::Pointer(Box::new(SpirvType::new(pointee.clone())), spirv::StorageClass::Generic),
+        SpirvType::Pointer(Box::new(pointee_type), spirv::StorageClass::Generic),
     );
     Ok(builder.ptr_cast_to_generic(generic_type, None, pointer)?)
 }

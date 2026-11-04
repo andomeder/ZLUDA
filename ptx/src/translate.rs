@@ -2237,6 +2237,43 @@ impl<'a, 'b> ArgumentMapVisitor<NormalizedArgParams, TypedArgParams>
                 }));
                 TypedOperand::Reg(temp_vec)
             }
+            ast::Operand::MixedPack(elements) => {
+                let (scalar_t, width) = match typ {
+                    ast::Type::Vector(scalar_t, width) => (*scalar_t, *width),
+                    _ => return Err(TranslateError::MismatchedType),
+                };
+                let mut ids = Vec::with_capacity(elements.len());
+                for element in elements {
+                    match element {
+                        ast::PackElement::Reg(id) => ids.push(id),
+                        ast::PackElement::Imm(value) => {
+                            let id = self.id_def.register_intermediate(Some((
+                                ast::Type::Scalar(scalar_t),
+                                state_space,
+                            )));
+                            self.func.push(Statement::Constant(ConstantDefinition {
+                                dst: id,
+                                typ: scalar_t,
+                                value,
+                            }));
+                            ids.push(id);
+                        }
+                    }
+                }
+                let temp_vec = self
+                    .id_def
+                    .register_intermediate(Some((typ.clone(), state_space)));
+                self.func.push(Statement::RepackVector(RepackVectorDetails {
+                    is_extract: false,
+                    typ: scalar_t,
+                    packed: temp_vec,
+                    unpacked: ids,
+                    non_default_implicit_conversion: None,
+                    pack_width: width,
+                    packed_scalar: None,
+                }));
+                TypedOperand::Reg(temp_vec)
+            }
         })
     }
 }
@@ -9036,6 +9073,15 @@ where
                     })
                     .collect::<Result<Vec<_>, _>>()?,
             ),
+            ast::Operand::MixedPack(elements) => ast::Operand::MixedPack(
+                elements
+                    .into_iter()
+                    .map(|element| match element {
+                        ast::PackElement::Reg(id) => Ok(ast::PackElement::Reg(self(id)?)),
+                        ast::PackElement::Imm(value) => Ok(ast::PackElement::Imm(value)),
+                    })
+                    .collect::<Result<_, TranslateError>>()?,
+            ),
             // A vector literal of constants: "st.global.v2.b32 [addr], {99, 0};"
             // Nothing to resolve here.
             ast::Operand::ImmPack(values) => ast::Operand::ImmPack(values),
@@ -10995,6 +11041,15 @@ impl<T> ast::Operand<T> {
                 ast::Operand::VecPack(vec.into_iter().map(f).collect::<Result<_, _>>()?)
             }
             ast::Operand::ImmPack(values) => ast::Operand::ImmPack(values),
+            ast::Operand::MixedPack(elements) => ast::Operand::MixedPack(
+                elements
+                    .into_iter()
+                    .map(|element| match element {
+                        ast::PackElement::Reg(id) => Ok(ast::PackElement::Reg(f(id)?)),
+                        ast::PackElement::Imm(value) => Ok(ast::PackElement::Imm(value)),
+                    })
+                    .collect::<Result<_, TranslateError>>()?,
+            ),
         })
     }
 }
@@ -11149,7 +11204,10 @@ impl<T> ast::Operand<T> {
             ast::Operand::Reg(r)
             | ast::Operand::RegOffset(r, _)
             | ast::Operand::VecMember(r, _) => Some(r),
-            ast::Operand::Imm(_) | ast::Operand::VecPack(..) | ast::Operand::ImmPack(..) => None,
+            ast::Operand::Imm(_)
+            | ast::Operand::VecPack(..)
+            | ast::Operand::ImmPack(..)
+            | ast::Operand::MixedPack(..) => None,
         }
     }
 }

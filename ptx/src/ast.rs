@@ -608,6 +608,15 @@ pub enum Operand<Id> {
     VecPack(Vec<Id>),
     /// A vector literal of constants: `{99, 0}`.
     ImmPack(Vec<ImmediateValue>),
+    /// A pack whose elements are not all of one kind: `{%rd1, 0}`.
+    MixedPack(Vec<PackElement<Id>>),
+}
+
+/// One element of a mixed vector pack.
+#[derive(Clone)]
+pub enum PackElement<Id> {
+    Reg(Id),
+    Imm(ImmediateValue),
 }
 
 pub enum VectorPrefix {

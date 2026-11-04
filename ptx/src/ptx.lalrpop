@@ -2556,6 +2556,20 @@ SrcOperandVec: ast::Operand<&'input str> = {
     <vec:VectorExtract> => if vec.len() == 1 { ast::Operand::Reg(vec[0]) } else { ast::Operand::VecPack(vec) },
     // A vector literal of immediates: "st.global.v2.b32 [%rd], {99, 0};"
     <vec:VectorImmediate> => ast::Operand::ImmPack(vec),
+    // A pack that mixes a register with a constant, which the LLVM backend
+    // emits for a wide store: "st.global.v2.b64 [%rd], {%rd2, 0};"
+    "{" <a:ExtendedIDOrHole> "," <b:ImmediateValue> "}" => {
+        ast::Operand::MixedPack(vec![
+            ast::PackElement::Reg(a),
+            ast::PackElement::Imm(b),
+        ])
+    },
+    "{" <a:ImmediateValue> "," <b:ExtendedIDOrHole> "}" => {
+        ast::Operand::MixedPack(vec![
+            ast::PackElement::Imm(a),
+            ast::PackElement::Reg(b),
+        ])
+    },
 };
 
 // A vector literal whose elements are constants.

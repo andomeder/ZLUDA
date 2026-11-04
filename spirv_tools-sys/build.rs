@@ -10,6 +10,7 @@ fn main() -> Result<(), VarError> {
     headers_path.push("../ext/spirv-headers");
     let spirv_tools_dir = Config::new("../ext/spirv-tools")
         .always_configure(false)
+        .env("CMAKE_POLICY_VERSION_MINIMUM", "3.5")
         .define("SPIRV-Headers_SOURCE_DIR", headers_path)
         .define("SPIRV_SKIP_EXECUTABLES", "ON")
         .define("SPIRV_SKIP_TESTS", "ON")

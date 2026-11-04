@@ -359,16 +359,39 @@ impl SpirvModule {
             (module, Some(log))
         };
         let (module, log) = built;
-        if module.is_err() && std::env::var_os("ZLUDA_TRACE_BUILD").is_some() {
+        if let Err(error) = module.as_ref() {
+            let log_text = log
+                .as_ref()
+                .map(|log| {
+                    log.to_cstring()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string()
+                })
+                .unwrap_or_default();
+            // A rejected module is the one failure an application can act on, so
+            // the reason is reported whether or not tracing is on: the backend's
+            // own words, not an error code that says nothing.
+            let reason = log_text
+                .lines()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or("the backend did not say why");
             eprintln!(
-                "module build failed: {:?}\nbuild log: {}",
-                module.as_ref().err(),
-                log.as_ref()
-                    .map(|log| log.to_cstring().unwrap_or_default().to_string_lossy().to_string())
-                    .unwrap_or_default()
+                "zluda: the backend rejected a kernel module ({:?}): {}",
+                error, reason
             );
+            if std::env::var_os("ZLUDA_TRACE_BUILD").is_some() {
+                eprintln!("module build error: {:?}\nbuild log: {}", error, log_text);
+            }
         }
-        Ok(module?)
+        // A module the backend refused to compile is an invalid module, not an
+        // unknown failure: an application dispatches a fallback on that.
+        Ok(module.map_err(|error| match error {
+            l0::sys::ze_result_t::ZE_RESULT_ERROR_MODULE_BUILD_FAILURE => {
+                CUresult::CUDA_ERROR_INVALID_PTX
+            }
+            other => other.into(),
+        })?)
     }
 
 

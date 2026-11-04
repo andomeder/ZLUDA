@@ -1,0 +1,36 @@
+.version 8.7
+.target sm_75
+.address_size 64
+
+// What a lifted kernel looks like: the whole shared window is one externally
+// declared symbol whose size is only the part that was static in the original,
+// and the kernel addresses past it. Here the static part is 1024 bytes and each
+// thread owns four more at 1024 + 4*tid.
+.extern .shared .align 16 .b8 shared_mem[1024];
+
+.visible .entry shared_prefix(.param .u64 out)
+{
+	.reg .b32 %r<8>;
+	.reg .b64 %rd<10>;
+
+	ld.param.u64 %rd1, [out];
+	mov.u32 %r1, %tid.x;
+
+	// shared_mem + 1024 + 4*tid
+	mov.b64 %rd2, shared_mem;
+	cvt.u64.u32 %rd3, %r1;
+	shl.b64 %rd4, %rd3, 2;
+	add.s64 %rd5, %rd2, %rd4;
+	add.s64 %rd5, %rd5, 1024;
+
+	// Store tid + 1 there, then read it back through the same window.
+	add.u32 %r2, %r1, 1;
+	st.volatile.shared.b32 [%rd5], %r2;
+	bar.sync 0;
+	ld.volatile.shared.b32 %r3, [%rd5];
+
+	// out[tid] = the value that came back
+	add.s64 %rd6, %rd1, %rd4;
+	st.global.b32 [%rd6], %r3;
+	ret;
+}

@@ -1456,11 +1456,21 @@ fn translate_function<'a>(
     ptx_impl_imports: &mut HashMap<String, Directive<'a>>,
     f: ast::ParsedFunction<'a>,
 ) -> Result<Option<Function<'a>>, TranslateError> {
+    // __assertfail is the one function that is imported from the implementation
+    // module, which defines it with CUDA's own signature: message, file, line,
+    // function, character count. A declaration that disagrees is not imported,
+    // because the backend's linker aborts on a signature mismatch instead of
+    // reporting it; the call gets a stub body like any other function that is
+    // called and not defined here, which is what a lift produces for it.
+    const ASSERTFAIL_ARGUMENTS: usize = 5;
     let import_as = match &f.func_directive {
         ast::MethodDeclaration {
             name: ast::MethodName::Func("__assertfail"),
+            input_arguments,
             ..
-        } => Some("__zluda_ptx_impl____assertfail".to_owned()),
+        } if input_arguments.len() == ASSERTFAIL_ARGUMENTS => {
+            Some("__zluda_ptx_impl____assertfail".to_owned())
+        }
         _ => None,
     };
     let (str_resolver, fn_resolver, fn_decl) = id_defs.start_fn(&f.func_directive)?;

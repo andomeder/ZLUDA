@@ -384,10 +384,12 @@ impl SpirvModule {
                 eprintln!("module build error: {:?}\nbuild log: {}", error, log_text);
             }
         }
-        // A module the backend refused to compile is an invalid module, not an
-        // unknown failure: an application dispatches a fallback on that.
+        // A module the backend refused to compile or to link is an invalid
+        // module, not an unknown failure: an application dispatches a fallback
+        // on that.
         Ok(module.map_err(|error| match error {
-            l0::sys::ze_result_t::ZE_RESULT_ERROR_MODULE_BUILD_FAILURE => {
+            l0::sys::ze_result_t::ZE_RESULT_ERROR_MODULE_BUILD_FAILURE
+            | l0::sys::ze_result_t::ZE_RESULT_ERROR_MODULE_LINK_FAILURE => {
                 CUresult::CUDA_ERROR_INVALID_PTX
             }
             other => other.into(),

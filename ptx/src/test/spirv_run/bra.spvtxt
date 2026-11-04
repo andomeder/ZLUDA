@@ -7,9 +7,12 @@
                OpCapability Int64
                OpCapability Float16
                OpCapability Float64
+               OpCapability KernelAttributesINTEL
+               OpExtension "SPV_INTEL_kernel_attributes"
          %29 = OpExtInstImport "OpenCL.std"
                OpMemoryModel Physical64 OpenCL
                OpEntryPoint Kernel %1 "bra"
+               OpExecutionMode %1 MaxWorkgroupSizeINTEL 256 256 256
        %void = OpTypeVoid
       %ulong = OpTypeInt 64 0
          %32 = OpTypeFunction %void %ulong %ulong
@@ -43,15 +46,15 @@
          %17 = OpIAdd %ulong %18 %ulong_1
                OpStore %10 %17
                OpBranch %6
-         %35 = OpLabel
-         %20 = OpLoad %ulong %9
-         %19 = OpIAdd %ulong %20 %ulong_2
-               OpStore %10 %19
-               OpBranch %6
           %6 = OpLabel
          %21 = OpLoad %ulong %8
          %22 = OpLoad %ulong %10
          %26 = OpConvertUToPtr %_ptr_Generic_ulong %21
                OpStore %26 %22 Aligned 8
                OpReturn
+         %35 = OpLabel
+         %20 = OpLoad %ulong %9
+         %19 = OpIAdd %ulong %20 %ulong_2
+               OpStore %10 %19
+               OpBranch %6
                OpFunctionEnd

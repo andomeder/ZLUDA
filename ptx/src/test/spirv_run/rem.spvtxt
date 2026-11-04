@@ -49,7 +49,7 @@
                OpStore %7 %14
          %17 = OpLoad %uint %6
          %18 = OpLoad %uint %7
-         %16 = OpSMod %uint %17 %18
+         %16 = OpSRem %uint %17 %18
                OpStore %6 %16
          %19 = OpLoad %ulong %5
          %20 = OpLoad %uint %6

@@ -2,20 +2,32 @@
                OpCapability Linkage
                OpCapability Addresses
                OpCapability Kernel
-               OpCapability Int64
                OpCapability Int8
+               OpCapability Int16
+               OpCapability Int64
+               OpCapability Float16
+               OpCapability Float64
+               OpCapability KernelAttributesINTEL
+               OpCapability SubgroupShuffleINTEL
+               OpCapability GroupNonUniformVote
+               OpCapability GroupNonUniformBallot
+               OpExtension "SPV_INTEL_kernel_attributes"
+               OpExtension "SPV_INTEL_subgroups"
          %12 = OpExtInstImport "OpenCL.std"
                OpMemoryModel Physical64 OpenCL
                OpEntryPoint Kernel %1 "mov_address"
+               OpExecutionMode %1 MaxWorkgroupSizeINTEL 256 256 256
        %void = OpTypeVoid
       %ulong = OpTypeInt 64 0
          %15 = OpTypeFunction %void %ulong %ulong
 %_ptr_Function_ulong = OpTypePointer Function %ulong
-      %uchar = OpTypeInt 8 0
        %uint = OpTypeInt 32 0
+      %uchar = OpTypeInt 8 0
      %uint_8 = OpConstant %uint 8
 %_arr_uchar_uint_8 = OpTypeArray %uchar %uint_8
 %_ptr_Function__arr_uchar_uint_8 = OpTypePointer Function %_arr_uchar_uint_8
+   %uint_8_0 = OpConstant %uint 8
+%_ptr_Generic__arr_uchar_uint_8 = OpTypePointer Generic %_arr_uchar_uint_8
           %1 = OpFunction %void None %15
           %6 = OpFunctionParameter %ulong
           %7 = OpFunctionParameter %ulong
@@ -26,7 +38,8 @@
           %5 = OpVariable %_ptr_Function_ulong Function
                OpStore %2 %6
                OpStore %3 %7
-          %9 = OpConvertPtrToU %ulong %4
+         %24 = OpPtrCastToGeneric %_ptr_Generic__arr_uchar_uint_8 %4
+          %9 = OpConvertPtrToU %ulong %24
           %8 = OpCopyObject %ulong %9
                OpStore %5 %8
                OpReturn

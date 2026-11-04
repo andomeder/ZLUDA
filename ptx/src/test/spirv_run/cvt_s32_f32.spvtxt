@@ -7,11 +7,18 @@
                OpCapability Int64
                OpCapability Float16
                OpCapability Float64
+               OpCapability KernelAttributesINTEL
+               OpCapability SubgroupShuffleINTEL
+               OpCapability GroupNonUniformVote
+               OpCapability GroupNonUniformBallot
+               OpExtension "SPV_INTEL_kernel_attributes"
+               OpExtension "SPV_INTEL_subgroups"
          %42 = OpExtInstImport "OpenCL.std"
                OpMemoryModel Physical64 OpenCL
                OpEntryPoint Kernel %1 "cvt_s32_f32"
-               OpDecorate %32 FPRoundingMode RTP
-               OpDecorate %34 FPRoundingMode RTP
+               OpExecutionMode %1 MaxWorkgroupSizeINTEL 256 256 256
+               OpDecorate %55 FPRoundingMode RTP
+               OpDecorate %56 FPRoundingMode RTP
        %void = OpTypeVoid
       %ulong = OpTypeInt 64 0
          %45 = OpTypeFunction %void %ulong %ulong
@@ -57,12 +64,14 @@
                OpStore %7 %14
          %17 = OpLoad %uint %6
          %33 = OpBitcast %float %17
-         %32 = OpConvertFToS %uint %33
+         %55 = OpConvertFToS %uint %33
+         %32 = OpCopyObject %uint %55
          %16 = OpCopyObject %uint %32
                OpStore %6 %16
          %19 = OpLoad %uint %7
          %35 = OpBitcast %float %19
-         %34 = OpConvertFToS %uint %35
+         %56 = OpConvertFToS %uint %35
+         %34 = OpCopyObject %uint %56
          %18 = OpCopyObject %uint %34
                OpStore %7 %18
          %20 = OpLoad %ulong %5
@@ -73,9 +82,9 @@
          %22 = OpLoad %ulong %5
          %23 = OpLoad %uint %7
          %38 = OpConvertUToPtr %_ptr_CrossWorkgroup_uint %22
-         %57 = OpBitcast %_ptr_CrossWorkgroup_uchar %38
-         %58 = OpInBoundsPtrAccessChain %_ptr_CrossWorkgroup_uchar %57 %ulong_4_0
-         %27 = OpBitcast %_ptr_CrossWorkgroup_uint %58
+         %59 = OpBitcast %_ptr_CrossWorkgroup_uchar %38
+         %60 = OpInBoundsPtrAccessChain %_ptr_CrossWorkgroup_uchar %59 %ulong_4_0
+         %27 = OpBitcast %_ptr_CrossWorkgroup_uint %60
          %39 = OpCopyObject %uint %23
                OpStore %27 %39 Aligned 4
                OpReturn

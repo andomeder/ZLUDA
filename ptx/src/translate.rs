@@ -14,14 +14,30 @@ quick_error! {
     #[derive(Debug)]
     pub enum TranslateError {
         UnknownSymbol {}
+        /// Same as UnknownSymbol, but names the offending identifier.
+        UnknownSymbolName(name: String) {
+            display("unknown symbol: {}", name)
+        }
         UntypedSymbol {}
+        /// A symbol without a type; names the offending identifier.
+        UntypedSymbolName(name: String) {
+            display("untyped symbol: {}", name)
+        }
         MismatchedType {}
+        /// A type mismatch, with the instruction that caused it.
+        MismatchedTypeIn(op: String) {
+            display("type mismatch in {}", op)
+        }
         Spirv(err: rspirv::dr::Error) {
             from()
             display("{}", err)
             cause(err)
         }
         Unreachable {}
+        /// An unreachable branch was hit; carries the source location.
+        UnreachableAt(location: String) {
+            display("unreachable at {}", location)
+        }
         Todo {}
     }
 }
@@ -32,8 +48,11 @@ fn error_unreachable() -> TranslateError {
 }
 
 #[cfg(not(debug_assertions))]
+#[track_caller]
 fn error_unreachable() -> TranslateError {
-    TranslateError::Unreachable
+    // The location tells which code path hit the unreachable branch.
+    let location = std::panic::Location::caller();
+    TranslateError::UnreachableAt(format!("{}:{}", location.file(), location.line()))
 }
 
 #[derive(PartialEq, Eq, Hash, Clone)]
@@ -49,13 +68,19 @@ enum SpirvType {
 impl SpirvType {
     fn new(t: ast::Type) -> Self {
         match t {
-            ast::Type::Scalar(t) => SpirvType::Base(t.into()),
+            // A packed half (".f16x2") is a vector of two 16-bit floats, so
+            // the scalar mapping has to go through the type conversion that
+            // knows about it.
+            ast::Type::Scalar(t) => SpirvType::from(t),
             ast::Type::Vector(typ, len) => SpirvType::Vector(typ.into(), len),
             ast::Type::Array(t, len) => SpirvType::Array(t.into(), len),
             ast::Type::Pointer(pointer_t, space) => SpirvType::Pointer(
                 Box::new(SpirvType::Base(pointer_t.into())),
                 space.to_spirv(),
             ),
+            ast::Type::Struct(members) => {
+                SpirvType::Struct(members.into_iter().map(Into::into).collect())
+            }
         }
     }
 
@@ -67,7 +92,13 @@ impl SpirvType {
 
 impl From<ast::ScalarType> for SpirvType {
     fn from(t: ast::ScalarType) -> Self {
-        SpirvType::Base(t.into())
+        match t {
+            // A packed half (".f16x2") is a vector of two 16-bit floats.
+            ast::ScalarType::F16x2 => {
+                SpirvType::Vector(SpirvScalarKey::F16, 2)
+            }
+            _ => SpirvType::Base(t.into()),
+        }
     }
 }
 
@@ -109,7 +140,9 @@ impl From<ast::ScalarType> for SpirvScalarKey {
             ast::ScalarType::F16 => SpirvScalarKey::F16,
             ast::ScalarType::F32 => SpirvScalarKey::F32,
             ast::ScalarType::F64 => SpirvScalarKey::F64,
-            ast::ScalarType::F16x2 => SpirvScalarKey::F16x2,
+            // A packed half is a vector of two 16-bit floats; the element
+            // type is used when a vector of them is built.
+            ast::ScalarType::F16x2 => SpirvScalarKey::F16,
             ast::ScalarType::Pred => SpirvScalarKey::Pred,
         }
     }
@@ -250,6 +283,8 @@ impl TypeWordMap {
         init: &[u8],
     ) -> Result<spirv::Word, TranslateError> {
         Ok(match typ {
+            // A parameter struct never has a literal initialiser.
+            ast::Type::Struct(_) => return Err(TranslateError::Todo),
             ast::Type::Scalar(t) => match t {
                 ast::ScalarType::B8 | ast::ScalarType::U8 | ast::ScalarType::S8 => self
                     .get_or_add_constant_single::<u8, _, _>(
@@ -414,6 +449,7 @@ impl Module {
     }
 }
 
+#[derive(Clone)]
 pub struct KernelInfo {
     pub arguments_sizes: Vec<usize>,
     pub uses_shared_mem: bool,
@@ -438,6 +474,7 @@ pub fn to_spirv_module<'a>(ast: ast::Module<'a>) -> Result<Module, TranslateErro
     let mut builder = dr::Builder::new();
     builder.reserve_ids(id_defs.current_id());
     let call_map = get_kernels_call_map(&directives);
+    let callee_param_types = get_callee_param_types(&directives);
     let mut directives = convert_dynamic_shared_memory_usage(directives, &mut || builder.id());
     normalize_variable_decls(&mut directives);
     let denorm_information = compute_denorm_information(&directives);
@@ -448,6 +485,20 @@ pub fn to_spirv_module<'a>(ast: ast::Module<'a>) -> Result<Module, TranslateErro
     let opencl_id = emit_opencl_import(&mut builder);
     emit_memory_model(&mut builder);
     let mut map = TypeWordMap::new(&mut builder);
+    // ldmatrix selects the thread that holds a matrix row by its lane id, so
+    // the builtin is needed even when the kernel never reads %laneid.
+    let needs_laneid = directives.iter().any(|directive| match directive {
+        Directive::Method(method) => match &method.body {
+            Some(body) => statements_use_laneid(body),
+            None => false,
+        },
+        _ => false,
+    });
+    if needs_laneid {
+        id_defs
+            .special_registers
+            .get_or_add(&mut id_defs.current_id, PtxSpecialRegister::Laneid);
+    }
     emit_builtins(&mut builder, &mut map, &id_defs);
     let mut kernel_info = HashMap::new();
     let build_options = emit_denorm_build_string(&call_map, &denorm_information);
@@ -458,6 +509,7 @@ pub fn to_spirv_module<'a>(ast: ast::Module<'a>) -> Result<Module, TranslateErro
         opencl_id,
         &denorm_information,
         &call_map,
+        &callee_param_types,
         directives,
         &mut kernel_info,
     )?;
@@ -507,11 +559,114 @@ fn emit_denorm_build_string<'input>(
                 .unwrap_or(&0);
         }
     }
-    if flush_over_preserve > 0 {
-        CString::new("-ze-take-global-address -ze-denorms-are-zero").unwrap()
+    // The backend compiler optimizes by default. It used to be turned off
+    // because a store whose address was computed into a register went missing
+    // (2026-08-21); that no longer reproduces, and without the optimizer a big
+    // kernel spills so much that it exceeds the scratch space limit
+    // ("total scratch space exceeds HW supported limit: 332288 bytes"), which
+    // fails the whole unit. ZLUDA_PTX_NO_OPT=1 brings the old behaviour back.
+    let optimize = std::env::var_os("ZLUDA_PTX_NO_OPT").is_none();
+    let opt_flag = if optimize { "" } else { " -cl-opt-disable" };
+    let denorm_flag = if flush_over_preserve > 0 {
+        " -ze-denorms-are-zero"
     } else {
-        CString::new("-ze-take-global-address").unwrap()
+        ""
+    };
+    CString::new(format!(
+        "-ze-take-global-address{}{}",
+        denorm_flag, opt_flag
+    ))
+    .unwrap()
+}
+
+/// Collect the ids of the functions called from a function body.
+fn collect_called_functions(body: &[ExpandedStatement]) -> HashSet<spirv::Word> {
+    let mut result = HashSet::new();
+    for statement in body {
+        match statement {
+            Statement::Call(call) => {
+                result.insert(call.name);
+            }
+            _ => {}
+        }
     }
+    result
+}
+
+/// Emit an OpFunction declaration (no body) for a function that is only
+/// declared in the PTX (`.extern .func`).
+///
+/// The 2021 baseline skipped such functions entirely, which left every call
+/// to them pointing at an undefined id ("forward referenced IDs have not been
+/// defined" from spirv-val). Declaring them here gives the calls a target.
+fn emit_function_declaration<'input>(
+    builder: &mut dr::Builder,
+    map: &mut TypeWordMap,
+    f: &Function<'input>,
+) -> Result<(), TranslateError> {
+    let func_decl = (*f.func_decl).borrow();
+    let fn_id = match func_decl.name {
+        ast::MethodName::Func(name) => name,
+        // A kernel without a body cannot happen; skip it.
+        ast::MethodName::Kernel(_) => return Ok(()),
+    };
+    let (ret_type, func_type) = get_function_type(
+        builder,
+        map,
+        func_decl.effective_input_arguments().map(|(_, typ)| typ),
+        &func_decl.return_arguments,
+    );
+    builder.begin_function(
+        ret_type,
+        Some(fn_id),
+        spirv::FunctionControl::NONE,
+        func_type,
+    )?;
+    for (name, typ) in func_decl.effective_input_arguments() {
+        let result_type = map.get_or_add(builder, typ);
+        builder.function_parameter(Some(name), result_type)?;
+    }
+    if f.import_as.is_some() {
+        // A function that is provided by another module (the zluda PTX
+        // implementation library): it must carry the Import linkage,
+        // otherwise spirv-val rejects it ("Function declaration must have a
+        // LinkageAttributes decoration with the Import Linkage type").
+        builder.end_function()?;
+        let linkage_name = f.import_as.as_ref().unwrap().clone();
+        builder.decorate(
+            fn_id,
+            spirv::Decoration::LinkageAttributes,
+            [
+                dr::Operand::LiteralString(linkage_name),
+                dr::Operand::LinkageType(spirv::LinkageType::Import),
+            ]
+            .iter()
+            .cloned(),
+        );
+        return Ok(());
+    }
+    // A function that is called but never defined in this module. CUDA
+    // resolves it against the other modules of the program at device-link
+    // time; each module is loaded on its own here, so the call is given a
+    // stub body. Such calls are usually in a branch that is never taken
+    // (CUDA's own "no_device_code" helper is one), so the stub is never
+    // reached.
+    builder.begin_block(None)?;
+    if func_decl.return_arguments.is_empty() {
+        builder.ret()?;
+    } else {
+        let ret = func_decl.return_arguments[0].v_type.clone();
+        let ret_type = map.get_or_add(builder, SpirvType::new(ret.clone()));
+        let zero = match ret {
+            ast::Type::Scalar(ast::ScalarType::F32) => builder.constant_f32(ret_type, None, 0.0),
+            ast::Type::Scalar(ast::ScalarType::F64) => builder.constant_f64(ret_type, None, 0.0),
+            ast::Type::Scalar(ast::ScalarType::F16) => builder.constant_f32(ret_type, None, 0.0),
+            _ => builder.constant_u32(ret_type, None, 0),
+        };
+        builder.ret_value(zero)?;
+    }
+    builder.end_function()?;
+    Ok(())
 }
 
 fn emit_directives<'input>(
@@ -524,10 +679,36 @@ fn emit_directives<'input>(
         HashMap<u8, (spirv::FPDenormMode, isize)>,
     >,
     call_map: &HashMap<&'input str, HashSet<spirv::Word>>,
+    callee_param_types: &HashMap<spirv::Word, Vec<SpirvType>>,
     directives: Vec<Directive<'input>>,
     kernel_info: &mut HashMap<String, KernelInfo>,
 ) -> Result<(), TranslateError> {
     let empty_body = Vec::new();
+    // The ids of the functions that are defined (have a body) in this module.
+    // A function that is only declared elsewhere in the same module does not
+    // need a separate declaration.
+    let defined_functions: HashSet<spirv::Word> = directives
+        .iter()
+        .filter_map(|d| match d {
+            Directive::Method(f) if f.body.is_some() => match (*f.func_decl).borrow().name {
+                ast::MethodName::Func(name) => Some(name),
+                ast::MethodName::Kernel(_) => None,
+            },
+            _ => None,
+        })
+        .collect();
+    // The ids of the functions that are actually called. A function that is
+    // only declared (`.extern .func`) but never called needs no declaration
+    // at all - and emitting one would make the module unlinkable, because the
+    // declaration carries an Import linkage that nothing provides.
+    let called_functions: HashSet<spirv::Word> = directives
+        .iter()
+        .filter_map(|d| match d {
+            Directive::Method(f) => f.body.as_ref().map(|body| collect_called_functions(body)),
+            _ => None,
+        })
+        .flatten()
+        .collect();
     for d in directives.iter() {
         match d {
             Directive::Variable(_, var) => {
@@ -540,6 +721,28 @@ fn emit_directives<'input>(
                         if f.import_as.is_some() {
                             &empty_body
                         } else {
+                            // A bodyless function (`.extern .func`) is only
+                            // declared, not defined. A call to it still needs a
+                            // target id, so emit an OpFunction without a
+                            // body: the module then has a declaration the
+                            // call can refer to. (The 2021 baseline never
+                            // saw such PTX.)
+                            //
+                            // A module may declare a function and define it
+                            // later (`.func f; ... .func f { }`), in which
+                            // case the definition provides the id and no
+                            // declaration is needed.
+                            let fn_id = match (*f.func_decl).borrow().name {
+                                ast::MethodName::Func(name) => Some(name),
+                                ast::MethodName::Kernel(_) => None,
+                            };
+                            if let Some(fn_id) = fn_id {
+                                if !defined_functions.contains(&fn_id)
+                                    && called_functions.contains(&fn_id)
+                                {
+                                    emit_function_declaration(builder, map, f)?;
+                                }
+                            }
                             continue;
                         }
                     }
@@ -559,29 +762,84 @@ fn emit_directives<'input>(
                     &directives,
                     kernel_info,
                 )?;
-                for t in f.tuning.iter() {
-                    match *t {
-                        ast::TuningDirective::MaxNtid(nx, ny, nz) => {
-                            builder.execution_mode(
-                                fn_id,
-                                spirv_headers::ExecutionMode::MaxWorkgroupSizeINTEL,
-                                [nx, ny, nz],
-                            );
+                let mut emitted_execution_mode = false;
+                if let ast::MethodName::Kernel(_) = func_decl.name {
+                    for t in f.tuning.iter() {
+                        match *t {
+                            ast::TuningDirective::MaxNtid(nx, ny, nz) => {
+                                // CUDA .maxntid caps the TOTAL thread count
+                                // (x*y*z, cf. upstream amdgpu-flat-work-group-size
+                                // 1..x*y*z); a 2D block within the cap must stay
+                                // launchable. SPIR-V's MaxWorkgroupSizeINTEL is
+                                // per-dimension, so allow up to the total in each.
+                                let total = (nx * ny * nz).clamp(1, 256);
+                                builder.execution_mode(
+                                    fn_id,
+                                    spirv_headers::ExecutionMode::MaxWorkgroupSizeINTEL,
+                                    [total, total, total],
+                                );
+                                emitted_execution_mode = true;
+                            }
+                            ast::TuningDirective::ReqNtid(nx, ny, nz) => {
+                                builder.execution_mode(
+                                    fn_id,
+                                    spirv_headers::ExecutionMode::LocalSize,
+                                    [nx, ny, nz],
+                                );
+                                emitted_execution_mode = true;
+                            }
+                            // Too architecture specific
+                            ast::TuningDirective::MaxNReg(..)
+                            | ast::TuningDirective::MinNCtaPerSm(..)
+                            | ast::TuningDirective::NoReturn => {}
                         }
-                        ast::TuningDirective::ReqNtid(nx, ny, nz) => {
-                            builder.execution_mode(
-                                fn_id,
-                                spirv_headers::ExecutionMode::LocalSize,
-                                [nx, ny, nz],
-                            );
-                        }
-                        // Too architecture specific
-                        ast::TuningDirective::MaxNReg(..)
-                        | ast::TuningDirective::MinNCtaPerSm(..) => {}
+                    }
+                    if !emitted_execution_mode {
+                        // No tuning directive: don't force a specific LocalSize
+                        // (that would cap the launch block size). Allow up to 256
+                        // threads per workgroup dimension instead.
+                        builder.execution_mode(
+                            fn_id,
+                            spirv_headers::ExecutionMode::MaxWorkgroupSizeINTEL,
+                            [256, 256, 256],
+                        );
+                    }
+                    // A PTX warp is 32 lanes, but a kernel compiled for this
+                    // GPU gets a 16 lane subgroup by default: a shuffle that
+                    // asks for a lane past 15 then reads outside the subgroup
+                    // and returns zero. The kernels that exchange data across
+                    // the warp therefore ask for the full 32 lanes.
+                    if statements_need_full_warp(&f_body)
+                        || special_registers_need_full_warp(&id_defs.special_registers)
+                    {
+                        builder.execution_mode(
+                            fn_id,
+                            spirv_headers::ExecutionMode::SubgroupSize,
+                            [32],
+                        );
                     }
                 }
-                emit_function_body_ops(builder, map, opencl_id, &f_body)?;
+                let laneid = id_defs
+                    .special_registers
+                    .builtins()
+                    .find(|(sreg, _)| *sreg == PtxSpecialRegister::Laneid)
+                    .map(|(_, id)| id);
+                emit_function_body_ops(
+                    builder,
+                    map,
+                    opencl_id,
+                    &f_body,
+                    callee_param_types,
+                    laneid,
+                )?;
+                if builder.selected_block().is_some() {
+                    builder.ret()?;
+                }
                 builder.end_function()?;
+                let fn_idx = builder.module_ref().functions.len() - 1;
+                if std::env::var_os("ZLUDA_PTX_DISABLE_RPO").is_none() {
+                    reorder_blocks_rpo(builder.module_mut(), fn_idx);
+                }
                 if let (
                     ast::MethodDeclaration {
                         name: ast::MethodName::Func(fn_id),
@@ -645,6 +903,36 @@ fn get_kernels_call_map<'input>(
                 result.insert(*name, visited);
             }
             ast::MethodName::Func(_) => {}
+        }
+    }
+    result
+}
+
+// Build a map from function id -> its effective input argument SPIR-V types,
+// so call sites can normalize pointer argument types to match the callee.
+fn get_callee_param_types<'input>(
+    module: &[Directive<'input>],
+) -> HashMap<spirv::Word, Vec<SpirvType>> {
+    let mut result = HashMap::new();
+    for directive in module {
+        if let Directive::Method(Function { func_decl, .. }) = directive {
+            let decl = (*func_decl).borrow();
+            let id = match decl.name {
+                ast::MethodName::Kernel(_) => continue,
+                ast::MethodName::Func(id) => id,
+            };
+            let types = decl
+                .input_arguments
+                .iter()
+                .map(|arg| {
+                    if decl.name.is_kernel() || arg.state_space == ast::StateSpace::Reg {
+                        SpirvType::new(arg.v_type.clone())
+                    } else {
+                        SpirvType::pointer_to(arg.v_type.clone(), arg.state_space.to_spirv())
+                    }
+                })
+                .collect();
+            result.insert(id, types);
         }
     }
     result
@@ -1073,8 +1361,24 @@ fn emit_function_header<'a>(
                     _ => {}
                 }
             }
-            global_variables.append(&mut interface);
-            builder.entry_point(spirv::ExecutionModel::Kernel, fn_id, name, global_variables);
+            // SPIR-V <= 1.3 OpEntryPoint interface must only contain Input/Output
+            // variables; kernel params are bound by argument index instead.
+            // Builtin special registers are Input variables, so append them too.
+            let mut interface = global_variables
+                .into_iter()
+                .filter(|id| {
+                    match defined_globals
+                        .variables_type_check
+                        .get(id)
+                        .and_then(|t| t.as_ref())
+                    {
+                        Some((_, ast::StateSpace::Sreg, _)) => true,
+                        Some((_, ast::StateSpace::Const, _)) => true,
+                        _ => false,
+                    }
+            }).collect::<Vec<_>>();
+            interface.extend(defined_globals.special_registers.interface());
+            builder.entry_point(spirv::ExecutionModel::Kernel, fn_id, name, interface);
             fn_id
         }
         ast::MethodName::Func(name) => name,
@@ -1117,12 +1421,22 @@ fn emit_capabilities(builder: &mut dr::Builder) {
     builder.capability(spirv::Capability::Int64);
     builder.capability(spirv::Capability::Float16);
     builder.capability(spirv::Capability::Float64);
+    builder.capability(spirv::Capability::KernelAttributesINTEL);
+    // Warp-level primitives (shfl / vote) are lowered to subgroup
+    // operations. The shuffle uses the Intel subgroup extension (the whole
+    // subgroup participates), the vote uses the core SPIR-V 1.3
+    // group operations (no extension needed).
+    builder.capability(spirv::Capability::SubgroupShuffleINTEL);
+    builder.capability(spirv::Capability::GroupNonUniformVote);
+    builder.capability(spirv::Capability::GroupNonUniformBallot);
     // TODO: re-enable when Intel float control extension works
     //builder.capability(spirv::Capability::FunctionFloatControlINTEL);
 }
 
 // http://htmlpreview.github.io/?https://github.com/KhronosGroup/SPIRV-Registry/blob/master/extensions/KHR/SPV_KHR_float_controls.html
-fn emit_extensions(_builder: &mut dr::Builder) {
+fn emit_extensions(builder: &mut dr::Builder) {
+    builder.extension("SPV_INTEL_kernel_attributes");
+    builder.extension("SPV_INTEL_subgroups");
     // TODO: re-enable when Intel float control extension works
     //builder.extension("SPV_INTEL_float_controls2");
 }
@@ -1217,6 +1531,7 @@ fn to_ssa<'input, 'b>(
     tuning: Vec<ast::TuningDirective>,
 ) -> Result<Function<'input>, TranslateError> {
     //deparamize_function_decl(&func_decl)?;
+    //deparamize_function_decl(&func_decl)?;
     let f_body = match f_body {
         Some(vec) => vec,
         None => {
@@ -1229,27 +1544,50 @@ fn to_ssa<'input, 'b>(
             })
         }
     };
-    let normalized_ids = normalize_identifiers(&mut id_defs, &fn_defs, f_body)?;
+    let normalized_ids = match normalize_identifiers(&mut id_defs, &fn_defs, f_body) {
+        Ok(v) => v,
+        Err(e) => return Err(e),
+    };
     let mut numeric_id_defs = id_defs.finish();
-    let unadorned_statements = normalize_predicates(normalized_ids, &mut numeric_id_defs)?;
-    let typed_statements =
-        convert_to_typed_statements(unadorned_statements, &fn_defs, &mut numeric_id_defs)?;
-    let (func_decl, typed_statements) =
-        convert_to_stateful_memory_access(func_decl, typed_statements, &mut numeric_id_defs)?;
-    let ssa_statements = insert_mem_ssa_statements(
+    let unadorned_statements = match normalize_predicates(normalized_ids, &mut numeric_id_defs) {
+        Ok(v) => v,
+        Err(e) => return Err(e),
+    };
+    let typed_statements = match convert_to_typed_statements(unadorned_statements, &fn_defs, &mut numeric_id_defs) {
+        Ok(v) => v,
+        Err(e) => return Err(e),
+    };
+    let (func_decl, typed_statements) = match convert_to_stateful_memory_access(func_decl, typed_statements, &mut numeric_id_defs) {
+        Ok(v) => v,
+        Err(e) => return Err(e),
+    };
+    let ssa_statements = match insert_mem_ssa_statements(
         typed_statements,
         &mut numeric_id_defs,
         &mut (*func_decl).borrow_mut(),
-    )?;
-    let ssa_statements = fix_special_registers(ssa_statements, &mut numeric_id_defs)?;
+    ) {
+        Ok(v) => v,
+        Err(e) => return Err(e),
+    };
+    let ssa_statements = match fix_special_registers(ssa_statements, &mut numeric_id_defs) {
+        Ok(v) => v,
+        Err(e) => return Err(e),
+    };
     let mut numeric_id_defs = numeric_id_defs.finish();
-    let expanded_statements = expand_arguments(ssa_statements, &mut numeric_id_defs)?;
-    let expanded_statements =
-        insert_implicit_conversions(expanded_statements, &mut numeric_id_defs)?;
+    let expanded_statements = match expand_arguments(ssa_statements, &mut numeric_id_defs) {
+        Ok(v) => v,
+        Err(e) => return Err(e),
+    };
+    let expanded_statements = match insert_implicit_conversions(expanded_statements, &mut numeric_id_defs) {
+        Ok(v) => v,
+        Err(e) => return Err(e),
+    };
     let mut numeric_id_defs = numeric_id_defs.unmut();
     let labeled_statements = normalize_labels(expanded_statements, &mut numeric_id_defs);
-    let (f_body, globals) =
-        extract_globals(labeled_statements, ptx_impl_imports, &mut numeric_id_defs)?;
+    let (f_body, globals) = match extract_globals(labeled_statements, ptx_impl_imports, &mut numeric_id_defs) {
+        Ok(v) => v,
+        Err(e) => return Err(e),
+    };
     Ok(Function {
         func_decl: func_decl,
         globals: globals,
@@ -1259,13 +1597,204 @@ fn to_ssa<'input, 'b>(
     })
 }
 
+/// Lower a `%lanemask_*` read into the shifts of the lane id that produce
+/// the mask. The mask covers the 32 lanes of a warp:
+///   lt: (1 << lane) - 1        le: (1 << (lane + 1)) - 1
+///   eq:  1 << lane             ge: ~((1 << lane) - 1)
+///   gt: ~((1 << (lane + 1)) - 1)
+fn expand_lane_mask(
+    numeric_id_defs: &mut NumericIdResolver,
+    mask: PtxSpecialRegister,
+    dst: spirv::Word,
+    typ: ast::ScalarType,
+    out: &mut Vec<TypedStatement>,
+) -> Result<(), TranslateError> {
+    let lane_var = numeric_id_defs
+        .special_registers
+        .get_or_add(numeric_id_defs.current_id, PtxSpecialRegister::Laneid);
+    let lane = numeric_id_defs
+        .register_intermediate(Some((ast::Type::Scalar(ast::ScalarType::U32), ast::StateSpace::Reg)));
+    out.push(Statement::LoadVar(LoadVarDetails {
+        arg: Arg2 {
+            dst: lane,
+            src: lane_var,
+        },
+        state_space: ast::StateSpace::Sreg,
+        typ: ast::Type::Scalar(ast::ScalarType::U32),
+        member_index: None,
+    }));
+    let one = numeric_id_defs
+        .register_intermediate(Some((ast::Type::Scalar(ast::ScalarType::U32), ast::StateSpace::Reg)));
+    out.push(Statement::Constant(ConstantDefinition {
+        dst: one,
+        typ: ast::ScalarType::U32,
+        value: ast::ImmediateValue::U64(1),
+    }));
+    // le and gt count one lane further than lt and ge.
+    let shift_amount = if matches!(
+        mask,
+        PtxSpecialRegister::LanemaskLe | PtxSpecialRegister::LanemaskGt
+    ) {
+        let next = numeric_id_defs.register_intermediate(Some((
+            ast::Type::Scalar(ast::ScalarType::U32),
+            ast::StateSpace::Reg,
+        )));
+        out.push(Statement::Instruction(ast::Instruction::Add(
+            ast::ArithDetails::Unsigned(ast::ScalarType::U32),
+            ast::Arg3 {
+                dst: TypedOperand::Reg(next),
+                src1: TypedOperand::Reg(lane),
+                src2: TypedOperand::Imm(ast::ImmediateValue::U64(1)),
+            },
+        )));
+        next
+    } else {
+        lane
+    };
+    let shifted = numeric_id_defs
+        .register_intermediate(Some((ast::Type::Scalar(ast::ScalarType::U32), ast::StateSpace::Reg)));
+    out.push(Statement::Instruction(ast::Instruction::Shl(
+        ast::ScalarType::U32,
+        ast::Arg3 {
+            dst: TypedOperand::Reg(shifted),
+            src1: TypedOperand::Reg(one),
+            src2: TypedOperand::Reg(shift_amount),
+        },
+    )));
+    match mask {
+        PtxSpecialRegister::LanemaskEq => {
+            out.push(Statement::Conversion(ImplicitConversion {
+                src: shifted,
+                dst,
+                from_type: ast::Type::Scalar(ast::ScalarType::U32),
+                from_space: ast::StateSpace::Reg,
+                to_type: ast::Type::Scalar(typ),
+                to_space: ast::StateSpace::Reg,
+                kind: ConversionKind::Default,
+            }));
+        }
+        PtxSpecialRegister::LanemaskLt | PtxSpecialRegister::LanemaskLe | PtxSpecialRegister::LanemaskGe
+        | PtxSpecialRegister::LanemaskGt => {
+            let minus_one = numeric_id_defs.register_intermediate(Some((
+                ast::Type::Scalar(ast::ScalarType::U32),
+                ast::StateSpace::Reg,
+            )));
+            out.push(Statement::Instruction(ast::Instruction::Sub(
+                ast::ArithDetails::Unsigned(ast::ScalarType::U32),
+                ast::Arg3 {
+                    dst: TypedOperand::Reg(minus_one),
+                    src1: TypedOperand::Reg(shifted),
+                    src2: TypedOperand::Imm(ast::ImmediateValue::U64(1)),
+                },
+            )));
+            // ge and gt are the complement of lt and le.
+            let value = if matches!(
+                mask,
+                PtxSpecialRegister::LanemaskGe | PtxSpecialRegister::LanemaskGt
+            ) {
+                let inverted = numeric_id_defs.register_intermediate(Some((
+                    ast::Type::Scalar(ast::ScalarType::U32),
+                    ast::StateSpace::Reg,
+                )));
+                out.push(Statement::Instruction(ast::Instruction::Not(
+                    ast::ScalarType::U32,
+                    ast::Arg2 {
+                        dst: TypedOperand::Reg(inverted),
+                        src: TypedOperand::Reg(minus_one),
+                    },
+                )));
+                inverted
+            } else {
+                minus_one
+            };
+            out.push(Statement::Conversion(ImplicitConversion {
+                src: value,
+                dst,
+                from_type: ast::Type::Scalar(ast::ScalarType::U32),
+                from_space: ast::StateSpace::Reg,
+                to_type: ast::Type::Scalar(typ),
+                to_space: ast::StateSpace::Reg,
+                kind: ConversionKind::Default,
+            }));
+        }
+        _ => unreachable!(),
+    }
+    Ok(())
+}
+
 fn fix_special_registers(
     typed_statements: Vec<TypedStatement>,
     numeric_id_defs: &mut NumericIdResolver,
 ) -> Result<Vec<TypedStatement>, TranslateError> {
     let mut result = Vec::with_capacity(typed_statements.len());
     for s in typed_statements {
+        // %envreg1/%envreg2 (CUDA kernel parameter-buffer base) has no SPIR-V
+        // counterpart. In the kernels we run the composed pointer is stored as
+        // dead data and never dereferenced, so lower the read to a zero constant.
+        if let Statement::Instruction(ast::Instruction::Mov(_, ref arg)) = s {
+            let envreg_read = match arg.src {
+                TypedOperand::Reg(src_id) => matches!(
+                    numeric_id_defs.special_registers.get(src_id),
+                    Some(PtxSpecialRegister::Envreg1 | PtxSpecialRegister::Envreg2)
+                ),
+                _ => false,
+            };
+            if envreg_read {
+                if let TypedOperand::Reg(dst_id) = arg.dst {
+                    result.push(Statement::Constant(ConstantDefinition {
+                        dst: dst_id,
+                        typ: ast::ScalarType::U32,
+                        value: ast::ImmediateValue::U64(0),
+                    }));
+                    continue;
+                }
+            }
+        }
         match s {
+            // A bare %envregN read (no .x/.y member access) is wrapped by
+            // InsertMemSSAVisitor into a plain LoadVar before this pass runs;
+            // lower it to a zero constant just like the Mov form above.
+            Statement::LoadVar(ref details)
+                if details.member_index.is_none()
+                    && matches!(
+                        numeric_id_defs.special_registers.get(details.arg.src),
+                        Some(PtxSpecialRegister::Envreg1 | PtxSpecialRegister::Envreg2)
+                    ) =>
+            {
+                result.push(Statement::Constant(ConstantDefinition {
+                    dst: details.arg.dst,
+                    typ: ast::ScalarType::U32,
+                    value: ast::ImmediateValue::U64(0),
+                }));
+            }
+            // %lanemask_lt and friends are a bit mask of the warp's lanes
+            // relative to this one, which is a shifted one:
+            //   lt: (1 << lane) - 1        le: (1 << (lane + 1)) - 1
+            //   eq:  1 << lane             ge: ~((1 << lane) - 1)
+            //   gt: ~((1 << (lane + 1)) - 1)
+            Statement::LoadVar(ref details)
+                if details.member_index.is_none()
+                    && matches!(
+                        numeric_id_defs.special_registers.get(details.arg.src),
+                        Some(
+                            PtxSpecialRegister::LanemaskLt
+                                | PtxSpecialRegister::LanemaskLe
+                                | PtxSpecialRegister::LanemaskEq
+                                | PtxSpecialRegister::LanemaskGe
+                                | PtxSpecialRegister::LanemaskGt
+                        )
+                    ) =>
+            {
+                let mask = match numeric_id_defs.special_registers.get(details.arg.src) {
+                    Some(mask) => mask,
+                    None => unreachable!(),
+                };
+                let dst_typ = match &details.typ {
+                    ast::Type::Scalar(t) => *t,
+                    _ => ast::ScalarType::U32,
+                };
+                expand_lane_mask(numeric_id_defs, mask, details.arg.dst, dst_typ, &mut result)?;
+            }
             Statement::LoadVar(
                 mut
                 details
@@ -1366,15 +1895,6 @@ fn extract_globals<'input, 'b>(
                     ..
                 },
             ) => global.push(var),
-            Statement::Instruction(ast::Instruction::Bfe { typ, arg }) => {
-                let fn_name = [ZLUDA_PTX_PREFIX, "bfe_", typ.to_ptx_name()].concat();
-                local.push(instruction_to_fn_call(
-                    id_def,
-                    ptx_impl_imports,
-                    ast::Instruction::Bfe { typ, arg },
-                    fn_name,
-                )?);
-            }
             Statement::Instruction(ast::Instruction::Bfi { typ, arg }) => {
                 let fn_name = [ZLUDA_PTX_PREFIX, "bfi_", typ.to_ptx_name()].concat();
                 local.push(instruction_to_fn_call(
@@ -1579,8 +2099,18 @@ fn convert_to_typed_statements(
         match s {
             Statement::Instruction(inst) => match inst {
                 ast::Instruction::Call(call) => {
-                    let resolver = fn_defs.get_fn_sig_resolver(call.func)?;
-                    let resolved_call = resolver.resolve_in_spirv_repr(call)?;
+                    let resolver = match fn_defs.get_fn_sig_resolver(call.func) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            return Err(e);
+                        }
+                    };
+                    let resolved_call = match resolver.resolve_in_spirv_repr(call) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            return Err(e);
+                        }
+                    };
                     let mut visitor = VectorRepackVisitor::new(&mut result, id_defs);
                     let reresolved_call = resolved_call.visit(&mut visitor)?;
                     visitor.func.push(reresolved_call);
@@ -1588,7 +2118,12 @@ fn convert_to_typed_statements(
                 }
                 inst => {
                     let mut visitor = VectorRepackVisitor::new(&mut result, id_defs);
-                    let instruction = Statement::Instruction(inst.map(&mut visitor)?);
+                    let instruction = match inst.map(&mut visitor) {
+                        Ok(v) => Statement::Instruction(v),
+                        Err(e) => {
+                            return Err(e);
+                        }
+                    };
                     visitor.func.push(instruction);
                     visitor.func.extend(visitor.post_stmts);
                 }
@@ -1631,8 +2166,36 @@ impl<'a, 'b> VectorRepackVisitor<'a, 'b> {
         idx: Vec<spirv::Word>,
     ) -> Result<spirv::Word, TranslateError> {
         // mov.u32 foobar, {a,b};
-        let scalar_t = match typ {
-            ast::Type::Vector(scalar_t, _) => *scalar_t,
+        //
+        // A vector pack can also name a 64-bit value that PTX spells as a
+        // pair of 32-bit registers: `mov.b64 {%r0,%r1}, %rd2;`. The pack
+        // then has to be assembled into a 64-bit value, not a vector.
+        // A pack operand either names a vector, or the pieces of a wider
+        // scalar: "mov.b64 {%r0,%r1}, %rd2;" splits a 64-bit value into two
+        // 32-bit halves, "mov.b32 {low,high}, %r1" splits a 32-bit value into
+        // two 16-bit halves (the inline assembly idiom CUDA uses for the
+        // half conversions). The element type comes from the registers
+        // themselves.
+        let (scalar_t, width, packed_scalar) = match typ {
+            ast::Type::Vector(scalar_t, width) => (*scalar_t, *width, None),
+            ast::Type::Scalar(packed) => {
+                // The element type comes from the registers of the pack; a
+                // hole ("_") has no register, so look at the first real one.
+                let first = match idx.iter().find(|id| **id != 0) {
+                    Some(id) => *id,
+                    None => return Err(TranslateError::MismatchedType),
+                };
+                let elem_type = match self.id_def.get_typed(first)?.0 {
+                    ast::Type::Scalar(s) => s,
+                    _ => return Err(TranslateError::MismatchedType),
+                };
+                let elem_bits = elem_type.size_of() as usize * 8;
+                let packed_bits = packed.size_of() as usize * 8;
+                if elem_bits * idx.len() != packed_bits {
+                    return Err(TranslateError::MismatchedType);
+                }
+                (elem_type, idx.len() as u8, Some(*packed))
+            }
             _ => return Err(TranslateError::MismatchedType),
         };
         let temp_vec = self
@@ -1644,6 +2207,8 @@ impl<'a, 'b> VectorRepackVisitor<'a, 'b> {
             packed: temp_vec,
             unpacked: idx,
             non_default_implicit_conversion,
+            pack_width: width,
+            packed_scalar,
         });
         if is_dst {
             self.post_stmts = Some(statement);
@@ -1683,6 +2248,38 @@ impl<'a, 'b> ArgumentMapVisitor<NormalizedArgParams, TypedArgParams>
                 state_space,
                 vec,
             )?),
+            // A vector literal of constants: "st.global.v2.b32 [addr], {99, 0};"
+            ast::Operand::ImmPack(values) => {
+                let (scalar_t, width) = match typ {
+                    ast::Type::Vector(scalar_t, width) => (*scalar_t, *width),
+                    _ => return Err(TranslateError::MismatchedType),
+                };
+                let mut ids = Vec::with_capacity(values.len());
+                for value in values {
+                    let id = self
+                        .id_def
+                        .register_intermediate(Some((ast::Type::Scalar(scalar_t), state_space)));
+                    self.func.push(Statement::Constant(ConstantDefinition {
+                        dst: id,
+                        typ: scalar_t,
+                        value,
+                    }));
+                    ids.push(id);
+                }
+                let temp_vec = self
+                    .id_def
+                    .register_intermediate(Some((typ.clone(), state_space)));
+                self.func.push(Statement::RepackVector(RepackVectorDetails {
+                    is_extract: false,
+                    typ: scalar_t,
+                    packed: temp_vec,
+                    unpacked: ids,
+                    non_default_implicit_conversion: None,
+                    pack_width: width,
+                    packed_scalar: None,
+                }));
+                TypedOperand::Reg(temp_vec)
+            }
         })
     }
 }
@@ -1904,6 +2501,32 @@ fn insert_mem_ssa_statements<'a, 'b>(
 ) -> Result<Vec<TypedStatement>, TranslateError> {
     let mut result = Vec::with_capacity(func.len());
     for arg in fn_decl.input_arguments.iter_mut() {
+        // IGC rejects array-typed by-value kernel arguments. A by-value
+        // struct (e.g. dim3) arrives as `.param .b8 name[12]`, i.e.
+        // Array(B8, [12]). Represent it as a vector of u32 instead - same
+        // byte layout, IGC accepts it. The kernel body only ever takes its
+        // address and reads bytes, which works through a pointer bitcast.
+        if fn_decl.name.is_kernel() {
+            if let ast::Type::Array(ast::ScalarType::B8, dims) = &arg.v_type {
+                let bytes: u32 = dims.iter().product();
+                // A SPIR-V vector holds two, three or four components, so a
+                // larger struct becomes an OpTypeStruct of 32-bit words (the
+                // backend accepts a struct as a kernel argument, an array it
+                // does not). The members are all 32-bit and there is no
+                // padding, so the byte layout is unchanged and the body can
+                // still read the bytes through a pointer bitcast.
+                if bytes % 4 == 0 && bytes / 4 <= 4 {
+                    arg.v_type = ast::Type::Vector(ast::ScalarType::U32, (bytes / 4) as u8);
+                } else if bytes % 4 == 0 {
+                    arg.v_type = ast::Type::Struct(vec![
+                        ast::ScalarType::U32;
+                        (bytes / 4) as usize
+                    ]);
+                } else if bytes <= 4 {
+                    arg.v_type = ast::Type::Vector(ast::ScalarType::U8, bytes as u8);
+                }
+            }
+        }
         insert_mem_ssa_argument(id_def, &mut result, arg, fn_decl.name.is_kernel());
     }
     for arg in fn_decl.return_arguments.iter() {
@@ -1968,6 +2591,8 @@ fn insert_mem_ssa_statements<'a, 'b>(
                 insert_mem_ssa_statement_default(id_def, &mut result, repack)?
             }
             s @ Statement::Variable(_) | s @ Statement::Label(_) => result.push(s),
+            // A constant needs no memory SSA processing.
+            s @ Statement::Constant(_) => result.push(s),
             _ => return Err(error_unreachable()),
         }
     }
@@ -2161,13 +2786,16 @@ fn insert_mem_ssa_statement_default<'a, 'input, S: Visitable<TypedArgParams, Typ
         func,
         post_statements: Vec::new(),
     };
-    let new_stmt = stmt.visit(&mut visitor)?;
+    let new_stmt = match stmt.visit(&mut visitor) {
+        Ok(v) => v,
+        Err(e) => return Err(e),
+    };
     visitor.func.push(new_stmt);
     visitor.func.extend(visitor.post_statements);
     Ok(())
 }
 
-fn expand_arguments<'a, 'b>(
+            fn expand_arguments<'a, 'b>(
     func: Vec<TypedStatement>,
     id_def: &'b mut MutableNumericIdResolver<'a>,
 ) -> Result<Vec<ExpandedStatement>, TranslateError> {
@@ -2182,7 +2810,11 @@ fn expand_arguments<'a, 'b>(
             }
             Statement::Instruction(inst) => {
                 let mut visitor = FlattenArguments::new(&mut result, id_def);
-                let (new_inst, post_stmts) = (inst.map(&mut visitor)?, visitor.post_stmts);
+                let new_inst = match inst.map(&mut visitor) {
+                    Ok(v) => v,
+                    Err(e) => return Err(e),
+                };
+                let post_stmts = visitor.post_stmts;
                 result.push(Statement::Instruction(new_inst));
                 result.extend(post_stmts);
             }
@@ -2201,13 +2833,21 @@ fn expand_arguments<'a, 'b>(
             })),
             Statement::PtrAccess(ptr_access) => {
                 let mut visitor = FlattenArguments::new(&mut result, id_def);
-                let (new_inst, post_stmts) = (ptr_access.map(&mut visitor)?, visitor.post_stmts);
+                let new_inst = match ptr_access.map(&mut visitor) {
+                    Ok(v) => v,
+                    Err(e) => return Err(e),
+                };
+                let post_stmts = visitor.post_stmts;
                 result.push(Statement::PtrAccess(new_inst));
                 result.extend(post_stmts);
             }
             Statement::RepackVector(repack) => {
                 let mut visitor = FlattenArguments::new(&mut result, id_def);
-                let (new_inst, post_stmts) = (repack.map(&mut visitor)?, visitor.post_stmts);
+                let new_inst = match repack.map(&mut visitor) {
+                    Ok(v) => v,
+                    Err(e) => return Err(e),
+                };
+                let post_stmts = visitor.post_stmts;
                 result.push(Statement::RepackVector(new_inst));
                 result.extend(post_stmts);
             }
@@ -2217,7 +2857,7 @@ fn expand_arguments<'a, 'b>(
             Statement::StoreVar(details) => result.push(Statement::StoreVar(details)),
             Statement::RetValue(d, id) => result.push(Statement::RetValue(d, id)),
             Statement::Conversion(conv) => result.push(Statement::Conversion(conv)),
-            Statement::Constant(_) => return Err(error_unreachable()),
+            Statement::Constant(cnst) => result.push(Statement::Constant(cnst)),
         }
     }
     Ok(result)
@@ -2383,19 +3023,21 @@ fn insert_implicit_conversions(
     id_def: &mut MutableNumericIdResolver,
 ) -> Result<Vec<ExpandedStatement>, TranslateError> {
     let mut result = Vec::with_capacity(func.len());
+    let mut idx = 0;
     for s in func.into_iter() {
+        idx += 1;
         match s {
             Statement::Call(call) => {
-                insert_implicit_conversions_impl(&mut result, id_def, call)?;
+                insert_implicit_conversions_impl(&mut result, id_def, call, idx)?;
             }
             Statement::Instruction(inst) => {
-                insert_implicit_conversions_impl(&mut result, id_def, inst)?;
+                insert_implicit_conversions_impl(&mut result, id_def, inst, idx)?;
             }
             Statement::PtrAccess(access) => {
-                insert_implicit_conversions_impl(&mut result, id_def, access)?;
+                insert_implicit_conversions_impl(&mut result, id_def, access, idx)?;
             }
             Statement::RepackVector(repack) => {
-                insert_implicit_conversions_impl(&mut result, id_def, repack)?;
+                insert_implicit_conversions_impl(&mut result, id_def, repack, idx)?;
             }
             s @ Statement::Conditional(_)
             | s @ Statement::Conversion(_)
@@ -2414,6 +3056,7 @@ fn insert_implicit_conversions_impl(
     func: &mut Vec<ExpandedStatement>,
     id_def: &mut MutableNumericIdResolver,
     stmt: impl Visitable<ExpandedArgParams, ExpandedArgParams>,
+    idx: usize,
 ) -> Result<(), TranslateError> {
     let mut post_conv = Vec::new();
     let statement =
@@ -2424,13 +3067,27 @@ fn insert_implicit_conversions_impl(
                 Some(t) => t,
             };
             let (operand_type, operand_space) = id_def.get_typed(desc.op)?;
+            let op_sz = operand_type.size_of();
             let conversion_fn = desc
                 .non_default_implicit_conversion
                 .unwrap_or(default_implicit_conversion);
-            match conversion_fn(
+            let conv_result = conversion_fn(
                 (operand_space, &operand_type),
                 (instruction_space, instr_type),
-            )? {
+            );
+            let conv_kind = match conv_result {
+                Ok(v) => v,
+                Err(TranslateError::MismatchedTypeIn(msg)) => {
+                    return Err(TranslateError::MismatchedTypeIn(format!(
+                        "{} (instruction wants {}, operand is {})",
+                        msg,
+                        describe_type(instr_type),
+                        describe_type(&operand_type)
+                    )))
+                }
+                Err(e) => return Err(e),
+            };
+            match conv_kind {
                 Some(conv_kind) => {
                     let conv_output = if desc.is_dst {
                         &mut post_conv
@@ -2469,6 +3126,157 @@ fn insert_implicit_conversions_impl(
     Ok(())
 }
 
+/// Whether a function body contains an ldmatrix, which needs the lane id
+/// builtin even if no instruction reads it.
+/// The width of a PTX warp, in lanes.
+const WARP_LANES: u32 = 32;
+
+/// Whether a function exchanges data across the whole warp, which needs a
+/// 32-lane subgroup (the default on this GPU is 16).
+fn statements_need_full_warp(statements: &[ExpandedStatement]) -> bool {
+    statements.iter().any(|statement| match statement {
+        Statement::Instruction(ast::Instruction::Shfl(..))
+        | Statement::Instruction(ast::Instruction::Vote(..))
+        | Statement::Instruction(ast::Instruction::LdMatrix(..))
+        | Statement::Instruction(ast::Instruction::Mma(..))
+        | Statement::Instruction(ast::Instruction::MovMatrix(..))
+        | Statement::Instruction(ast::Instruction::Redux(..))
+        | Statement::Instruction(ast::Instruction::BarRedPopc(..))
+        | Statement::Instruction(ast::Instruction::BarRedPred(..))
+        // A warp barrier synchronises the 32 lanes of a PTX warp; with a 16
+        // lane subgroup it would only synchronise half of it.
+        | Statement::Instruction(ast::Instruction::Bar(ast::BarDetails::WarpSync, _)) => true,
+        _ => false,
+    })
+}
+
+/// Whether the code reads the lane or warp id. Both are per-warp values: with a
+/// 16 lane subgroup `%laneid` repeats 0..15 twice and `%warpid` counts halves.
+fn special_registers_need_full_warp(special_registers: &SpecialRegistersMap) -> bool {
+    special_registers.builtins().any(|(sreg, _)| {
+        matches!(
+            sreg,
+            PtxSpecialRegister::Laneid
+                | PtxSpecialRegister::Warpid
+                | PtxSpecialRegister::Nwarpid
+                | PtxSpecialRegister::LanemaskLt
+                | PtxSpecialRegister::LanemaskLe
+                | PtxSpecialRegister::LanemaskEq
+                | PtxSpecialRegister::LanemaskGe
+                | PtxSpecialRegister::LanemaskGt
+        )
+    })
+}
+
+/// Whether the code needs the lane id: the matrix instructions pick the
+/// thread that holds a fragment by it, and a shuffle computes its source lane
+/// from it.
+fn statements_use_laneid(statements: &[ExpandedStatement]) -> bool {
+    statements.iter().any(|statement| match statement {
+        Statement::Instruction(ast::Instruction::Shfl(..))
+        | Statement::Instruction(ast::Instruction::LdMatrix(..))
+        | Statement::Instruction(ast::Instruction::Mma(..))
+        | Statement::Instruction(ast::Instruction::MovMatrix(..)) => true,
+        _ => false,
+    })
+}
+
+fn statements_use_ldmatrix(statements: &[ExpandedStatement]) -> bool {
+    statements.iter().any(|statement| match statement {
+        // Both the matrix load and the matrix multiply pick the thread that
+        // holds a fragment by its lane id.
+        Statement::Instruction(ast::Instruction::LdMatrix(..))
+        | Statement::Instruction(ast::Instruction::Mma(..))
+        | Statement::Instruction(ast::Instruction::MovMatrix(..)) => true,
+        _ => false,
+    })
+}
+
+fn contains_958(s: &ExpandedStatement) -> bool {
+    match s {
+        Statement::Instruction(ast::Instruction::St(_, arg)) => arg.src1 == 958 || arg.src2 == 958,
+        Statement::Instruction(ast::Instruction::Ld(_, arg)) => arg.dst == 958 || arg.src == 958,
+        Statement::Instruction(ast::Instruction::Mov(_, arg)) => arg.dst == 958 || arg.src == 958,
+        Statement::Instruction(ast::Instruction::Cvta(_, arg)) => arg.dst == 958 || arg.src == 958,
+        Statement::Instruction(ast::Instruction::BarRedPopc(_, a, b)) => *a == 958 || *b == 958,
+        Statement::StoreVar(d) => d.arg.src1 == 958 || d.arg.src2 == 958,
+        Statement::LoadVar(d) => d.arg.dst == 958 || d.arg.src == 958,
+        _ => false,
+    }
+}
+
+// Reorder a function's blocks so every block appears after its dominators.
+// rspirv emits blocks in statement order; PTX loops can place a loop body
+// before its dominator header, which spirv-val rejects. Reverse post-order of
+// the CFG satisfies dominance for reducible control flow.
+fn reorder_blocks_rpo(module: &mut dr::Module, fn_idx: usize) {
+    let function = &module.functions[fn_idx];
+    if function.blocks.is_empty() {
+        return;
+    }
+    let entry = function.blocks[0].label.as_ref().and_then(|l| l.result_id).unwrap_or(0);
+    let mut label_to_block: HashMap<spirv::Word, usize> = HashMap::new();
+    for (i, b) in function.blocks.iter().enumerate() {
+        if let Some(l) = b.label.as_ref() {
+            if let Some(id) = l.result_id {
+                label_to_block.insert(id, i);
+            }
+        }
+    }
+    let mut order: Vec<usize> = Vec::new();
+    let mut visited = HashSet::new();
+    fn dfs(
+        idx: usize,
+        blocks: &[dr::Block],
+        label_to_block: &HashMap<spirv::Word, usize>,
+        visited: &mut HashSet<usize>,
+        order: &mut Vec<usize>,
+    ) {
+        if !visited.insert(idx) {
+            return;
+        }
+        let block = &blocks[idx];
+        let targets = block
+            .instructions
+            .iter()
+            .filter(|i| i.class.opcode == spirv::Op::Branch || i.class.opcode == spirv::Op::BranchConditional || i.class.opcode == spirv::Op::Switch)
+            .flat_map(|i| i.operands.iter())
+            .filter_map(|o| match o {
+                dr::Operand::IdRef(id) => Some(*id),
+                _ => None,
+            })
+            .filter_map(|id| label_to_block.get(&id).copied())
+            .collect::<Vec<_>>();
+        for t in targets {
+            dfs(t, blocks, label_to_block, visited, order);
+        }
+        order.push(idx);
+    }
+    dfs(
+        label_to_block
+            .get(&entry)
+            .copied()
+            .unwrap_or(0),
+        &function.blocks,
+        &label_to_block,
+        &mut visited,
+        &mut order,
+    );
+    // Reverse post-order: entry block first (post-order pushes entry last).
+    order.reverse();
+    // Also append any blocks not reachable via DFS (e.g. landing pads).
+    for i in 0..function.blocks.len() {
+        if !visited.contains(&i) {
+            order.push(i);
+        }
+    }
+    if order.len() != function.blocks.len() {
+        return;
+    }
+    let old = std::mem::take(&mut module.functions[fn_idx].blocks);
+    module.functions[fn_idx].blocks = order.into_iter().map(|i| old[i].clone()).collect();
+}
+
 fn get_function_type(
     builder: &mut dr::Builder,
     map: &mut TypeWordMap,
@@ -2489,8 +3297,10 @@ fn emit_function_body_ops(
     map: &mut TypeWordMap,
     opencl: spirv::Word,
     func: &[ExpandedStatement],
+    callee_param_types: &HashMap<spirv::Word, Vec<SpirvType>>,
+    laneid: Option<spirv::Word>,
 ) -> Result<(), TranslateError> {
-    for s in func {
+    for (sidx, s) in func.iter().enumerate() {
         match s {
             Statement::Label(id) => {
                 if builder.selected_block().is_some() {
@@ -2550,10 +3360,10 @@ fn emit_function_body_ops(
                         builder.constant_u64(typ_id, Some(cnst.dst), value);
                     }
                     (ast::ScalarType::S8, ast::ImmediateValue::U64(value)) => {
-                        builder.constant_u32(typ_id, Some(cnst.dst), value as i8 as u32);
+                        builder.constant_u32(typ_id, Some(cnst.dst), value as i8 as i32 as u32);
                     }
                     (ast::ScalarType::S16, ast::ImmediateValue::U64(value)) => {
-                        builder.constant_u32(typ_id, Some(cnst.dst), value as i16 as u32);
+                        builder.constant_u32(typ_id, Some(cnst.dst), value as i16 as i32 as u32);
                     }
                     (ast::ScalarType::S32, ast::ImmediateValue::U64(value)) => {
                         builder.constant_u32(typ_id, Some(cnst.dst), value as i32 as u32);
@@ -2569,9 +3379,23 @@ fn emit_function_body_ops(
                     | (ast::ScalarType::U16, ast::ImmediateValue::S64(value)) => {
                         builder.constant_u32(typ_id, Some(cnst.dst), value as u16 as u32);
                     }
+                    // Signed narrow types keep the value truncated to their
+                    // width: the constant lives in a 16-bit type, and the
+                    // signed comparison op (OpSGreaterThan) reinterprets the
+                    // 16-bit pattern as signed.
+                    (ast::ScalarType::S8, ast::ImmediateValue::S64(value)) => {
+                        builder.constant_u32(typ_id, Some(cnst.dst), value as u8 as u32);
+                    }
+                    (ast::ScalarType::S16, ast::ImmediateValue::S64(value)) => {
+                        builder.constant_u32(typ_id, Some(cnst.dst), value as u16 as u32);
+                    }
                     (ast::ScalarType::B32, ast::ImmediateValue::S64(value))
                     | (ast::ScalarType::U32, ast::ImmediateValue::S64(value)) => {
                         builder.constant_u32(typ_id, Some(cnst.dst), value as u32);
+                    }
+                    (ast::ScalarType::B32, ast::ImmediateValue::F32(value))
+                    | (ast::ScalarType::U32, ast::ImmediateValue::F32(value)) => {
+                        builder.constant_u32(typ_id, Some(cnst.dst), value.to_bits());
                     }
                     (ast::ScalarType::B64, ast::ImmediateValue::S64(value))
                     | (ast::ScalarType::U64, ast::ImmediateValue::S64(value)) => {
@@ -2626,7 +3450,9 @@ fn emit_function_body_ops(
                     _ => return Err(TranslateError::MismatchedType),
                 }
             }
-            Statement::Conversion(cv) => emit_implicit_conversion(builder, map, cv)?,
+            Statement::Conversion(cv) => {
+                emit_implicit_conversion(builder, map, cv)?
+            }
             Statement::Conditional(bra) => {
                 builder.branch_conditional(
                     bra.predicate,
@@ -2638,21 +3464,112 @@ fn emit_function_body_ops(
             Statement::Instruction(inst) => match inst {
                 ast::Instruction::Abs(d, arg) => emit_abs(builder, map, opencl, d, arg)?,
                 ast::Instruction::Call(_) => unreachable!(),
+                // A memory barrier: OpMemoryBarrier with the scope of the
+                // barrier and acquire-release semantics.
+                ast::Instruction::Membar(scope) => {
+                    let scope_id = map.get_or_add_constant(
+                        builder,
+                        &ast::Type::Scalar(ast::ScalarType::U32),
+                        &vec_repr(scope.to_spirv() as u32),
+                    )?;
+                    let semantics_id = map.get_or_add_constant(
+                        builder,
+                        &ast::Type::Scalar(ast::ScalarType::U32),
+                        &vec_repr(
+                            spirv::MemorySemantics::ACQUIRE_RELEASE
+                                | spirv::MemorySemantics::WORKGROUP_MEMORY
+                                | spirv::MemorySemantics::CROSS_WORKGROUP_MEMORY,
+                        ),
+                    )?;
+                    builder.memory_barrier(scope_id, semantics_id)?;
+                }
                 // SPIR-V does not support marking jumps as guaranteed-converged
                 ast::Instruction::Bra(_, arg) => {
                     builder.branch(arg.src)?;
                 }
+                ast::Instruction::LdMatrix(details, arg) => {
+                    emit_ldmatrix(builder, map, laneid, details, arg)?
+                }
+                ast::Instruction::CvtPacked(typ, arg) => {
+                    emit_cvt_packed(builder, map, *typ, arg)?
+                }
+                ast::Instruction::Redux(op, typ, arg) => {
+                    emit_redux(builder, map, op, typ, arg)?
+                }
+                // brx.idx: an indirect branch. The index selects the label;
+                // anything out of range falls through to the instruction after
+                // the branch, which is what a guarded switch means.
+                ast::Instruction::BrxIdx(index, _table, targets) => {
+                    let index = *index;
+                    let u32_type = map.get_or_add_scalar(builder, ast::ScalarType::U32);
+                    let index = builder.bitcast(u32_type, None, index)?;
+                    let fallthrough = builder.id();
+                    builder.switch(
+                        index,
+                        fallthrough,
+                        targets
+                            .iter()
+                            .enumerate()
+                            .map(|(i, target)| (dr::Operand::LiteralInt32(i as u32), *target)),
+                    )?;
+                    builder.begin_block(Some(fallthrough))?;
+                }
+                ast::Instruction::VSub4(arg) => emit_vsub4(builder, map, arg)?,
+                ast::Instruction::VSet4(op, arg) => emit_vset4(builder, map, op, arg)?,
+                ast::Instruction::MovMatrix(arg) => {
+                    emit_movmatrix(builder, map, laneid, arg)?
+                }
+                ast::Instruction::CpAsync(details, arg) => {
+                    emit_cp_async(builder, map, details, arg)?
+                }
+                ast::Instruction::Prmt(typ, arg) => emit_prmt(builder, map, *typ, arg)?,
+                ast::Instruction::Dp4a(typ, arg) => emit_dp4a(builder, map, *typ, arg)?,
+                ast::Instruction::Copysign(typ, arg) => {
+                    emit_copysign(builder, map, *typ, arg)?
+                }
+                // A scheduling hint: the thread may yield, which changes
+                // nothing about the result.
+                ast::Instruction::Nanosleep(_) => {}
+                // An abort path that only follows an assert. SPIR-V has no
+                // trap, and ending the block here would invalidate the
+                // instructions the PTX emits after it.
+                ast::Instruction::Trap => {}
+                ast::Instruction::Shf(details, arg) => emit_shf(builder, map, details, arg)?,
+                ast::Instruction::Mma(details, arg) => {
+                    emit_mma(builder, map, laneid, details, arg)?
+                }
+                // The copies are synchronous, so there is nothing to wait for
+                // and no groups to keep track of.
+                ast::Instruction::CpAsyncCommitGroup
+                | ast::Instruction::CpAsyncWaitGroup(_)
+                | ast::Instruction::CpAsyncWaitAll => {}
                 ast::Instruction::Ld(data, arg) => {
-                    if data.qualifier != ast::LdStQualifier::Weak {
-                        todo!()
-                    }
                     let result_type =
                         map.get_or_add(builder, SpirvType::new(ast::Type::from(data.typ.clone())));
+                    // The memory qualifiers map onto SPIR-V's memory access
+                    // flags: .volatile is the Volatile flag, .nc (a read-only
+                    // cache) is the NonPrivatePointer flag. The ordering
+                    // qualifiers (.acquire, .relaxed) are ordering hints that
+                    // the memory barrier of the surrounding code provides.
+                    let mut flags = spirv::MemoryAccess::ALIGNED;
+                    match data.qualifier {
+                        ast::LdStQualifier::Volatile => flags |= spirv::MemoryAccess::VOLATILE,
+                        ast::LdStQualifier::Relaxed(_) | ast::LdStQualifier::Acquire(_) => {}
+                        ast::LdStQualifier::Weak => {
+                            // A non-coherent load ("ld.global.nc") is a hint
+                            // that the data does not change while the kernel
+                            // runs. SPIR-V would spell that with the
+                            // NonPrivatePointer flag, but that flag requires
+                            // the Vulkan memory model, which a compute
+                            // kernel must not declare; the load keeps the
+                            // plain semantics instead.
+                        }
+                    }
                     builder.load(
                         result_type,
                         Some(arg.dst),
                         arg.src,
-                        Some(spirv::MemoryAccess::ALIGNED),
+                        Some(flags),
                         [dr::Operand::LiteralInt32(
                             ast::Type::from(data.typ.clone()).size_of() as u32,
                         )]
@@ -2661,13 +3578,16 @@ fn emit_function_body_ops(
                     )?;
                 }
                 ast::Instruction::St(data, arg) => {
-                    if data.qualifier != ast::LdStQualifier::Weak {
-                        todo!()
+                    let mut flags = spirv::MemoryAccess::ALIGNED;
+                    match data.qualifier {
+                        ast::LdStQualifier::Volatile => flags |= spirv::MemoryAccess::VOLATILE,
+                        ast::LdStQualifier::Relaxed(_) | ast::LdStQualifier::Acquire(_) => {}
+                        ast::LdStQualifier::Weak => {}
                     }
                     builder.store(
                         arg.src1,
                         arg.src2,
-                        Some(spirv::MemoryAccess::ALIGNED),
+                        Some(flags),
                         [dr::Operand::LiteralInt32(
                             ast::Type::from(data.typ.clone()).size_of() as u32,
                         )]
@@ -2680,7 +3600,15 @@ fn emit_function_body_ops(
                 ast::Instruction::Mov(d, arg) => {
                     let result_type =
                         map.get_or_add(builder, SpirvType::new(ast::Type::from(d.typ.clone())));
-                    builder.copy_object(result_type, Some(arg.dst), arg.src)?;
+                    // copy_object requires matching types; OpBitcast cannot
+                    // target predicates. Only address-sourced movs (pointer
+                    // <-> integer) need the bitcast; everything else moves
+                    // between identically-typed values.
+                    if d.typ == ast::Type::Scalar(ast::ScalarType::Pred) || !d.src_is_address {
+                        builder.copy_object(result_type, Some(arg.dst), arg.src)?;
+                    } else {
+                        builder.bitcast(result_type, Some(arg.dst), arg.src)?;
+                    }
                 }
                 ast::Instruction::Mul(mul, arg) => match mul {
                     ast::MulDetails::Signed(ref ctr) => {
@@ -2689,22 +3617,29 @@ fn emit_function_body_ops(
                     ast::MulDetails::Unsigned(ref ctr) => {
                         emit_mul_uint(builder, map, opencl, ctr, arg)?
                     }
-                    ast::MulDetails::Float(ref ctr) => emit_mul_float(builder, map, ctr, arg)?,
+                    ast::MulDetails::Float(ref ctr) => emit_mul_float(builder, map, opencl, ctr, arg)?,
                 },
                 ast::Instruction::Add(add, arg) => match add {
                     ast::ArithDetails::Signed(ref desc) => {
-                        emit_add_int(builder, map, desc.typ.into(), desc.saturate, arg)?
+                        emit_add_int(builder, map, opencl, desc.typ.into(), desc.saturate, arg)?
                     }
                     ast::ArithDetails::Unsigned(ref desc) => {
-                        emit_add_int(builder, map, (*desc).into(), false, arg)?
+                        emit_add_int(builder, map, opencl, (*desc).into(), false, arg)?
                     }
-                    ast::ArithDetails::Float(desc) => emit_add_float(builder, map, desc, arg)?,
+                    ast::ArithDetails::Float(desc) => {
+                        emit_add_float(builder, map, opencl, desc, arg)?
+                    }
                 },
                 ast::Instruction::Setp(setp, arg) => {
-                    if arg.dst2.is_some() {
-                        todo!()
-                    }
                     emit_setp(builder, map, setp, arg)?;
+                    if let Some(dst2) = arg.dst2 {
+                        // "p|q" also reports the complement of the comparison.
+                        let pred_type = map.get_or_add(
+                            builder,
+                            SpirvType::Base(SpirvScalarKey::Pred),
+                        );
+                        builder.logical_not(pred_type, Some(dst2), arg.dst1)?;
+                    }
                 }
                 ast::Instruction::Not(t, a) => {
                     let result_type = map.get_or_add(builder, SpirvType::from(*t));
@@ -2730,6 +3665,33 @@ fn emit_function_body_ops(
                     let result_type = map.get_or_add_scalar(builder, full_type);
                     let offset_src = insert_shift_hack(builder, map, a.src2, size_of as usize)?;
                     if t.kind() == ast::ScalarKind::Signed {
+                        // PTX clamps an over-wide shift to the register width,
+                        // which for an arithmetic right shift replicates the
+                        // sign. Clamping the amount to width-1 gives exactly
+                        // that (the backend would otherwise produce zero).
+                        let limit = match size_of {
+                            8 => map.get_or_add_constant(
+                                builder,
+                                &ast::Type::Scalar(ast::ScalarType::U64),
+                                &vec_repr(size_of as u64 * 8 - 1),
+                            )?,
+                            2 => map.get_or_add_constant(
+                                builder,
+                                &ast::Type::Scalar(ast::ScalarType::U16),
+                                &vec_repr(size_of as u16 * 8 - 1),
+                            )?,
+                            _ => map.get_or_add_constant(
+                                builder,
+                                &ast::Type::Scalar(ast::ScalarType::U32),
+                                &vec_repr(size_of as u32 * 8 - 1),
+                            )?,
+                        };
+                        let bool_type =
+                            map.get_or_add_scalar(builder, ast::ScalarType::Pred);
+                        let below =
+                            builder.u_less_than(bool_type, None, offset_src, limit)?;
+                        let offset_src =
+                            builder.select(result_type, None, below, offset_src, limit)?;
                         builder.shift_right_arithmetic(
                             result_type,
                             Some(a.dst),
@@ -2755,7 +3717,48 @@ fn emit_function_body_ops(
                     let result_type = map.get_or_add_scalar(builder, ast::ScalarType::B64);
                     builder.copy_object(result_type, Some(arg.dst), arg.src)?;
                 }
-                ast::Instruction::SetpBool(_, _) => todo!(),
+                // setp.cmp.boolop.type p[|q], a, b, c combines the comparison
+                // with the predicate c: p = (a cmp b) op c, and the optional q
+                // is the same with c inverted.
+                ast::Instruction::SetpBool(details, arg) => {
+                    let pred_type =
+                        map.get_or_add(builder, SpirvType::Base(SpirvScalarKey::Pred));
+                    let cmp = builder.id();
+                    let plain = ast::SetpData {
+                        typ: details.typ,
+                        flush_to_zero: details.flush_to_zero,
+                        cmp_op: details.cmp_op,
+                    };
+                    let cmp_arg = ast::Arg4Setp {
+                        dst1: cmp,
+                        dst2: None,
+                        src1: arg.src1,
+                        src2: arg.src2,
+                    };
+                    emit_setp(builder, map, &plain, &cmp_arg)?;
+                    let combine = |builder: &mut dr::Builder,
+                                   right: spirv::Word|
+                     -> Result<spirv::Word, dr::Error> {
+                        match details.bool_op {
+                            ast::SetpBoolPostOp::And => {
+                                builder.logical_and(pred_type, None, cmp, right)
+                            }
+                            ast::SetpBoolPostOp::Or => {
+                                builder.logical_or(pred_type, None, cmp, right)
+                            }
+                            ast::SetpBoolPostOp::Xor => {
+                                builder.logical_not_equal(pred_type, None, cmp, right)
+                            }
+                        }
+                    };
+                    let combined = combine(builder, arg.src3)?;
+                    builder.copy_object(pred_type, Some(arg.dst1), combined)?;
+                    if let Some(dst2) = arg.dst2 {
+                        let inverted = builder.logical_not(pred_type, None, arg.src3)?;
+                        let combined = combine(builder, inverted)?;
+                        builder.copy_object(pred_type, Some(dst2), combined)?;
+                    }
+                }
                 ast::Instruction::Mad(mad, arg) => match mad {
                     ast::MulDetails::Signed(ref desc) => {
                         emit_mad_sint(builder, map, opencl, desc, arg)?
@@ -2777,13 +3780,13 @@ fn emit_function_body_ops(
                 }
                 ast::Instruction::Sub(d, arg) => match d {
                     ast::ArithDetails::Signed(desc) => {
-                        emit_sub_int(builder, map, desc.typ.into(), desc.saturate, arg)?;
+                        emit_sub_int(builder, map, opencl, desc.typ.into(), desc.saturate, arg)?;
                     }
                     ast::ArithDetails::Unsigned(desc) => {
-                        emit_sub_int(builder, map, (*desc).into(), false, arg)?;
+                        emit_sub_int(builder, map, opencl, (*desc).into(), false, arg)?;
                     }
                     ast::ArithDetails::Float(desc) => {
-                        emit_sub_float(builder, map, desc, arg)?;
+                        emit_sub_float(builder, map, opencl, desc, arg)?;
                     }
                 },
                 ast::Instruction::Min(d, a) => {
@@ -2809,13 +3812,22 @@ fn emit_function_body_ops(
                 }
                 // TODO: implement named barriers
                 ast::Instruction::Bar(d, _) => {
+                    let scope = match d {
+                        // bar.warp.sync only synchronizes the warp, so it must
+                        // not use the workgroup scope (that would be a full
+                        // barrier).
+                        ast::BarDetails::WarpSync => spirv::Scope::Subgroup as u32,
+                        ast::BarDetails::SyncAligned | ast::BarDetails::RedPopc => {
+                            spirv::Scope::Workgroup as u32
+                        }
+                    };
                     let workgroup_scope = map.get_or_add_constant(
                         builder,
                         &ast::Type::Scalar(ast::ScalarType::U32),
-                        &vec_repr(spirv::Scope::Workgroup as u32),
+                        &vec_repr(scope),
                     )?;
                     let barrier_semantics = match d {
-                        ast::BarDetails::SyncAligned => map.get_or_add_constant(
+                        ast::BarDetails::SyncAligned | ast::BarDetails::RedPopc | ast::BarDetails::WarpSync => map.get_or_add_constant(
                             builder,
                             &ast::Type::Scalar(ast::ScalarType::U32),
                             &vec_repr(
@@ -2826,6 +3838,164 @@ fn emit_function_body_ops(
                         )?,
                     };
                     builder.control_barrier(workgroup_scope, workgroup_scope, barrier_semantics)?;
+                }
+                // bar.red.or.pred / bar.red.and.pred: a barrier plus the
+                // disjunction (or conjunction) of a predicate across the
+                // workgroup.
+                //
+                // SPIR-V has no workgroup wide group operation, so the votes are
+                // collected in one word of workgroup memory:
+                //
+                //    clear the word                   (it starts undefined)
+                //    barrier
+                //    if (voting) atomic_add(word, 1)  one vote per lane
+                //    barrier
+                //    result = word != 0               (word == 0 for .and)
+                //    barrier
+                //    if (voting) atomic_and(word, 0)  take the own vote back out
+                //    barrier
+                //
+                // A lane votes when its predicate holds (.or) or when it does
+                // not (.and); the vote itself sits in a branch, so the atomic's
+                // operand is the same for every lane. Clearing the word at the
+                // end means a loop can run the instruction any number of times.
+                //
+                // Verified on hardware for the predicate holding for none, for
+                // some and for all of the lanes, at 4, 8, 16 and 32 threads
+                // (tmp/mma_test/barpred*.ptx).
+                ast::Instruction::BarRedPred(and, dst, _bar_id, pred) => {
+                    let and = *and;
+                    let dst = *dst;
+                    let pred = *pred;
+                    let u32_type = map.get_or_add_scalar(builder, ast::ScalarType::U32);
+                    let pred_type = map.get_or_add_scalar(builder, ast::ScalarType::Pred);
+                    let zero = map.get_or_add_constant(
+                        builder,
+                        &ast::Type::Scalar(ast::ScalarType::U32),
+                        &vec_repr(0u32),
+                    )?;
+                    // The lanes whose vote is counted: those for which the
+                    // predicate holds, or for the conjunction those for which
+                    // it does not.
+                    let voting = if and {
+                        builder.logical_not(pred_type, None, pred)?
+                    } else {
+                        pred
+                    };
+                    emit_bar_red(builder, map, voting, |builder, collected| {
+                        if and {
+                            // Nobody voted against, so every predicate held.
+                            builder.i_equal(pred_type, Some(dst), collected, zero)?;
+                        } else {
+                            builder.i_not_equal(pred_type, Some(dst), collected, zero)?;
+                        }
+                        Ok(())
+                    })?;
+                    let _ = u32_type;
+                }
+                // bar.red.popc counts the lanes for which the predicate holds.
+                ast::Instruction::BarRedPopc(dst, _bar_id, pred) => {
+                    let dst = *dst;
+                    let pred = *pred;
+                    let u32_type = map.get_or_add_scalar(builder, ast::ScalarType::U32);
+                    emit_bar_red(builder, map, pred, |builder, collected| {
+                        builder.copy_object(u32_type, Some(dst), collected)?;
+                        Ok(())
+                    })?;
+                }
+                // shfl.sync.<mode>.<type> d[|p], a, b, c, membermask
+                //
+                // PTX's shuffle is a warp-level exchange. The Intel subgroup
+                // extensions map onto it directly:
+                //   .idx  -> OpSubgroupShuffleINTEL     (lane from operand)
+                //   .up   -> OpSubgroupShuffleUpINTEL   (lane - delta)
+                //   .down -> OpSubgroupShuffleDownINTEL (lane + delta)
+                //   .bfly -> OpSubgroupShuffleXorINTEL  (lane ^ delta)
+                // The Intel ops use the whole subgroup, which matches the
+                // common case of a full-warp member mask.
+                //
+                // The optional destination predicate ("the computed source
+                // lane was in range") is not modelled by the Intel ops; we
+                // emit a constant true, which matches the common case where
+                // the source lane is in range.
+                ast::Instruction::Shfl(mode, typ, arg) => {
+                    emit_shfl(builder, map, laneid, *mode, *typ, arg)?
+                }
+                // vote.sync.mode.pred   d, a, membermask
+                // vote.sync.ballot.b32 d, a, membermask
+                //
+                // The source operand `a` is a predicate register. The mode
+                // forms reduce the predicate across the subgroup, the ballot
+                // form collects the votes into a bitmask.
+                ast::Instruction::Vote(mode, typ, arg) => {
+                    let result_type = map.get_or_add_scalar(builder, (*typ).into());
+                    let subgroup_scope = map.get_or_add_constant(
+                        builder,
+                        &ast::Type::Scalar(ast::ScalarType::U32),
+                        &vec_repr(spirv::Scope::Subgroup as u32),
+                    )?;
+                    // The source operand is a predicate register, which is
+                    // exactly what the group operations expect.
+                    let pred = arg.src;
+                    match mode {
+                        ast::VoteMode::All => {
+                            builder.group_non_uniform_all(
+                                result_type,
+                                Some(arg.dst),
+                                subgroup_scope,
+                                pred,
+                            )?;
+                        }
+                        ast::VoteMode::Any => {
+                            builder.group_non_uniform_any(
+                                result_type,
+                                Some(arg.dst),
+                                subgroup_scope,
+                                pred,
+                            )?;
+                        }
+                        ast::VoteMode::Uni => {
+                            // True when the predicate has the same value in
+                            // every active lane, so it holds when they agree
+                            // either all-true or all-false.
+                            let all = builder.group_non_uniform_all(
+                                result_type,
+                                None,
+                                subgroup_scope,
+                                pred,
+                            )?;
+                            let inverted = builder.logical_not(result_type, None, pred)?;
+                            let none = builder.group_non_uniform_all(
+                                result_type,
+                                None,
+                                subgroup_scope,
+                                inverted,
+                            )?;
+                            builder.logical_or(result_type, Some(arg.dst), all, none)?;
+                        }
+                        ast::VoteMode::Ballot => {
+                            // The ballot result is a vector of four 32-bit
+                            // words covering up to 128 lanes; a warp has 32
+                            // lanes, so the mask is the first word.
+                            let ballot_type = map.get_or_add(
+                                builder,
+                                SpirvType::Vector(SpirvScalarKey::B32, 4),
+                            );
+                            let ballot = builder.group_non_uniform_ballot(
+                                ballot_type,
+                                None,
+                                subgroup_scope,
+                                pred,
+                            )?;
+                            let u32_type = map.get_or_add_scalar(builder, ast::ScalarType::U32);
+                            builder.composite_extract(
+                                u32_type,
+                                Some(arg.dst),
+                                ballot,
+                                [0].iter().copied(),
+                            )?;
+                        }
+                    }
                 }
                 ast::Instruction::Atom(details, arg) => {
                     emit_atom(builder, map, details, arg)?;
@@ -2882,8 +4052,14 @@ fn emit_function_body_ops(
                     )?;
                 }
                 ast::Instruction::Neg(details, arg) => {
-                    let result_type = map.get_or_add_scalar(builder, details.typ);
-                    let negate_func = if details.typ.kind() == ast::ScalarKind::Float {
+                    // A packed pair of halves is a vector of two halves, so the
+                    // result type has to come from the type rather than from the
+                    // scalar key, and it negates both lanes at once.
+                    let result_type = map.get_or_add(builder, SpirvType::from(details.typ));
+                    let negate_func = if matches!(
+                        details.typ.kind(),
+                        ast::ScalarKind::Float | ast::ScalarKind::Float2
+                    ) {
                         dr::Builder::f_negate
                     } else {
                         dr::Builder::s_negate
@@ -2940,6 +4116,68 @@ fn emit_function_body_ops(
                         [dr::Operand::IdRef(arg.src)].iter().cloned(),
                     )?;
                 }
+                // bfind: index of the most significant set bit. A negative
+                // signed input is searched as its complement, so the answer is
+                // the position of its most significant zero bit, and an input
+                // with no such bit reports all ones.
+                ast::Instruction::Bfind { typ, arg } => {
+                    let result_type = map.get_or_add_scalar(builder, (*typ).into());
+                    let pred_type = map.get_or_add_scalar(builder, ast::ScalarType::Pred);
+                    let bits: u64 = if typ.size_of() >= 8 { 64 } else { 32 };
+                    let zero = map.get_or_add_constant(
+                        builder,
+                        &ast::Type::Scalar(*typ),
+                        &vec_repr(0u32),
+                    )?;
+                    let source = if typ.kind() == ast::ScalarKind::Signed {
+                        let negative = builder.s_less_than(pred_type, None, arg.src, zero)?;
+                        let inverted = builder.not(result_type, None, arg.src)?;
+                        builder.select(result_type, None, negative, inverted, arg.src)?
+                    } else {
+                        arg.src
+                    };
+                    let clz = builder.ext_inst(
+                        result_type,
+                        None,
+                        opencl,
+                        spirv::CLOp::clz as u32,
+                        [dr::Operand::IdRef(source)].iter().cloned(),
+                    )?;
+                    // The highest set bit is width - 1 and "no bit set" is
+                    // width, so both constants belong to the operand's width.
+                    let last = map.get_or_add_constant(
+                        builder,
+                        &ast::Type::Scalar(ast::ScalarType::U64),
+                        &vec_repr(bits - 1),
+                    )?;
+                    let width = map.get_or_add_constant(
+                        builder,
+                        &ast::Type::Scalar(ast::ScalarType::U64),
+                        &vec_repr(bits),
+                    )?;
+                    let u64_type = map.get_or_add_scalar(builder, ast::ScalarType::U64);
+                    let clz = builder.u_convert(u64_type, None, clz)?;
+                    let wide_result = if bits == 64 { u64_type } else { result_type };
+                    let diff = builder.i_sub(wide_result, None, last, clz)?;
+                    let diff = builder.u_convert(result_type, None, diff)?;
+                    let none_set = builder.i_equal(pred_type, None, clz, width)?;
+                    let all_ones = map.get_or_add_constant(
+                        builder,
+                        &ast::Type::Scalar(*typ),
+                        &if bits == 64 {
+                            vec_repr(u64::MAX).to_vec()
+                        } else {
+                            vec_repr(u32::MAX).to_vec()
+                        },
+                    )?;
+                    builder.select(
+                        result_type,
+                        Some(arg.dst),
+                        none_set,
+                        all_ones,
+                        diff,
+                    )?;
+                }
                 ast::Instruction::Brev { typ, arg } => {
                     let result_type = map.get_or_add_scalar(builder, (*typ).into());
                     builder.bit_reverse(result_type, Some(arg.dst), arg.src)?;
@@ -2956,17 +4194,104 @@ fn emit_function_body_ops(
                     let result_type = map.get_or_add_scalar(builder, (*typ).into());
                     builder_fn(builder, result_type, Some(arg.dst), arg.src1, arg.src2)?;
                 }
-                ast::Instruction::Bfe { .. } => {
-                    // Should have beeen replaced with a funciton call earlier
-                    return Err(error_unreachable());
+                // bfe: extract a bit field, sign or zero extended to the
+                // register width.
+                //
+                // SPIR-V has OpBitFieldUExtract and OpBitFieldSExtract, but the
+                // backend only implements the 32-bit forms (the 64-bit ones
+                // come out as a call to a builtin it does not define), so the
+                // 64-bit case is done with shifts:
+                //
+                //   shifted = base >> pos                    (0 if pos >= width)
+                //   masked  = shifted & mask(len)             (len clamped)
+                //   signed  = (masked << (width - len)) >> (width - len)
+                //
+                // Every shift amount is masked to the register width first, so
+                // none of them is ever out of range (which would be undefined).
+                ast::Instruction::Bfe { typ, arg } => {
+                    let result_type = map.get_or_add_scalar(builder, ast::ScalarType::from(*typ));
+                    let signed = typ.kind() == ast::ScalarKind::Signed;
+                    if typ.size_of() <= 4 {
+                        if signed {
+                            builder.bit_field_s_extract(
+                                result_type,
+                                Some(arg.dst),
+                                arg.src1,
+                                arg.src2,
+                                arg.src3,
+                            )?;
+                        } else {
+                            builder.bit_field_u_extract(
+                                result_type,
+                                Some(arg.dst),
+                                arg.src1,
+                                arg.src2,
+                                arg.src3,
+                            )?;
+                        }
+                    } else {
+                        let width: u32 = 64;
+                        let u64_type = map.get_or_add_scalar(builder, ast::ScalarType::U64);
+                        let s64_type = map.get_or_add_scalar(builder, ast::ScalarType::S64);
+                        let c = |builder: &mut dr::Builder, map: &mut TypeWordMap, v: u64| {
+                            map.get_or_add_constant(
+                                builder,
+                                &ast::Type::Scalar(ast::ScalarType::U64),
+                                &vec_repr(v),
+                            )
+                        };
+                        let c63 = c(builder, map, 63)?;
+                        let c64 = c(builder, map, 64)?;
+                        let c1 = c(builder, map, 1)?;
+                        let all_ones = c(builder, map, u64::MAX)?;
+                        let zero = c(builder, map, 0)?;
+                        let bool_type = map.get_or_add_scalar(builder, ast::ScalarType::Pred);
+                        // The width of the field, clamped to 64.
+                        let len = arg.src3;
+                        let len_wide = builder.u_convert(u64_type, None, len)?;
+                        let over = builder.u_greater_than_equal(bool_type, None, len_wide, c64)?;
+                        let len_wide = builder.select(u64_type, None, over, c64, len_wide)?;
+                        // mask = (1 << (len & 63)) - 1, and all ones when len
+                        // is the whole register.
+                        let len_low = builder.bitwise_and(u64_type, None, len_wide, c63)?;
+                        let one_shifted = builder.shift_left_logical(u64_type, None, c1, len_low)?;
+                        let mask = builder.i_sub(u64_type, None, one_shifted, c1)?;
+                        let mask = builder.select(u64_type, None, over, all_ones, mask)?;
+                        // shifted = base >> pos, zero when pos is out of range.
+                        let pos = arg.src2;
+                        let pos_wide = builder.u_convert(u64_type, None, pos)?;
+                        let pos_low = builder.bitwise_and(u64_type, None, pos_wide, c63)?;
+                        let base = builder.u_convert(u64_type, None, arg.src1)?;
+                        let shifted = builder.shift_right_logical(u64_type, None, base, pos_low)?;
+                        let pos_over =
+                            builder.u_greater_than_equal(bool_type, None, pos_wide, c64)?;
+                        let shifted = builder.select(u64_type, None, pos_over, zero, shifted)?;
+                        let masked = builder.bitwise_and(u64_type, None, shifted, mask)?;
+                        if signed {
+                            // Push the sign bit of the field to the top and
+                            // shift it back down arithmetically.
+                            let back = builder.i_sub(u64_type, None, c64, len_wide)?;
+                            let top = builder.shift_left_logical(u64_type, None, masked, back)?;
+                            let top = builder.bitcast(s64_type, None, top)?;
+                            let extended = builder.shift_right_arithmetic(s64_type, None, top, back)?;
+                            let extended = builder.bitcast(u64_type, None, extended)?;
+                            builder.copy_object(result_type, Some(arg.dst), extended)?;
+                        } else {
+                            builder.copy_object(result_type, Some(arg.dst), masked)?;
+                        }
+                    }
                 }
                 ast::Instruction::Bfi { .. } => {
                     // Should have beeen replaced with a funciton call earlier
                     return Err(error_unreachable());
                 }
                 ast::Instruction::Rem { typ, arg } => {
+                    // PTX "rem" is C's remainder: the quotient truncates towards
+                    // zero, so the result takes the sign of the dividend. OpSMod
+                    // floors instead, which differs for mixed signs (and stops
+                    // matching the OpSDiv that "div" lowers to).
                     let builder_fn = if typ.kind() == ast::ScalarKind::Signed {
-                        dr::Builder::s_mod
+                        dr::Builder::s_rem
                     } else {
                         dr::Builder::u_mod
                     };
@@ -3032,9 +4357,136 @@ fn emit_function_body_ops(
                 builder.bitcast(result_type, Some(*dst), temp)?;
             }
             Statement::RepackVector(repack) => {
-                if repack.is_extract {
+                if let Some(packed_scalar) = repack.packed_scalar {
+                    // The pack names the pieces of a wider scalar value:
+                    // "mov.b64 {%r0,%r1}, %rd2;" splits a 64-bit value into
+                    // two 32-bit halves, "mov.b32 {low,high}, %r1" splits a
+                    // 32-bit value into two 16-bit halves. The lowest piece
+                    // is the first element of the pack.
+                    let elem_bits = repack.typ.size_of() as u32 * 8;
+                    let elem_type = map.get_or_add_scalar(builder, repack.typ);
+                    // The pieces are extracted as integers of the element's
+                    // width: a pack of two 16-bit halves is split out of a
+                    // 32-bit value, a pack of two 32-bit halves out of a
+                    // 64-bit one.
+                    let int_elem_type = map.get_or_add_scalar(
+                        builder,
+                        match repack.typ.size_of() {
+                            2 => ast::ScalarType::U16,
+                            _ => ast::ScalarType::U32,
+                        },
+                    );
+                    // The pieces are put together in the width of the packed
+                    // value: a pack of two 16-bit halves is assembled into a
+                    // 32-bit value, a pack of two 32-bit halves into a
+                    // 64-bit one.
+                    let int_packed_scalar = match packed_scalar.size_of() {
+                        2 => ast::ScalarType::U16,
+                        4 => ast::ScalarType::U32,
+                        _ => ast::ScalarType::U64,
+                    };
+                    let int_packed_type = map.get_or_add_scalar(builder, int_packed_scalar);
+                    let mask = map.get_or_add_constant(
+                        builder,
+                        &ast::Type::Scalar(int_packed_scalar),
+                        &vec_repr((1u64 << elem_bits) - 1),
+                    )?;
+                    if repack.is_extract {
+                        // The pack is the destination: split the value.
+                        // A packed value that is already 64 bits wide must not
+                        // be converted: SPIR-V has no conversion between a
+                        // value and its own type.
+                        // The packed value already has the width the pieces
+                        // are cut out of: converting it would be a no-op,
+                        // and SPIR-V has no conversion between a value and
+                        // its own type.
+                        // Each piece is taken out of the packed value by its
+                        // own shift, rather than by shifting a running value
+                        // down: a pack whose pieces are written back through
+                        // memory is emitted per destination, and a running
+                        // value left the second piece reading the same low
+                        // word as the first (which made the sum of squares of
+                        // ggml's norm kernel come out equal to the sum).
+                        let original =
+                            builder.copy_object(int_packed_type, None, repack.packed)?;
+                        for (index, dst_id) in repack.unpacked.iter().enumerate() {
+                            if *dst_id == 0 {
+                                // A hole in the pack: the element is not written.
+                                continue;
+                            }
+                            let shift_bits = elem_bits as usize * index;
+                            let source = if shift_bits == 0 || elem_bits >= 64 {
+                                original
+                            } else {
+                                let shift = map.get_or_add_constant(
+                                    builder,
+                                    &ast::Type::Scalar(int_packed_scalar),
+                                    &vec_repr(shift_bits as u64),
+                                )?;
+                                builder.shift_right_logical(
+                                    int_packed_type,
+                                    None,
+                                    original,
+                                    shift,
+                                )?
+                            };
+                            let piece = builder.bitwise_and(int_packed_type, None, source, mask)?;
+                            let piece = builder.u_convert(int_elem_type, None, piece)?;
+                            if elem_type == int_elem_type {
+                                builder.copy_object(elem_type, Some(*dst_id), piece)?;
+                            } else {
+                                // A half precision piece is an integer in the
+                                // register; only its bit pattern matters.
+                                builder.bitcast(elem_type, Some(*dst_id), piece)?;
+                            }
+                        }
+                    } else {
+                        // The pack is the source: join the pieces. Each piece
+                        // goes to the position its index names, so the first
+                        // one stays at the bottom of the packed value.
+                        let mut joined: Option<spirv::Word> = None;
+                        for (index, src_id) in repack.unpacked.iter().enumerate() {
+                            let piece = if *src_id == 0 {
+                                // A hole in the pack: the piece is undefined.
+                                0
+                            } else {
+                                builder.u_convert(int_packed_type, None, *src_id)?
+                            };
+                            let piece = builder.bitwise_and(int_packed_type, None, piece, mask)?;
+                            let shift_bits = elem_bits as usize * index;
+                            let shifted = if shift_bits == 0 || elem_bits >= 64 {
+                                piece
+                            } else {
+                                let shift = map.get_or_add_constant(
+                                    builder,
+                                    &ast::Type::Scalar(int_packed_scalar),
+                                    &vec_repr(shift_bits as u64),
+                                )?;
+                                builder.shift_left_logical(int_packed_type, None, piece, shift)?
+                            };
+                            joined = Some(match joined {
+                                None => shifted,
+                                Some(prev) => {
+                                    builder.bitwise_or(int_packed_type, None, prev, shifted)?
+                                }
+                            });
+                        }
+                        let joined = joined.unwrap_or(0);
+                        let result_type = map.get_or_add_scalar(builder, packed_scalar);
+                        let joined = if result_type == int_packed_type {
+                            builder.copy_object(result_type, None, joined)?
+                        } else {
+                            builder.bitcast(result_type, None, joined)?
+                        };
+                        builder.copy_object(result_type, Some(repack.packed), joined)?;
+                    }
+                } else if repack.is_extract {
                     let scalar_type = map.get_or_add_scalar(builder, repack.typ);
                     for (index, dst_id) in repack.unpacked.iter().enumerate() {
+                        if *dst_id == 0 {
+                            // A hole in the pack: the element is not written.
+                            continue;
+                        }
                         builder.composite_extract(
                             scalar_type,
                             Some(*dst_id),
@@ -3052,10 +4504,21 @@ fn emit_function_body_ops(
                     );
                     let mut temp_vec = builder.undef(vector_type, None);
                     for (index, src_id) in repack.unpacked.iter().enumerate() {
+                        let src_id = if *src_id == 0 {
+                            // A hole in the source pack: the element is
+                            // undefined, use zero.
+                            map.get_or_add_constant(
+                                builder,
+                                &ast::Type::Scalar(ast::ScalarType::U32),
+                                &vec_repr(0u32),
+                            )?
+                        } else {
+                            *src_id
+                        };
                         temp_vec = builder.composite_insert(
                             vector_type,
                             None,
-                            *src_id,
+                            src_id,
                             temp_vec,
                             [index as u32].iter().copied(),
                         )?;
@@ -3099,6 +4562,1416 @@ fn emit_logical_xor_spirv(
     builder.logical_and(result_type, result_id, temp_or, temp_neg)
 }
 
+// copysign.f32 d, a, b;
+//
+// The magnitude of a with the sign of b: a bit operation on the two values.
+fn emit_copysign(
+    builder: &mut dr::Builder,
+    map: &mut TypeWordMap,
+    typ: ast::ScalarType,
+    arg: &ast::Arg3<ExpandedArgParams>,
+) -> Result<(), TranslateError> {
+    let result_type = map.get_or_add_scalar(builder, typ);
+    let bits_type = map.get_or_add_scalar(builder, ast::ScalarType::U32);
+    let magnitude_mask = map.get_or_add_constant(
+        builder,
+        &ast::Type::Scalar(ast::ScalarType::U32),
+        &vec_repr(0x7fff_ffffu32),
+    )?;
+    let sign_mask = map.get_or_add_constant(
+        builder,
+        &ast::Type::Scalar(ast::ScalarType::U32),
+        &vec_repr(0x8000_0000u32),
+    )?;
+    // "Copy sign bit of a into value of b": the magnitude comes from the
+    // second operand and the sign from the first, which is the opposite of
+    // what the name suggests and of SPIR-V's OpCopySign.
+    let sign_source = builder.bitcast(bits_type, None, arg.src1)?;
+    let value_source = builder.bitcast(bits_type, None, arg.src2)?;
+    let magnitude = builder.bitwise_and(bits_type, None, value_source, magnitude_mask)?;
+    let sign = builder.bitwise_and(bits_type, None, sign_source, sign_mask)?;
+    let result = builder.bitwise_or(bits_type, None, magnitude, sign)?;
+    builder.bitcast(result_type, Some(arg.dst), result)?;
+    Ok(())
+}
+
+// dp4a.s32.s32 d, a, b, c;   dp4a.u32.u32 d, a, b, c;
+//
+// Four byte products, accumulated into c: the four bytes of a are multiplied
+// with the four bytes of b and the products are summed with c. The signed
+// form sign-extends the bytes, the unsigned one zero-extends them.
+fn emit_dp4a(
+    builder: &mut dr::Builder,
+    map: &mut TypeWordMap,
+    typ: ast::ScalarType,
+    arg: &ast::Arg4<ExpandedArgParams>,
+) -> Result<(), TranslateError> {
+    let result_type = map.get_or_add_scalar(builder, typ);
+    let i32_type = map.get_or_add_scalar(builder, ast::ScalarType::S32);
+    let u32_type = map.get_or_add_scalar(builder, ast::ScalarType::U32);
+    let signed = typ.kind() == ast::ScalarKind::Signed;
+    let mut accumulator = arg.src3;
+    for index in 0..4u32 {
+        let shift = map.get_or_add_constant(
+            builder,
+            &ast::Type::Scalar(ast::ScalarType::U32),
+            &vec_repr(index * 8),
+        )?;
+        let mask = map.get_or_add_constant(
+            builder,
+            &ast::Type::Scalar(ast::ScalarType::U32),
+            &vec_repr(0xffu32),
+        )?;
+        let mut extract = |builder: &mut dr::Builder, source: spirv::Word| {
+            let value = builder.shift_right_logical(u32_type, None, source, shift)?;
+            let value = builder.bitwise_and(u32_type, None, value, mask)?;
+            if signed {
+                // Sign-extend the byte: shift it up and back down.
+                let twenty_four = map.get_or_add_constant(
+                    builder,
+                    &ast::Type::Scalar(ast::ScalarType::U32),
+                    &vec_repr(24u32),
+                )?;
+                let value = builder.shift_left_logical(u32_type, None, value, twenty_four)?;
+                Ok::<_, TranslateError>(builder.shift_right_arithmetic(
+                    i32_type,
+                    None,
+                    value,
+                    twenty_four,
+                )?)
+            } else {
+                Ok(builder.u_convert(i32_type, None, value)?)
+            }
+        };
+        let left = extract(builder, arg.src1)?;
+        let right = extract(builder, arg.src2)?;
+        let product = builder.i_mul(i32_type, None, left, right)?;
+        accumulator = builder.i_add(i32_type, None, accumulator, product)?;
+    }
+    builder.copy_object(result_type, Some(arg.dst), accumulator)?;
+    Ok(())
+}
+
+/// Two 16-bit floats packed into one register, the low half first.
+fn pack_halves(
+    builder: &mut dr::Builder,
+    map: &mut TypeWordMap,
+    low: spirv::Word,
+    high: spirv::Word,
+    u32_type: spirv::Word,
+    b32_type: spirv::Word,
+    f16_type: spirv::Word,
+) -> Result<spirv::Word, TranslateError> {
+    let u16_type = map.get_or_add_scalar(builder, ast::ScalarType::U16);
+    let low_bits = builder.bitcast(u16_type, None, low)?;
+    let high_bits = builder.bitcast(u16_type, None, high)?;
+    let low_bits = builder.u_convert(u32_type, None, low_bits)?;
+    let high_bits = builder.u_convert(u32_type, None, high_bits)?;
+    let sixteen = map.get_or_add_constant(
+        builder,
+        &ast::Type::Scalar(ast::ScalarType::U32),
+        &vec_repr(16u32),
+    )?;
+    let high_bits = builder.shift_left_logical(u32_type, None, high_bits, sixteen)?;
+    let joined = builder.bitwise_or(u32_type, None, low_bits, high_bits)?;
+    Ok(builder.bitcast(b32_type, None, joined)?)
+}
+
+/// One half of a packed pair of 16-bit floats: half 0 is the low 16 bits of
+/// the register, half 1 the high ones.
+fn half_of_pack(
+    builder: &mut dr::Builder,
+    map: &mut TypeWordMap,
+    packed: spirv::Word,
+    index: u32,
+    u32_type: spirv::Word,
+    f32_type: spirv::Word,
+    f16_type: spirv::Word,
+) -> Result<spirv::Word, TranslateError> {
+    let _ = u32_type;
+    let f16x2_type = map.get_or_add(builder, SpirvType::Vector(SpirvScalarKey::F16, 2));
+    let vector = builder.bitcast(f16x2_type, None, packed)?;
+    let half = builder.composite_extract(f16_type, None, vector, [index].iter().copied())?;
+    Ok(builder.f_convert(f32_type, None, half)?)
+}
+
+// mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+//     {d0,d1,d2,d3}, {a0,a1,a2,a3}, {b0,b1}, {c0,c1,c2,c3};
+//
+// The tensor-core matrix multiply, D = A * B + C, with the fragments spread
+// over the 32 lanes of the warp. With g = lane/4 and j = lane%4, and for the
+// half precision form:
+//
+//   A (m x k, row major), 4 x b32 = 8 halves
+//     a0 = A[g][2j], A[g][2j+1]        a1 = A[g+8][2j], A[g+8][2j+1]
+//     a2 = A[g][2j+8], A[g][2j+9]      a3 = A[g+8][2j+8], A[g+8][2j+9]
+//   B (k x n, column major), 2 x b32 = 4 halves
+//     b0 = B[2j][g], B[2j+1][g]        b1 = B[2j+8][g], B[2j+9][g]
+//   C, D (m x n), 4 x f32
+//     c0 = C[g][2j]   c1 = C[g][2j+1]  c2 = C[g+8][2j]  c3 = C[g+8][2j+1]
+//
+// Every thread therefore knows four elements of D and needs the whole row of A
+// and the whole column of B for them, which live in other lanes: they are
+// fetched with a subgroup shuffle.
+//
+// The same shape holds for the other element widths, with the number of
+// elements a register carries being 32 bits / element bits: the k range splits
+// into two halves (eight columns for the half precision form, four for the
+// 32-bit tf32 form), the first element of a pair sits in the lane g*4 + j and
+// the rest follow.
+// shfl.sync.mode.b32  d[|p], a, b, c, membermask;
+//
+// The thread reads `a` from a source lane, and p says whether that lane was
+// in range. The source lane comes from the lane id, the operand b and the two
+// fields of c (c[4:0] is the clamp, c[12:8] the segment mask):
+//
+//   maxLane = (lane & segmask) | (clamp & ~segmask)
+//   minLane =  lane & segmask
+//   .up    j = lane - b                p = j >= maxLane (below lane 0 is out)
+//   .down  j = lane + b                p = j <= maxLane
+//   .bfly  j = lane ^ b                p = j <= maxLane
+//   .idx   j = minLane | (b & ~segmask) p = j <= maxLane
+//
+// A thread whose source lane is out of range reads its own register, so the
+// lane that is asked for is always one that exists and the backend's shuffle
+// by lane index is exactly that.
+fn emit_shfl(
+    builder: &mut dr::Builder,
+    map: &mut TypeWordMap,
+    laneid: Option<spirv::Word>,
+    mode: ast::ShflMode,
+    typ: ast::ScalarType,
+    arg: &ast::ArgShfl<ExpandedArgParams>,
+) -> Result<(), TranslateError> {
+    // The lane id is only needed to compute the source lane, and a kernel that
+    // shuffles gets the builtin emitted for it.
+    let laneid = laneid.ok_or(TranslateError::Todo)?;
+    let result_type = map.get_or_add_scalar(builder, typ.into());
+    let u32_type = map.get_or_add_scalar(builder, ast::ScalarType::U32);
+    let pred_type = map.get_or_add_scalar(builder, ast::ScalarType::Pred);
+    let constant = |builder: &mut dr::Builder, map: &mut TypeWordMap, value: u32| {
+        map.get_or_add_constant(
+            builder,
+            &ast::Type::Scalar(ast::ScalarType::U32),
+            &vec_repr(value),
+        )
+    };
+    let lane_mask = constant(builder, map, 0x1f)?;
+    let segment_shift = constant(builder, map, 8)?;
+    let lane = builder.load(u32_type, None, laneid, None, [].iter().cloned())?;
+    // b is a five bit lane number or offset; a larger value wraps.
+    let offset = builder.bitwise_and(u32_type, None, arg.lane, lane_mask)?;
+    let clamp = builder.bitwise_and(u32_type, None, arg.clamp, lane_mask)?;
+    let segmask = builder.shift_right_logical(u32_type, None, arg.clamp, segment_shift)?;
+    let segmask = builder.bitwise_and(u32_type, None, segmask, lane_mask)?;
+    let not_segmask = builder.not(u32_type, None, segmask)?;
+    let first_in_segment = builder.bitwise_and(u32_type, None, lane, segmask)?;
+    let clamp_high = builder.bitwise_and(u32_type, None, clamp, not_segmask)?;
+    let max_lane = builder.bitwise_or(u32_type, None, first_in_segment, clamp_high)?;
+    let (source, in_range) = match mode {
+        ast::ShflMode::Up => {
+            let source = builder.i_sub(u32_type, None, lane, offset)?;
+            let above_zero = builder.u_greater_than_equal(pred_type, None, lane, offset)?;
+            let below_max = builder.u_greater_than_equal(pred_type, None, source, max_lane)?;
+            let in_range =
+                builder.logical_and(pred_type, None, above_zero, below_max)?;
+            (source, in_range)
+        }
+        ast::ShflMode::Down => {
+            let source = builder.i_add(u32_type, None, lane, offset)?;
+            let in_range = builder.u_less_than_equal(pred_type, None, source, max_lane)?;
+            (source, in_range)
+        }
+        ast::ShflMode::Bfly => {
+            let source = builder.bitwise_xor(u32_type, None, lane, offset)?;
+            let in_range = builder.u_less_than_equal(pred_type, None, source, max_lane)?;
+            (source, in_range)
+        }
+        ast::ShflMode::Idx => {
+            let low = builder.bitwise_and(u32_type, None, offset, not_segmask)?;
+            let source = builder.bitwise_or(u32_type, None, first_in_segment, low)?;
+            let in_range = builder.u_less_than_equal(pred_type, None, source, max_lane)?;
+            (source, in_range)
+        }
+    };
+    let source = builder.select(u32_type, None, in_range, source, lane)?;
+    builder.subgroup_shuffle_intel(result_type, Some(arg.dst), arg.src, source)?;
+    if let Some(pred) = arg.dst_predicate {
+        builder.copy_object(pred_type, Some(pred), in_range)?;
+    }
+    Ok(())
+}
+
+fn emit_mma(
+    builder: &mut dr::Builder,
+    map: &mut TypeWordMap,
+    laneid: Option<spirv::Word>,
+    details: &ast::MmaDetails,
+    arg: &ast::ArgMma<ExpandedArgParams>,
+) -> Result<(), TranslateError> {
+    let laneid = laneid.ok_or(TranslateError::Todo)?;
+    if details.m != 16 || details.n != 8 {
+        return Err(TranslateError::Todo);
+    }
+    let element_bits: u32 = match details.a {
+        ast::ScalarType::F16 | ast::ScalarType::B16 => 16,
+        // The tf32 form names its elements .tf32, which the AST keeps as a
+        // plain 32-bit value.
+        ast::ScalarType::B32 => 32,
+        ast::ScalarType::S8 | ast::ScalarType::U8 => 8,
+        _ => return Err(TranslateError::Todo),
+    };
+    if details.b != details.a {
+        return Err(TranslateError::Todo);
+    }
+    let k = details.k as u32;
+    let half_accumulator = match (details.dst, details.c) {
+        (ast::ScalarType::F32, ast::ScalarType::F32) => false,
+        (ast::ScalarType::F16, ast::ScalarType::F16) => true,
+        (ast::ScalarType::S32, ast::ScalarType::S32) => false,
+        (ast::ScalarType::U32, ast::ScalarType::U32) => false,
+        _ => return Err(TranslateError::Todo),
+    };
+    let integer = element_bits == 8;
+    // A register holds 32 bits of elements. The four lanes of a row group
+    // cover k values 0..(4 * per_register), and every further group of that
+    // many k values is one more set of registers.
+    let per_register = 32 / element_bits;
+    let k_per_set = per_register * 4;
+    if k % k_per_set != 0 {
+        return Err(TranslateError::Todo);
+    }
+    let bfloat16 = details.a == ast::ScalarType::B16;
+    let u32_type = map.get_or_add_scalar(builder, ast::ScalarType::U32);
+    let b32_type = map.get_or_add_scalar(builder, ast::ScalarType::B32);
+    let f32_type = map.get_or_add_scalar(builder, ast::ScalarType::F32);
+    let f16_type = map.get_or_add_scalar(builder, ast::ScalarType::F16);
+    let f16x2_type = map.get_or_add(builder, SpirvType::Vector(SpirvScalarKey::F16, 2));
+    let b32_vector4 = map.get_or_add(builder, SpirvType::Vector(SpirvScalarKey::B32, 4));
+    let b32_vector2 = map.get_or_add(builder, SpirvType::Vector(SpirvScalarKey::B32, 2));
+    let f32_vector4 = map.get_or_add(builder, SpirvType::Vector(SpirvScalarKey::F32, 4));
+    // Only the floating point forms need the OpenCL extended instructions;
+    // the integer one multiplies and adds directly.
+    let opencl = builder
+        .module_ref()
+        .ext_inst_imports
+        .first()
+        .and_then(|i| i.result_id);
+    let two = map.get_or_add_constant(
+        builder,
+        &ast::Type::Scalar(ast::ScalarType::U32),
+        &vec_repr(2u32),
+    )?;
+    let three = map.get_or_add_constant(
+        builder,
+        &ast::Type::Scalar(ast::ScalarType::U32),
+        &vec_repr(3u32),
+    )?;
+    let one = map.get_or_add_constant(
+        builder,
+        &ast::Type::Scalar(ast::ScalarType::U32),
+        &vec_repr(1u32),
+    )?;
+    let lane = builder.load(u32_type, None, laneid, None, [].iter().cloned())?;
+    // g = lane / 4 (the row group), j = lane % 4 (the column pair).
+    let group = builder.shift_right_logical(u32_type, None, lane, two)?;
+    let in_group = builder.bitwise_and(u32_type, None, lane, three)?;
+    let col0 = builder.shift_left_logical(u32_type, None, in_group, one)?;
+    let col1 = builder.i_add(u32_type, None, col0, one)?;
+    // The A fragment as plain registers, with every element converted to a
+    // float up front: fetching one pack and converting both of its halves
+    // afterwards is folded by the backend compiler into half precision
+    // arithmetic whose two lanes are then reduced with an integer add.
+    // A set of fragments covers k_per_set k values and two rows; B's sets each
+    // cover k_per_set k values for one column group.
+    let sets = k / k_per_set;
+    let a_registers = sets * 2;
+    let b_registers = sets;
+    let result_registers: u32 = if half_accumulator { 2 } else { 4 };
+    // A register carries at most four elements (the 8-bit form).
+    let mut a_values = vec![[0u32; 4]; a_registers as usize];
+    for register in 0..a_registers {
+        let element = fragment_register(builder, b32_type, arg.a, register, a_registers)?;
+        for half in 0..per_register {
+            a_values[register as usize][half as usize] = fragment_element(
+                builder,
+                map,
+                element,
+                half,
+                element_bits,
+                bfloat16,
+                details.a == ast::ScalarType::S8,
+                u32_type,
+                f32_type,
+                f16_type,
+                f16x2_type,
+            )?;
+        }
+    }
+    let mut b_values = vec![[0u32; 4]; b_registers as usize];
+    for register in 0..b_registers {
+        let element = fragment_register(builder, b32_type, arg.b, register, b_registers)?;
+        for half in 0..per_register {
+            b_values[register as usize][half as usize] = fragment_element(
+                builder,
+                map,
+                element,
+                half,
+                element_bits,
+                bfloat16,
+                details.a == ast::ScalarType::S8,
+                u32_type,
+                f32_type,
+                f16_type,
+                f16x2_type,
+            )?;
+        }
+    }
+    let mut outputs = Vec::with_capacity(4);
+    for (output_index, (row_high, column)) in [
+        (false, col0),
+        (false, col1),
+        (true, col0),
+        (true, col1),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let column: spirv::Word = *column;
+        // The accumulator of a half precision multiply is packed two values to
+        // a register; a float one has a register per value. Both are converted
+        // to floats, because the accumulation is done in single precision and
+        // rounded back afterwards.
+        let mut sum = if integer {
+            let register = fragment_register(
+                builder,
+                b32_type,
+                arg.c,
+                output_index as u32,
+                result_registers,
+            )?;
+            builder.bitcast(u32_type, None, register)?
+        } else if half_accumulator {
+            let register = builder.composite_extract(
+                b32_type,
+                None,
+                arg.c,
+                [output_index as u32 / 2].iter().copied(),
+            )?;
+            fragment_element(
+                builder,
+                map,
+                register,
+                output_index as u32 % 2,
+                16,
+                false,
+                false,
+                u32_type,
+                f32_type,
+                f16_type,
+                f16x2_type,
+            )?
+        } else {
+            builder.composite_extract(f32_type, None, arg.c, [output_index as u32].iter().copied())?
+        };
+        for step in 0u32..k {
+            let within = step % k_per_set;
+            let element = within % per_register;
+            let pair = within / per_register;
+            let set = step / k_per_set;
+            let a_index = set * 2 + if *row_high { 1 } else { 0 };
+            let offset = map.get_or_add_constant(
+                builder,
+                &ast::Type::Scalar(ast::ScalarType::U32),
+                &vec_repr(pair),
+            )?;
+            let group_base = builder.shift_left_logical(u32_type, None, group, two)?;
+            let a_lane = builder.i_add(u32_type, None, group_base, offset)?;
+            // The integer form exchanges integers; the float forms exchange
+            // floats.
+            let value_type = if integer { u32_type } else { f32_type };
+            let a_value = builder.subgroup_shuffle_intel(
+                value_type,
+                None,
+                a_values[a_index as usize][element as usize],
+                a_lane,
+            )?;
+            let column_base = builder.shift_left_logical(u32_type, None, column, two)?;
+            let b_lane = builder.i_add(u32_type, None, column_base, offset)?;
+            let b_index = set;
+            let b_value = builder.subgroup_shuffle_intel(
+                value_type,
+                None,
+                b_values[b_index as usize][element as usize],
+                b_lane,
+            )?;
+            sum = if integer {
+                let product = builder.i_mul(u32_type, None, a_value, b_value)?;
+                builder.i_add(u32_type, None, product, sum)?
+            } else {
+                builder.ext_inst(
+                    f32_type,
+                    None,
+                    opencl.ok_or(TranslateError::Todo)?,
+                    spirv::CLOp::fma as u32,
+                    [
+                        dr::Operand::IdRef(a_value),
+                        dr::Operand::IdRef(b_value),
+                        dr::Operand::IdRef(sum),
+                    ]
+                    .iter()
+                    .cloned(),
+                )?
+            };
+        }
+        outputs.push(sum);
+    }
+    if integer {
+        let mut registers = Vec::with_capacity(4);
+        for value in outputs.iter() {
+            registers.push(builder.bitcast(b32_type, None, *value)?);
+        }
+        builder.composite_construct(b32_vector4, Some(arg.dst), registers.into_iter())?;
+    } else if half_accumulator {
+        let mut registers = Vec::with_capacity(2);
+        for pair in 0..2 {
+            let low = builder.f_convert(f16_type, None, outputs[pair * 2])?;
+            let high = builder.f_convert(f16_type, None, outputs[pair * 2 + 1])?;
+            registers.push(pack_halves(builder, map, low, high, u32_type, b32_type, f16_type)?);
+        }
+        builder.composite_construct(b32_vector2, Some(arg.dst), registers.into_iter())?;
+    } else {
+        builder.composite_construct(f32_vector4, Some(arg.dst), outputs.into_iter())?;
+    }
+    let _ = (one, b32_vector4, f16x2_type);
+    Ok(())
+}
+
+/// One register of a fragment. A fragment of one register is the register
+/// itself: SPIR-V has no vector of one element.
+fn fragment_register(
+    builder: &mut dr::Builder,
+    b32_type: spirv::Word,
+    fragment: spirv::Word,
+    index: u32,
+    count: u32,
+) -> Result<spirv::Word, TranslateError> {
+    if count == 1 {
+        return Ok(fragment);
+    }
+    Ok(builder.composite_extract(b32_type, None, fragment, [index].iter().copied())?)
+}
+
+/// One element of a fragment register, as a float.
+fn fragment_element(
+    builder: &mut dr::Builder,
+    map: &mut TypeWordMap,
+    register: spirv::Word,
+    element: u32,
+    element_bits: u32,
+    bfloat16: bool,
+    signed: bool,
+    u32_type: spirv::Word,
+    f32_type: spirv::Word,
+    f16_type: spirv::Word,
+    f16x2_type: spirv::Word,
+) -> Result<spirv::Word, TranslateError> {
+    if element_bits == 32 {
+        // A tf32 element is a 32-bit float; only the rounding of the multiply
+        // differs from the float form, and the accumulator is a float.
+        return Ok(builder.bitcast(f32_type, None, register)?);
+    }
+    if element_bits == 8 {
+        // Four bytes are packed into the register; the value is widened to a
+        // full 32-bit integer of the instruction's sign.
+        let shift = map.get_or_add_constant(
+            builder,
+            &ast::Type::Scalar(ast::ScalarType::U32),
+            &vec_repr(element * 8),
+        )?;
+        let mask = map.get_or_add_constant(
+            builder,
+            &ast::Type::Scalar(ast::ScalarType::U32),
+            &vec_repr(0xffu32),
+        )?;
+        let byte = builder.shift_right_logical(u32_type, None, register, shift)?;
+        let byte = builder.bitwise_and(u32_type, None, byte, mask)?;
+        let u8_type = map.get_or_add_scalar(builder, ast::ScalarType::U8);
+        let byte = builder.u_convert(u8_type, None, byte)?;
+        return Ok(if signed {
+            let s8_type = map.get_or_add_scalar(builder, ast::ScalarType::S8);
+            let value = builder.bitcast(s8_type, None, byte)?;
+            builder.s_convert(u32_type, None, value)?
+        } else {
+            builder.u_convert(u32_type, None, byte)?
+        });
+    }
+    if bfloat16 {
+        // A bf16 value is the upper half of an f32, so the conversion is a
+        // shift of the bit pattern.
+        let bits = if element == 0 {
+            let mask = map.get_or_add_constant(
+                builder,
+                &ast::Type::Scalar(ast::ScalarType::U32),
+                &vec_repr(0xffffu32),
+            )?;
+            builder.bitwise_and(u32_type, None, register, mask)?
+        } else {
+            let sixteen = map.get_or_add_constant(
+                builder,
+                &ast::Type::Scalar(ast::ScalarType::U32),
+                &vec_repr(16u32),
+            )?;
+            builder.shift_right_logical(u32_type, None, register, sixteen)?
+        };
+        let sixteen = map.get_or_add_constant(
+            builder,
+            &ast::Type::Scalar(ast::ScalarType::U32),
+            &vec_repr(16u32),
+        )?;
+        let bits = builder.shift_left_logical(u32_type, None, bits, sixteen)?;
+        return Ok(builder.bitcast(f32_type, None, bits)?);
+    }
+    let vector = builder.bitcast(f16x2_type, None, register)?;
+    let half = builder.composite_extract(f16_type, None, vector, [element].iter().copied())?;
+    Ok(builder.f_convert(f32_type, None, half)?)
+}
+
+// shf.l.wrap.b32 d, a, b, c;   d = (b << c) | (a >> (32 - c))
+// shf.r.wrap.b32 d, a, b, c;   d = (a >> c) | (b << (32 - c))
+//
+// The two operands form one 64-bit value; the result is the low 32 bits of
+// it shifted by c. A shift by zero keeps the low word, which is what the
+// select at the end takes care of (a shift by 32 is undefined).
+fn emit_shf(
+    builder: &mut dr::Builder,
+    map: &mut TypeWordMap,
+    details: &ast::ShfDetails,
+    arg: &ast::Arg4<ExpandedArgParams>,
+) -> Result<(), TranslateError> {
+    let u32_type = map.get_or_add_scalar(builder, ast::ScalarType::B32);
+    let thirty_one = map.get_or_add_constant(
+        builder,
+        &ast::Type::Scalar(ast::ScalarType::U32),
+        &vec_repr(31u32),
+    )?;
+    let thirty_two = map.get_or_add_constant(
+        builder,
+        &ast::Type::Scalar(ast::ScalarType::U32),
+        &vec_repr(32u32),
+    )?;
+    let zero = map.get_or_add_constant(
+        builder,
+        &ast::Type::Scalar(ast::ScalarType::U32),
+        &vec_repr(0u32),
+    )?;
+    let bool_type = map.get_or_add_scalar(builder, ast::ScalarType::Pred);
+    let count = builder.bitwise_and(u32_type, None, arg.src3, thirty_one)?;
+    let lowered_shift = builder.i_sub(u32_type, None, thirty_two, count)?;
+    let lowered_shift = builder.bitwise_and(u32_type, None, lowered_shift, thirty_one)?;
+    // {b, a} is one 64-bit value with b in the high word, so:
+    //   shf.l: d = (b << c) | (a >> (32 - c))
+    //   shf.r: d = (a >> c) | (b << (32 - c))
+    // The right form used to apply each amount to the opposite operand.
+    let combined = if details.left {
+        let moved_high = builder.shift_left_logical(u32_type, None, arg.src2, count)?;
+        let moved_low = builder.shift_right_logical(u32_type, None, arg.src1, lowered_shift)?;
+        builder.bitwise_or(u32_type, None, moved_high, moved_low)?
+    } else {
+        let moved_low = builder.shift_right_logical(u32_type, None, arg.src1, count)?;
+        let moved_high = builder.shift_left_logical(u32_type, None, arg.src2, lowered_shift)?;
+        builder.bitwise_or(u32_type, None, moved_low, moved_high)?
+    };
+    if details.wrap {
+        // A wrap of zero leaves the value unshifted, so the result is the low
+        // word of the pair: b for a left shift, a for a right one.
+        let is_zero = builder.i_equal(bool_type, None, count, zero)?;
+        let survivor = if details.left { arg.src2 } else { arg.src1 };
+        builder.select(u32_type, Some(arg.dst), is_zero, survivor, combined)?;
+    } else {
+        // A clamp past the width returns the word that survives the shift:
+        // the low word for a left shift, the high word for a right shift. A
+        // clamp of zero is the same as a wrap of zero, so the low word of the
+        // pair is the result and the combination above does not apply.
+        let wide = builder.u_greater_than_equal(bool_type, None, arg.src3, thirty_two)?;
+        let survivor = if details.left { arg.src1 } else { arg.src2 };
+        let clamped = builder.select(u32_type, None, wide, survivor, combined)?;
+        let is_zero = builder.i_equal(bool_type, None, arg.src3, zero)?;
+        let unshifted = if details.left { arg.src2 } else { arg.src1 };
+        builder.select(u32_type, Some(arg.dst), is_zero, unshifted, clamped)?;
+    }
+    Ok(())
+}
+
+// prmt.b32 d, a, b, c;
+//
+// The eight bytes of a and b form one pool (a holds bytes 0-3, b bytes 4-7).
+// Each of the four nibbles of c selects one byte of the pool for the result,
+// the low nibble for the lowest byte. A nibble whose top bit is set does not
+// select a byte at all: the sign bit of the selected byte is replicated over
+// the whole output byte, which is the sign extension the instruction documents.
+/// bar.red reduces a predicate (or counts the lanes that hold it) across the
+/// whole workgroup. SPIR-V has no workgroup wide group operation, so the votes
+/// are counted in workgroup memory: the word is cleared, every lane whose vote
+/// counts adds one, the total is handed to `finish`, and the word is cleared
+/// again so that a loop can run the same instruction once more.
+fn emit_bar_red(
+    builder: &mut dr::Builder,
+    map: &mut TypeWordMap,
+    voting: spirv::Word,
+    finish: impl FnOnce(&mut dr::Builder, spirv::Word) -> Result<(), TranslateError>,
+) -> Result<(), TranslateError> {
+    let u32_type = map.get_or_add_scalar(builder, ast::ScalarType::U32);
+    let scratch = builder.id();
+    let scratch_type = map.get_or_add(
+        builder,
+        SpirvType::pointer_to(
+            ast::Type::Scalar(ast::ScalarType::U32),
+            spirv::StorageClass::Workgroup,
+        ),
+    );
+    builder.insert_types_global_values(
+        dr::InsertPoint::End,
+        dr::Instruction::new(
+            spirv::Op::Variable,
+            Some(scratch_type),
+            Some(scratch),
+            vec![dr::Operand::StorageClass(spirv::StorageClass::Workgroup)],
+        ),
+    );
+    let workgroup_scope = map.get_or_add_constant(
+        builder,
+        &ast::Type::Scalar(ast::ScalarType::U32),
+        &vec_repr(spirv::Scope::Workgroup as u32),
+    )?;
+    let barrier_semantics = map.get_or_add_constant(
+        builder,
+        &ast::Type::Scalar(ast::ScalarType::U32),
+        &vec_repr(
+            spirv::MemorySemantics::CROSS_WORKGROUP_MEMORY
+                | spirv::MemorySemantics::WORKGROUP_MEMORY
+                | spirv::MemorySemantics::SEQUENTIALLY_CONSISTENT,
+        ),
+    )?;
+    let atomic_scope = map.get_or_add_constant(
+        builder,
+        &ast::Type::Scalar(ast::ScalarType::U32),
+        &vec_repr(spirv::Scope::Device as u32),
+    )?;
+    let atomic_semantics = map.get_or_add_constant(
+        builder,
+        &ast::Type::Scalar(ast::ScalarType::U32),
+        &vec_repr(spirv::MemorySemantics::NONE.bits()),
+    )?;
+    let zero = map.get_or_add_constant(
+        builder,
+        &ast::Type::Scalar(ast::ScalarType::U32),
+        &vec_repr(0u32),
+    )?;
+    let one = map.get_or_add_constant(
+        builder,
+        &ast::Type::Scalar(ast::ScalarType::U32),
+        &vec_repr(1u32),
+    )?;
+    let barrier = |builder: &mut dr::Builder| -> Result<(), TranslateError> {
+        builder.control_barrier(workgroup_scope, workgroup_scope, barrier_semantics)?;
+        Ok(())
+    };
+    // One guarded atomic, in a block of its own. Deliberately not an
+    // OpSelectionMerge: a structured selection is predicated by the backend
+    // compiler, and a predicated atomic only lands for a single lane. The
+    // unstructured branch that the predicated instructions of the PTX lower to
+    // is compiled per lane.
+    let guarded =
+        |builder: &mut dr::Builder, add: bool| -> Result<(), TranslateError> {
+            let then_id = builder.id();
+            let merge_id = builder.id();
+            builder.branch_conditional(voting, then_id, merge_id, iter::empty())?;
+            builder.begin_block(Some(then_id))?;
+            if add {
+                builder.atomic_i_add(
+                    u32_type,
+                    None,
+                    scratch,
+                    atomic_scope,
+                    atomic_semantics,
+                    one,
+                )?;
+            } else {
+                // Clearing the own vote: and with zero.
+                builder.atomic_and(
+                    u32_type,
+                    None,
+                    scratch,
+                    atomic_scope,
+                    atomic_semantics,
+                    zero,
+                )?;
+            }
+            builder.branch(merge_id)?;
+            builder.begin_block(Some(merge_id))?;
+            Ok(())
+        };
+    // Workgroup memory starts undefined, so the word is cleared before the first
+    // vote (every thread writes the same value, so the race is harmless).
+    builder.store(
+        scratch,
+        zero,
+        Some(spirv::MemoryAccess::VOLATILE),
+        [].iter().cloned(),
+    )?;
+    barrier(builder)?;
+    guarded(builder, true)?;
+    barrier(builder)?;
+    let collected = builder.load(
+        u32_type,
+        None,
+        scratch,
+        Some(spirv::MemoryAccess::VOLATILE),
+        [].iter().cloned(),
+    )?;
+    finish(builder, collected)?;
+    barrier(builder)?;
+    guarded(builder, false)?;
+    barrier(builder)?;
+    Ok(())
+}
+
+fn emit_prmt(
+    builder: &mut dr::Builder,
+    map: &mut TypeWordMap,
+    typ: ast::ScalarType,
+    arg: &ast::Arg4<ExpandedArgParams>,
+) -> Result<(), TranslateError> {
+    let typ: ast::ScalarType = typ.into();
+    let result_type = map.get_or_add_scalar(builder, typ);
+    let u32_type = map.get_or_add_scalar(builder, ast::ScalarType::U32);
+    let bool_type = map.get_or_add_scalar(builder, ast::ScalarType::Pred);
+    let constant = |builder: &mut dr::Builder, map: &mut TypeWordMap, value: u32| {
+        map.get_or_add_constant(
+            builder,
+            &ast::Type::Scalar(ast::ScalarType::U32),
+            &vec_repr(value),
+        )
+    };
+    let zero = constant(builder, map, 0)?;
+    let one = constant(builder, map, 1)?;
+    let three = constant(builder, map, 3)?;
+    let four = constant(builder, map, 4)?;
+    let seven = constant(builder, map, 7)?;
+    let eight = constant(builder, map, 8)?;
+    let fifteen = constant(builder, map, 15)?;
+    let sign = constant(builder, map, 0x80)?;
+    let all_ones = constant(builder, map, 0xff)?;
+    let mut result: Option<spirv::Word> = None;
+    // Each output byte comes from one of the eight input bytes: the selector's
+    // low three bits pick the byte, and its fourth bit asks for the byte's sign
+    // to be replicated instead of the byte itself. The source word and the
+    // shift are both 32 bits wide, which keeps the whole thing in one width.
+    for index in 0..4u32 {
+        let selector_shift = constant(builder, map, index * 4)?;
+        let selector = builder.shift_right_logical(u32_type, None, arg.src3, selector_shift)?;
+        let selector = builder.bitwise_and(u32_type, None, selector, fifteen)?;
+        let byte_index = builder.bitwise_and(u32_type, None, selector, seven)?;
+        // Bytes 0..3 are in the first operand, 4..7 in the second.
+        let from_second = builder.bitwise_and(u32_type, None, byte_index, four)?;
+        let from_second = builder.i_not_equal(bool_type, None, from_second, zero)?;
+        let source = builder.select(u32_type, None, from_second, arg.src2, arg.src1)?;
+        let shift = builder.bitwise_and(u32_type, None, byte_index, three)?;
+        let shift = builder.shift_left_logical(u32_type, None, shift, three)?;
+        let byte = builder.shift_right_logical(u32_type, None, source, shift)?;
+        let byte = builder.bitwise_and(u32_type, None, byte, all_ones)?;
+        // The selector's fourth bit: replicate the byte's sign instead.
+        let replicate = builder.bitwise_and(u32_type, None, selector, eight)?;
+        let replicate = builder.i_not_equal(bool_type, None, replicate, zero)?;
+        let negative = builder.bitwise_and(u32_type, None, byte, sign)?;
+        let negative = builder.i_not_equal(bool_type, None, negative, zero)?;
+        let ones = builder.select(u32_type, None, negative, all_ones, zero)?;
+        let byte = builder.select(u32_type, None, replicate, ones, byte)?;
+        result = Some(match result {
+            None => byte,
+            Some(previous) => {
+                let into_place = constant(builder, map, index * 8)?;
+                let byte = builder.shift_left_logical(u32_type, None, byte, into_place)?;
+                builder.bitwise_or(u32_type, None, previous, byte)?
+            }
+        });
+    }
+    let _ = one;
+    let result = result.ok_or(TranslateError::Todo)?;
+    builder.copy_object(result_type, Some(arg.dst), result)?;
+    Ok(())
+}
+
+// cp.async.cg.shared.global [dst], [src], 16;
+//
+// Copies global memory into shared memory. The point of the instruction is
+// to overlap the copy with the arithmetic; a plain copy produces the same
+// result, so that is what is emitted. The destination is a 32-bit offset in
+// the shared window, which is what a pointer into the Workgroup storage
+// class means in SPIR-V.
+fn emit_cp_async(
+    builder: &mut dr::Builder,
+    map: &mut TypeWordMap,
+    details: &ast::CpAsyncDetails,
+    arg: &ast::ArgCpAsync<ExpandedArgParams>,
+) -> Result<(), TranslateError> {
+    let size = details.size as u32;
+    if size == 0 || size % 4 != 0 || size > 16 {
+        return Err(TranslateError::Todo);
+    }
+    if arg.src_size.is_some() {
+        // A partial copy zero-fills the rest; that form is not used by the
+        // kernels we run.
+        return Err(TranslateError::Todo);
+    }
+    let u32_type = map.get_or_add_scalar(builder, ast::ScalarType::U32);
+    let u8_ptr = map.get_or_add(
+        builder,
+        SpirvType::pointer_to(
+            ast::Type::Scalar(ast::ScalarType::B8),
+            spirv::StorageClass::Generic,
+        ),
+    );
+    let u32_ptr = map.get_or_add(
+        builder,
+        SpirvType::pointer_to(
+            ast::Type::Scalar(ast::ScalarType::B32),
+            spirv::StorageClass::Generic,
+        ),
+    );
+    let shared_u8_ptr = map.get_or_add(
+        builder,
+        SpirvType::pointer_to(
+            ast::Type::Scalar(ast::ScalarType::B8),
+            spirv::StorageClass::Workgroup,
+        ),
+    );
+    let shared_u32_ptr = map.get_or_add(
+        builder,
+        SpirvType::pointer_to(
+            ast::Type::Scalar(ast::ScalarType::B32),
+            spirv::StorageClass::Workgroup,
+        ),
+    );
+    let src_ptr = builder.convert_u_to_ptr(u8_ptr, None, arg.src)?;
+    let dst_ptr = builder.convert_u_to_ptr(shared_u8_ptr, None, arg.dst)?;
+    for offset in (0..size).step_by(4) {
+        let offset_const = map.get_or_add_constant(
+            builder,
+            &ast::Type::Scalar(ast::ScalarType::U32),
+            &vec_repr(offset),
+        )?;
+        let word = if offset == 0 {
+            builder.bitcast(u32_ptr, None, src_ptr)?
+        } else {
+            let advanced = builder.in_bounds_ptr_access_chain(
+                u8_ptr,
+                None,
+                src_ptr,
+                offset_const,
+                iter::empty(),
+            )?;
+            builder.bitcast(u32_ptr, None, advanced)?
+        };
+        let word = builder.load(
+            u32_type,
+            None,
+            word,
+            Some(spirv::MemoryAccess::ALIGNED),
+            [dr::Operand::LiteralInt32(4)].iter().cloned(),
+        )?;
+        let target = if offset == 0 {
+            builder.bitcast(shared_u32_ptr, None, dst_ptr)?
+        } else {
+            let advanced = builder.in_bounds_ptr_access_chain(
+                shared_u8_ptr,
+                None,
+                dst_ptr,
+                offset_const,
+                iter::empty(),
+            )?;
+            builder.bitcast(shared_u32_ptr, None, advanced)?
+        };
+        builder.store(target, word, None, iter::empty())?;
+    }
+    Ok(())
+}
+
+// ldmatrix.sync.aligned.m8n8.x{1,2,4}.b16 [.trans] {d...}, [p];
+//
+// The rows of matrix i are the addresses held by the threads 8i..8i+7, and
+// thread t receives the two 16-bit elements at row t/4, columns 2*(t%4) and
+// 2*(t%4)+1 of every matrix. The row address therefore has to be fetched
+// from the thread that holds it (a subgroup shuffle), and the elements are
+// then read from shared memory.
+//
+// ".trans" distributes the transposed matrix: thread t receives the elements
+// at rows 2*(t%4) and 2*(t%4)+1, column t/4.
+/// `vsub4.u32.u32.u32 d, a, b, c;` - four independent byte subtractions.
+///
+/// Each result byte is the low eight bits of the difference, so the bytes do
+/// not borrow into each other. CUDA's documentation of the intrinsic says the
+/// same thing ("performs per-byte subtraction ... partial results are
+/// recombined"); the saturating variant is a different instruction.
+fn emit_vsub4(
+    builder: &mut dr::Builder,
+    map: &mut TypeWordMap,
+    arg: &ast::Arg3<ExpandedArgParams>,
+) -> Result<(), TranslateError> {
+    let u32_type = map.get_or_add_scalar(builder, ast::ScalarType::U32);
+    let mask = map.get_or_add_constant(
+        builder,
+        &ast::Type::Scalar(ast::ScalarType::U32),
+        &vec_repr(0xffu32),
+    )?;
+    let mut result: Option<spirv::Word> = None;
+    for byte in 0u32..4 {
+        let shift = map.get_or_add_constant(
+            builder,
+            &ast::Type::Scalar(ast::ScalarType::U32),
+            &vec_repr(byte * 8),
+        )?;
+        if byte == 0 {
+            let low = builder.bitwise_and(u32_type, None, arg.src1, mask)?;
+            let low_b = builder.bitwise_and(u32_type, None, arg.src2, mask)?;
+            // The difference of two bytes is negative in the low byte as often
+            // as not, and in a 32-bit register that sets every upper bit: the
+            // byte has to be cut out again.
+            let low = builder.i_sub(u32_type, None, low, low_b)?;
+            result = Some(builder.bitwise_and(u32_type, None, low, mask)?);
+            continue;
+        }
+        let a = builder.shift_right_logical(u32_type, None, arg.src1, shift)?;
+        let a = builder.bitwise_and(u32_type, None, a, mask)?;
+        let b = builder.shift_right_logical(u32_type, None, arg.src2, shift)?;
+        let b = builder.bitwise_and(u32_type, None, b, mask)?;
+        let byte_diff = builder.i_sub(u32_type, None, a, b)?;
+        let byte_diff = builder.bitwise_and(u32_type, None, byte_diff, mask)?;
+        let byte_diff = builder.shift_left_logical(u32_type, None, byte_diff, shift)?;
+        result = Some(builder.bitwise_or(u32_type, None, result.unwrap_or(0), byte_diff)?);
+    }
+    builder.copy_object(u32_type, Some(arg.dst), result.unwrap_or(0))?;
+    Ok(())
+}
+
+/// `vset4.u32.u32.ne d, a, b, c;` - four independent byte comparisons, each
+/// result being one or zero (CUDA documents the `set` intrinsics that way; the
+/// `cmp` ones return 0xff and are different instructions).
+fn emit_vset4(
+    builder: &mut dr::Builder,
+    map: &mut TypeWordMap,
+    op: &ast::CompareOp,
+    arg: &ast::Arg3<ExpandedArgParams>,
+) -> Result<(), TranslateError> {
+    let u32_type = map.get_or_add_scalar(builder, ast::ScalarType::U32);
+    let bool_type = map.get_or_add_scalar(builder, ast::ScalarType::Pred);
+    let mask = map.get_or_add_constant(
+        builder,
+        &ast::Type::Scalar(ast::ScalarType::U32),
+        &vec_repr(0xffu32),
+    )?;
+    let one = map.get_or_add_constant(
+        builder,
+        &ast::Type::Scalar(ast::ScalarType::U32),
+        &vec_repr(1u32),
+    )?;
+    let zero = map.get_or_add_constant(
+        builder,
+        &ast::Type::Scalar(ast::ScalarType::U32),
+        &vec_repr(0u32),
+    )?;
+    let mut result: Option<spirv::Word> = None;
+    for byte in 0u32..4 {
+        let shift = map.get_or_add_constant(
+            builder,
+            &ast::Type::Scalar(ast::ScalarType::U32),
+            &vec_repr(byte * 8),
+        )?;
+        let a = builder.shift_right_logical(u32_type, None, arg.src1, shift)?;
+        let a = builder.bitwise_and(u32_type, None, a, mask)?;
+        let b = builder.shift_right_logical(u32_type, None, arg.src2, shift)?;
+        let b = builder.bitwise_and(u32_type, None, b, mask)?;
+        let holds = match op {
+            ast::CompareOp::Eq => builder.i_equal(bool_type, None, a, b)?,
+            ast::CompareOp::Ne => builder.i_not_equal(bool_type, None, a, b)?,
+            ast::CompareOp::Lt => builder.u_less_than(bool_type, None, a, b)?,
+            ast::CompareOp::Le => builder.u_less_than_equal(bool_type, None, a, b)?,
+            ast::CompareOp::Gt => builder.u_greater_than(bool_type, None, a, b)?,
+            ast::CompareOp::Ge => builder.u_greater_than_equal(bool_type, None, a, b)?,
+        };
+        let piece = builder.select(u32_type, None, holds, one, zero)?;
+        let piece = builder.shift_left_logical(u32_type, None, piece, shift)?;
+        result = Some(match result {
+            None => piece,
+            Some(previous) => builder.bitwise_or(u32_type, None, previous, piece)?,
+        });
+    }
+    builder.copy_object(u32_type, Some(arg.dst), result.unwrap_or(0))?;
+    Ok(())
+}
+
+/// `redux.sync.add.s32 d, a, mask;` - the value `a` reduced across the warp.
+///
+/// The member mask is a promise about which lanes take part; the group
+/// operation reduces over the whole subgroup, which is what a kernel running
+/// with every lane active means by it.
+fn emit_redux(
+    builder: &mut dr::Builder,
+    map: &mut TypeWordMap,
+    op: &ast::ReduxOp,
+    typ: &ast::ScalarType,
+    arg: &ast::Arg3<ExpandedArgParams>,
+) -> Result<(), TranslateError> {
+    let result_type = map.get_or_add_scalar(builder, ast::ScalarType::from(*typ));
+    let subgroup = map.get_or_add_constant(
+        builder,
+        &ast::Type::Scalar(ast::ScalarType::U32),
+        &vec_repr(spirv::Scope::Subgroup as u32),
+    )?;
+    let value = arg.src1;
+    let reduce = spirv::GroupOperation::Reduce;
+    let result = match (op, typ) {
+        (ast::ReduxOp::Add, ast::ScalarType::F32) => {
+            builder.group_non_uniform_f_add(result_type, None, subgroup, reduce, value, None)?
+        }
+
+        (ast::ReduxOp::Min, ast::ScalarType::F32) => {
+            builder.group_non_uniform_f_min(result_type, None, subgroup, reduce, value, None)?
+        }
+        (ast::ReduxOp::Max, ast::ScalarType::F32) => {
+            builder.group_non_uniform_f_max(result_type, None, subgroup, reduce, value, None)?
+        }
+        (ast::ReduxOp::Add, _) => builder.group_non_uniform_i_add(
+            result_type,
+            None,
+            subgroup,
+            reduce,
+            value,
+            None,
+        )?,
+        // The float minimum and maximum, and the bitwise reductions, have no
+        // group operation of their own.
+        _ => return Err(TranslateError::Todo),
+    };
+    builder.copy_object(result_type, Some(arg.dst), result)?;
+    Ok(())
+}
+
+/// `cvt.rn.f16x2.f32 d, a, b;` and its bfloat counterpart: two floats are
+/// converted and packed into one register, the first one in the low half.
+fn emit_cvt_packed(
+    builder: &mut dr::Builder,
+    map: &mut TypeWordMap,
+    typ: ast::ScalarType,
+    arg: &ast::Arg3<ExpandedArgParams>,
+) -> Result<(), TranslateError> {
+    let u32_type = map.get_or_add_scalar(builder, ast::ScalarType::U32);
+    let b32_type = map.get_or_add_scalar(builder, ast::ScalarType::B32);
+    let u16_type = map.get_or_add_scalar(builder, ast::ScalarType::U16);
+    let f32_type = map.get_or_add_scalar(builder, ast::ScalarType::F32);
+    let sixteen = map.get_or_add_constant(
+        builder,
+        &ast::Type::Scalar(ast::ScalarType::U32),
+        &vec_repr(16u32),
+    )?;
+    let convert = |builder: &mut dr::Builder,
+                   map: &mut TypeWordMap,
+                   value: spirv::Word|
+     -> Result<spirv::Word, TranslateError> {
+        if typ == ast::ScalarType::B16 {
+            // bfloat16 keeps the upper half of the float, rounded to nearest
+            // even.
+            let bits = builder.bitcast(u32_type, None, value)?;
+            let rounding = map.get_or_add_constant(
+                builder,
+                &ast::Type::Scalar(ast::ScalarType::U32),
+                &vec_repr(0x7fffu32),
+            )?;
+            // Round to nearest even: half of what is dropped, plus the low bit
+            // of the part that is kept so that a tie goes to the even value.
+            let one = map.get_or_add_constant(
+                builder,
+                &ast::Type::Scalar(ast::ScalarType::U32),
+                &vec_repr(1u32),
+            )?;
+            let kept = builder.shift_right_logical(u32_type, None, bits, sixteen)?;
+            let lsb = builder.bitwise_and(u32_type, None, kept, one)?;
+            let biased = builder.i_add(u32_type, None, bits, rounding)?;
+            let biased = builder.i_add(u32_type, None, biased, lsb)?;
+            return Ok(builder.shift_right_logical(u32_type, None, biased, sixteen)?);
+        }
+        let f16_type = map.get_or_add_scalar(builder, ast::ScalarType::F16);
+        let half = builder.f_convert(f16_type, None, value)?;
+        let half = builder.bitcast(u16_type, None, half)?;
+        Ok(builder.u_convert(u32_type, None, half)?)
+    };
+    // "cvt.rn.f16x2.f32 d, a, b" puts a in the HIGH half and b in the LOW half,
+    // which is the opposite of the order the operands are written in. NVIDIA's
+    // own header spells it out: the sm_80 form feeds the asm as "%2, %1" so
+    // that the first argument ends up low, and the fallback builds
+    // {low = a, high = b} by hand. Getting this backwards exchanges every
+    // adjacent pair of k values in whatever the caller stages, which is how
+    // ggml's f16 matmul ended up pairing A's element k with B's element k^1.
+    let high = convert(builder, map, arg.src1)?;
+    let low = convert(builder, map, arg.src2)?;
+    let high = builder.shift_left_logical(u32_type, None, high, sixteen)?;
+    let joined = builder.bitwise_or(u32_type, None, low, high)?;
+    let joined = builder.bitcast(b32_type, None, joined)?;
+    builder.copy_object(b32_type, Some(arg.dst), joined)?;
+    Ok(())
+}
+
+// movmatrix.sync.aligned.m8n8.trans.b16 d, a;
+//
+// The warp holds an 8 x 8 matrix of 16-bit values in one register per thread:
+// thread t holds the two values of row t/4, columns 2*(t%4) and 2*(t%4)+1. The
+// transposed matrix has the same distribution, so thread t's result is the
+// value at row 2*(t%4) and column t/4, followed by the one at row 2*(t%4)+1 and
+// the same column. Both are fetched from their owner with a subgroup shuffle.
+fn emit_movmatrix(
+    builder: &mut dr::Builder,
+    map: &mut TypeWordMap,
+    laneid: Option<spirv::Word>,
+    arg: &ast::Arg2<ExpandedArgParams>,
+) -> Result<(), TranslateError> {
+    let laneid = laneid.ok_or(TranslateError::Todo)?;
+    let u32_type = map.get_or_add_scalar(builder, ast::ScalarType::U32);
+    let b32_type = map.get_or_add_scalar(builder, ast::ScalarType::B32);
+    let two = map.get_or_add_constant(
+        builder,
+        &ast::Type::Scalar(ast::ScalarType::U32),
+        &vec_repr(2u32),
+    )?;
+    let three = map.get_or_add_constant(
+        builder,
+        &ast::Type::Scalar(ast::ScalarType::U32),
+        &vec_repr(3u32),
+    )?;
+    let four = map.get_or_add_constant(
+        builder,
+        &ast::Type::Scalar(ast::ScalarType::U32),
+        &vec_repr(4u32),
+    )?;
+    let one = map.get_or_add_constant(
+        builder,
+        &ast::Type::Scalar(ast::ScalarType::U32),
+        &vec_repr(1u32),
+    )?;
+    let sixteen = map.get_or_add_constant(
+        builder,
+        &ast::Type::Scalar(ast::ScalarType::U32),
+        &vec_repr(16u32),
+    )?;
+    let mask = map.get_or_add_constant(
+        builder,
+        &ast::Type::Scalar(ast::ScalarType::U32),
+        &vec_repr(0xffffu32),
+    )?;
+    let lane = builder.load(u32_type, None, laneid, None, [].iter().cloned())?;
+    // column = lane / 4, row pair = 2 * (lane % 4)
+    let column = builder.shift_right_logical(u32_type, None, lane, two)?;
+    let in_group = builder.bitwise_and(u32_type, None, lane, three)?;
+    let low_row = builder.i_add(u32_type, None, in_group, in_group)?;
+    let one_row = builder.i_add(u32_type, None, low_row, one.clone())?;
+    // The source thread of a value at (row, column) is 4 * row + column / 2,
+    // and the half it holds is column % 2.
+    let column_pair = builder.shift_right_logical(u32_type, None, column, one.clone())?;
+    let low_lane_base = builder.shift_left_logical(u32_type, None, low_row, two)?;
+    let low_source = builder.i_add(u32_type, None, low_lane_base, column_pair)?;
+    let high_lane_base = builder.shift_left_logical(u32_type, None, one_row, two)?;
+    let high_source = builder.i_add(u32_type, None, high_lane_base, column_pair)?;
+    let half = builder.bitwise_and(u32_type, None, column, one)?;
+    let shift = builder.shift_left_logical(u32_type, None, half, four)?;
+    let low_packed = builder.subgroup_shuffle_intel(b32_type, None, arg.src, low_source)?;
+    let high_packed = builder.subgroup_shuffle_intel(b32_type, None, arg.src, high_source)?;
+    let low_packed = builder.bitcast(u32_type, None, low_packed)?;
+    let high_packed = builder.bitcast(u32_type, None, high_packed)?;
+    let low = builder.shift_right_logical(u32_type, None, low_packed, shift)?;
+    let high = builder.shift_right_logical(u32_type, None, high_packed, shift)?;
+    let low = builder.bitwise_and(u32_type, None, low, mask)?;
+    let high = builder.bitwise_and(u32_type, None, high, mask)?;
+    let high = builder.shift_left_logical(u32_type, None, high, sixteen)?;
+    let joined = builder.bitwise_or(u32_type, None, low, high)?;
+    let result = builder.bitcast(b32_type, None, joined)?;
+    builder.copy_object(b32_type, Some(arg.dst), result)?;
+    Ok(())
+}
+
+fn emit_ldmatrix(
+    builder: &mut dr::Builder,
+    map: &mut TypeWordMap,
+    laneid: Option<spirv::Word>,
+    details: &ast::LdMatrixDetails,
+    arg: &ast::Arg2LdMatrix<ExpandedArgParams>,
+) -> Result<(), TranslateError> {
+    let laneid = laneid.ok_or(TranslateError::Todo)?;
+    let num = details.num as usize;
+    if num == 0 || num > 4 {
+        return Err(TranslateError::Todo);
+    }
+    let u32_type = map.get_or_add_scalar(builder, ast::ScalarType::U32);
+    let u64_type = map.get_or_add_scalar(builder, ast::ScalarType::U64);
+    let u16_type = map.get_or_add_scalar(builder, ast::ScalarType::U16);
+    let u8_ptr = map.get_or_add(
+        builder,
+        SpirvType::pointer_to(
+            ast::Type::Scalar(ast::ScalarType::B8),
+            spirv::StorageClass::Generic,
+        ),
+    );
+    let u32_ptr = map.get_or_add(
+        builder,
+        SpirvType::pointer_to(
+            ast::Type::Scalar(ast::ScalarType::B32),
+            spirv::StorageClass::Generic,
+        ),
+    );
+    let u16_ptr = map.get_or_add(
+        builder,
+        SpirvType::pointer_to(
+            ast::Type::Scalar(ast::ScalarType::B16),
+            spirv::StorageClass::Generic,
+        ),
+    );
+    let c1 = map.get_or_add_constant(
+        builder,
+        &ast::Type::Scalar(ast::ScalarType::U32),
+        &vec_repr(1u32),
+    )?;
+    let c2 = map.get_or_add_constant(
+        builder,
+        &ast::Type::Scalar(ast::ScalarType::U32),
+        &vec_repr(2u32),
+    )?;
+    let c3 = map.get_or_add_constant(
+        builder,
+        &ast::Type::Scalar(ast::ScalarType::U32),
+        &vec_repr(3u32),
+    )?;
+    let lane = builder.load(u32_type, None, laneid, None, [].iter().cloned())?;
+    // %lane / 4 and %lane % 4 select the row fragment and the pair of
+    // elements inside the row.
+    let lane_div4 = builder.shift_right_logical(u32_type, None, lane, c2)?;
+    let lane_mod4 = builder.bitwise_and(u32_type, None, lane, c3)?;
+    let mut fragments = Vec::with_capacity(num);
+    for i in 0..num {
+        let base = (8 * i) as u32;
+        let fragment = if details.trans {
+            // Row 2*(t%4) and 2*(t%4)+1, column t/4.
+            let mut doubles = builder.shift_left_logical(u32_type, None, lane_mod4, c1)?;
+            if base != 0 {
+                let offset = map.get_or_add_constant(
+                    builder,
+                    &ast::Type::Scalar(ast::ScalarType::U32),
+                    &vec_repr(base),
+                )?;
+                doubles = builder.i_add(u32_type, None, doubles, offset)?;
+            }
+            let next = builder.i_add(u32_type, None, doubles, c1)?;
+            let byte_offset = builder.shift_left_logical(u32_type, None, lane_div4, c1)?;
+            let byte_offset = builder.u_convert(u64_type, None, byte_offset)?;
+            let low = ldmatrix_load(
+                builder, map, arg.src, doubles, byte_offset, u64_type, u8_ptr, u16_ptr, u16_type,
+                2,
+            )?;
+            let low = builder.u_convert(u32_type, None, low)?;
+            let high = ldmatrix_load(
+                builder, map, arg.src, next, byte_offset, u64_type, u8_ptr, u16_ptr, u16_type, 2,
+            )?;
+            let high = builder.u_convert(u32_type, None, high)?;
+            let shift = map.get_or_add_constant(
+                builder,
+                &ast::Type::Scalar(ast::ScalarType::U32),
+                &vec_repr(16u32),
+            )?;
+            let high = builder.shift_left_logical(u32_type, None, high, shift)?;
+            builder.bitwise_or(u32_type, None, low, high)?
+        } else {
+            // Row t/4, columns 2*(t%4) and 2*(t%4)+1.
+            let mut src_lane = lane_div4;
+            if base != 0 {
+                let offset = map.get_or_add_constant(
+                    builder,
+                    &ast::Type::Scalar(ast::ScalarType::U32),
+                    &vec_repr(base),
+                )?;
+                src_lane = builder.i_add(u32_type, None, src_lane, offset)?;
+            }
+            let byte_offset = builder.shift_left_logical(u32_type, None, lane_mod4, c2)?;
+            let byte_offset = builder.u_convert(u64_type, None, byte_offset)?;
+            ldmatrix_load(
+                builder, map, arg.src, src_lane, byte_offset, u64_type, u8_ptr, u32_ptr, u32_type,
+                4,
+            )?
+        };
+        fragments.push(fragment);
+    }
+    if num == 1 {
+        // A single fragment register holds one 8x8 tile; there is no SPIR-V
+        // vector of one element.
+        let b32_type = map.get_or_add_scalar(builder, ast::ScalarType::B32);
+        builder.copy_object(b32_type, Some(arg.dst), fragments[0])?;
+    } else {
+        let vector_type =
+            map.get_or_add(builder, SpirvType::Vector(SpirvScalarKey::B32, num as u8));
+        builder.composite_construct(vector_type, Some(arg.dst), fragments.into_iter())?;
+    }
+    Ok(())
+}
+
+/// Read the elements of one matrix row from shared memory: the row address
+/// is held by `src_lane`, so it is fetched from there first.
+#[allow(clippy::too_many_arguments)]
+fn ldmatrix_load(
+    builder: &mut dr::Builder,
+    map: &mut TypeWordMap,
+    address: spirv::Word,
+    src_lane: spirv::Word,
+    byte_offset: spirv::Word,
+    u64_type: spirv::Word,
+    u8_ptr: spirv::Word,
+    element_ptr: spirv::Word,
+    result_type: spirv::Word,
+    element_size: u32,
+) -> Result<spirv::Word, TranslateError> {
+    // The shuffle is a 32-bit operation, so the 64-bit address travels as
+    // two halves.
+    let u32_type = map.get_or_add_scalar(builder, ast::ScalarType::U32);
+    let b32_type = map.get_or_add_scalar(builder, ast::ScalarType::B32);
+    // The linker of the OpenCL runtime requires the shift amount to have the
+    // same type as the shifted value.
+    let thirty_two = map.get_or_add_constant(
+        builder,
+        &ast::Type::Scalar(ast::ScalarType::U32),
+        &vec_repr(32u32),
+    )?;
+    let thirty_two_wide = map.get_or_add_constant(
+        builder,
+        &ast::Type::Scalar(ast::ScalarType::U64),
+        &vec_repr(32u64),
+    )?;
+    let low = builder.u_convert(u32_type, None, address)?;
+    let high = builder.shift_right_logical(u64_type, None, address, thirty_two_wide)?;
+    let high = builder.u_convert(u32_type, None, high)?;
+    let low = builder.subgroup_shuffle_intel(b32_type, None, low, src_lane)?;
+    let high = builder.subgroup_shuffle_intel(b32_type, None, high, src_lane)?;
+    let row = builder.u_convert(u64_type, None, high)?;
+    let row = builder.shift_left_logical(u64_type, None, row, thirty_two_wide)?;
+    let low = builder.u_convert(u64_type, None, low)?;
+    let row = builder.bitwise_or(u64_type, None, row, low)?;
+    let address = builder.i_add(u64_type, None, row, byte_offset)?;
+    let pointer = builder.convert_u_to_ptr(u8_ptr, None, address)?;
+    let pointer = builder.bitcast(element_ptr, None, pointer)?;
+    Ok(builder.load(
+        result_type,
+        None,
+        pointer,
+        Some(spirv::MemoryAccess::ALIGNED),
+        [dr::Operand::LiteralInt32(element_size)].iter().cloned(),
+    )?)
+}
+
 fn emit_sqrt(
     builder: &mut dr::Builder,
     map: &mut TypeWordMap,
@@ -3118,7 +5991,7 @@ fn emit_sqrt(
         ocl_op as spirv::Word,
         [dr::Operand::IdRef(a.src)].iter().cloned(),
     )?;
-    emit_rounding_decoration(builder, a.dst, rounding);
+    let _ = rounding;
     Ok(())
 }
 
@@ -3135,9 +6008,7 @@ fn emit_float_div_decoration(builder: &mut dr::Builder, dst: spirv::Word, kind: 
                 .cloned(),
             );
         }
-        ast::DivFloatKind::Rounding(rnd) => {
-            emit_rounding_decoration(builder, dst, Some(rnd));
-        }
+        ast::DivFloatKind::Rounding(_rnd) => {}
         ast::DivFloatKind::Full => {}
     }
 }
@@ -3185,6 +6056,7 @@ fn emit_atom(
         }
     };
     let result_type = map.get_or_add_scalar(builder, typ);
+    let src_ptr = arg.src1;
     let memory_const = map.get_or_add_constant(
         builder,
         &ast::Type::Scalar(ast::ScalarType::U32),
@@ -3199,7 +6071,7 @@ fn emit_atom(
         builder,
         result_type,
         Some(arg.dst),
-        arg.src1,
+        src_ptr,
         memory_const,
         semantics_const,
         arg.src2,
@@ -3214,18 +6086,80 @@ struct PtxImplImport {
     in_args: Vec<ast::Type>,
 }
 
+/// PTX ".sat" on a float arithmetic result clamps it to [0, 1].
+fn saturate_float_result(
+    builder: &mut dr::Builder,
+    map: &mut TypeWordMap,
+    opencl: spirv::Word,
+    value: spirv::Word,
+    typ: ast::ScalarType,
+) -> Result<spirv::Word, dr::Error> {
+    let clamp = |builder: &mut dr::Builder,
+                 result_type: spirv::Word|
+     -> Result<spirv::Word, dr::Error> {
+        let zero = builder.constant_f32(result_type, None, 0.0);
+        let one = builder.constant_f32(result_type, None, 1.0);
+        let clamped = builder.id();
+        builder.ext_inst(
+            result_type,
+            Some(clamped),
+            opencl,
+            spirv::CLOp::fclamp as u32,
+            [
+                dr::Operand::IdRef(value),
+                dr::Operand::IdRef(zero),
+                dr::Operand::IdRef(one),
+            ]
+            .iter()
+            .cloned(),
+        )?;
+        Ok(clamped)
+    };
+    match typ {
+        ast::ScalarType::F32 => {
+            let result_type = map.get_or_add_scalar(builder, ast::ScalarType::F32);
+            clamp(builder, result_type)
+        }
+        ast::ScalarType::F16 => {
+            // Clamp in single precision, which needs no half constant.
+            let f32_type = map.get_or_add_scalar(builder, ast::ScalarType::F32);
+            let wide = builder.f_convert(f32_type, None, value)?;
+            let clamped = clamp(builder, f32_type)?;
+            let half_type = map.get_or_add_scalar(builder, ast::ScalarType::F16);
+            Ok(builder.f_convert(half_type, None, clamped)?)
+        }
+        _ => Ok(value),
+    }
+}
+
 fn emit_mul_float(
     builder: &mut dr::Builder,
     map: &mut TypeWordMap,
+    opencl: spirv::Word,
     ctr: &ast::ArithFloat,
     arg: &ast::Arg3<ExpandedArgParams>,
 ) -> Result<(), dr::Error> {
-    if ctr.saturate {
-        todo!()
+    // A packed pair of halves is a vector of two halves, not a scalar.
+    let result_type = map.get_or_add(builder, SpirvType::from(ctr.typ));
+    if needs_wide_rounding(ast::Type::Scalar(ctr.typ), ctr.rounding) {
+        return emit_rounded_float(
+            builder,
+            map,
+            opencl,
+            RoundedFloatOp::Mul,
+            ctr.rounding,
+            arg.dst,
+            arg.src1,
+            arg.src2,
+        );
     }
-    let result_type = map.get_or_add_scalar(builder, ctr.typ.into());
+    if ctr.saturate {
+        let product = builder.f_mul(result_type, None, arg.src1, arg.src2)?;
+        let saturated = saturate_float_result(builder, map, opencl, product, ctr.typ)?;
+        builder.copy_object(result_type, Some(arg.dst), saturated)?;
+        return Ok(());
+    }
     builder.f_mul(result_type, Some(arg.dst), arg.src1, arg.src2)?;
-    emit_rounding_decoration(builder, arg.dst, ctr.rounding);
     Ok(())
 }
 
@@ -3243,16 +6177,19 @@ fn emit_rcp(
     let one = map.get_or_add_constant(builder, &ast::Type::Scalar(instr_type), &constant)?;
     let result_type = map.get_or_add_scalar(builder, instr_type);
     builder.f_div(result_type, Some(a.dst), one, a.src)?;
-    emit_rounding_decoration(builder, a.dst, desc.rounding);
-    builder.decorate(
-        a.dst,
-        spirv::Decoration::FPFastMathMode,
-        [dr::Operand::FPFastMathMode(
-            spirv::FPFastMathMode::ALLOW_RECIP,
-        )]
-        .iter()
-        .cloned(),
-    );
+    if desc.rounding.is_none() {
+        // Only the approximate form may be compiled as a reciprocal estimate;
+        // rcp.rn promises the correctly rounded quotient.
+        builder.decorate(
+            a.dst,
+            spirv::Decoration::FPFastMathMode,
+            [dr::Operand::FPFastMathMode(
+                spirv::FPFastMathMode::ALLOW_RECIP,
+            )]
+            .iter()
+            .cloned(),
+        );
+    }
     Ok(())
 }
 
@@ -3329,7 +6266,16 @@ fn emit_mad_uint(
                 .cloned(),
             )?;
         }
-        ast::MulIntControl::Wide => todo!(),
+        ast::MulIntControl::Wide => {
+            // mad.wide.u32 d, a, b, c: the product is 64 bits wide and c is
+            // added to it without truncation.
+            let wide_type = map.get_or_add_scalar(builder, ast::ScalarType::U64);
+            let a = builder.u_convert(wide_type, None, arg.src1)?;
+            let b = builder.u_convert(wide_type, None, arg.src2)?;
+            let product = builder.i_mul(wide_type, None, a, b)?;
+            let c = builder.u_convert(wide_type, None, arg.src3)?;
+            builder.i_add(wide_type, Some(arg.dst), product, c)?;
+        }
     };
     Ok(())
 }
@@ -3362,7 +6308,14 @@ fn emit_mad_sint(
                 .cloned(),
             )?;
         }
-        ast::MulIntControl::Wide => todo!(),
+        ast::MulIntControl::Wide => {
+            let wide_type = map.get_or_add_scalar(builder, ast::ScalarType::S64);
+            let a = builder.s_convert(wide_type, None, arg.src1)?;
+            let b = builder.s_convert(wide_type, None, arg.src2)?;
+            let product = builder.i_mul(wide_type, None, a, b)?;
+            let c = builder.s_convert(wide_type, None, arg.src3)?;
+            builder.i_add(wide_type, Some(arg.dst), product, c)?;
+        }
     };
     Ok(())
 }
@@ -3375,6 +6328,36 @@ fn emit_mad_float(
     arg: &ast::Arg4<ExpandedArgParams>,
 ) -> Result<(), dr::Error> {
     let inst_type = map.get_or_add(builder, SpirvType::from(ast::ScalarType::from(desc.typ)));
+    if needs_wide_rounding(ast::Type::Scalar(desc.typ), desc.rounding) {
+        return emit_rounded_float(
+            builder,
+            map,
+            opencl,
+            RoundedFloatOp::Mad(arg.src3),
+            desc.rounding,
+            arg.dst,
+            arg.src1,
+            arg.src2,
+        );
+    }
+    if desc.saturate {
+        let product = builder.ext_inst(
+            inst_type,
+            None,
+            opencl,
+            spirv::CLOp::fma as spirv::Word,
+            [
+                dr::Operand::IdRef(arg.src1),
+                dr::Operand::IdRef(arg.src2),
+                dr::Operand::IdRef(arg.src3),
+            ]
+            .iter()
+            .cloned(),
+        )?;
+        let saturated = saturate_float_result(builder, map, opencl, product, desc.typ)?;
+        builder.copy_object(inst_type, Some(arg.dst), saturated)?;
+        return Ok(());
+    }
     builder.ext_inst(
         inst_type,
         Some(arg.dst),
@@ -3394,24 +6377,60 @@ fn emit_mad_float(
 fn emit_add_float(
     builder: &mut dr::Builder,
     map: &mut TypeWordMap,
+    opencl: spirv::Word,
     desc: &ast::ArithFloat,
     arg: &ast::Arg3<ExpandedArgParams>,
 ) -> Result<(), dr::Error> {
     let inst_type = map.get_or_add(builder, SpirvType::from(ast::ScalarType::from(desc.typ)));
+    if needs_wide_rounding(ast::Type::Scalar(desc.typ), desc.rounding) {
+        return emit_rounded_float(
+            builder,
+            map,
+            opencl,
+            RoundedFloatOp::Add,
+            desc.rounding,
+            arg.dst,
+            arg.src1,
+            arg.src2,
+        );
+    }
+    if desc.saturate {
+        let add = builder.f_add(inst_type, None, arg.src1, arg.src2)?;
+        let saturated = saturate_float_result(builder, map, opencl, add, desc.typ)?;
+        builder.copy_object(inst_type, Some(arg.dst), saturated)?;
+        return Ok(());
+    }
     builder.f_add(inst_type, Some(arg.dst), arg.src1, arg.src2)?;
-    emit_rounding_decoration(builder, arg.dst, desc.rounding);
     Ok(())
 }
 
 fn emit_sub_float(
     builder: &mut dr::Builder,
     map: &mut TypeWordMap,
+    opencl: spirv::Word,
     desc: &ast::ArithFloat,
     arg: &ast::Arg3<ExpandedArgParams>,
 ) -> Result<(), dr::Error> {
     let inst_type = map.get_or_add(builder, SpirvType::from(ast::ScalarType::from(desc.typ)));
+    if needs_wide_rounding(ast::Type::Scalar(desc.typ), desc.rounding) {
+        return emit_rounded_float(
+            builder,
+            map,
+            opencl,
+            RoundedFloatOp::Sub,
+            desc.rounding,
+            arg.dst,
+            arg.src1,
+            arg.src2,
+        );
+    }
+    if desc.saturate {
+        let sub = builder.f_sub(inst_type, None, arg.src1, arg.src2)?;
+        let saturated = saturate_float_result(builder, map, opencl, sub, desc.typ)?;
+        builder.copy_object(inst_type, Some(arg.dst), saturated)?;
+        return Ok(());
+    }
     builder.f_sub(inst_type, Some(arg.dst), arg.src1, arg.src2)?;
-    emit_rounding_decoration(builder, arg.dst, desc.rounding);
     Ok(())
 }
 
@@ -3471,84 +6490,202 @@ fn emit_cvt(
     opencl: spirv::Word,
     dets: &ast::CvtDetails,
     arg: &ast::Arg2<ExpandedArgParams>,
-) -> Result<(), TranslateError> {
+    ) -> Result<(), TranslateError> {
     match dets {
         ast::CvtDetails::FloatFromFloat(desc) => {
-            if desc.saturate {
-                todo!()
+            // bfloat16 has no SPIR-V type: the conversion is done on the bit
+            // pattern. A bf16 value is the upper 16 bits of an f32.
+            if desc.dst == ast::ScalarType::B16 && desc.src == ast::ScalarType::F32 {
+                // f32 -> bf16: round to nearest even, then keep the upper half.
+                let u32_type = map.get_or_add_scalar(builder, ast::ScalarType::U32);
+                let bits = builder.bitcast(u32_type, None, arg.src)?;
+                let rounding = map.get_or_add_constant(
+                    builder,
+                    &ast::Type::Scalar(ast::ScalarType::U32),
+                    &vec_repr(0x7fffu32),
+                )?;
+                // Round to nearest even: the bias is half of the part that is
+                // dropped, plus the low bit of the kept part (so that a tie
+                // goes to the even value).
+                let shift = map.get_or_add_constant(
+                    builder,
+                    &ast::Type::Scalar(ast::ScalarType::U32),
+                    &vec_repr(16u32),
+                )?;
+                let one = map.get_or_add_constant(
+                    builder,
+                    &ast::Type::Scalar(ast::ScalarType::U32),
+                    &vec_repr(1u32),
+                )?;
+                let kept = builder.shift_right_logical(u32_type, None, bits, shift)?;
+                let lsb = builder.bitwise_and(u32_type, None, kept, one)?;
+                let biased = builder.i_add(u32_type, None, bits, rounding)?;
+                let biased = builder.i_add(u32_type, None, biased, lsb)?;
+                let high = builder.shift_right_logical(u32_type, None, biased, shift)?;
+                let b16_type = map.get_or_add_scalar(builder, ast::ScalarType::B16);
+                let high = builder.u_convert(b16_type, None, high)?;
+                builder.copy_object(b16_type, Some(arg.dst), high)?;
+                return Ok(());
             }
-            let dest_t: ast::ScalarType = desc.dst.into();
-            let result_type = map.get_or_add(builder, SpirvType::from(dest_t));
-            if desc.dst == desc.src {
-                match desc.rounding {
-                    Some(ast::RoundingMode::NearestEven) => {
-                        builder.ext_inst(
-                            result_type,
-                            Some(arg.dst),
-                            opencl,
-                            spirv::CLOp::rint as u32,
-                            [dr::Operand::IdRef(arg.src)].iter().cloned(),
-                        )?;
+            if desc.dst == ast::ScalarType::F32 && desc.src == ast::ScalarType::B16 {
+                // bf16 -> f32: the value is the upper half of an f32.
+                let u32_type = map.get_or_add_scalar(builder, ast::ScalarType::U32);
+                let b16_type = map.get_or_add_scalar(builder, ast::ScalarType::B16);
+                let bits = builder.u_convert(u32_type, None, arg.src)?;
+                let shift = map.get_or_add_constant(
+                    builder,
+                    &ast::Type::Scalar(ast::ScalarType::U32),
+                    &vec_repr(16u32),
+                )?;
+                let bits = builder.shift_left_logical(u32_type, None, bits, shift)?;
+                let f32_type = map.get_or_add_scalar(builder, ast::ScalarType::F32);
+                let value = builder.bitcast(f32_type, None, bits)?;
+                builder.copy_object(f32_type, Some(arg.dst), value)?;
+                return Ok(());
+            }
+            if desc.saturate {
+                if desc.dst == desc.src {
+                    let ty_id = map.get_or_add(builder, SpirvType::from(desc.dst));
+                    let zero = builder.constant_f32(ty_id, None, 0.0);
+                    let one = builder.constant_f32(ty_id, None, 1.0);
+                    let dest_t: ast::ScalarType = desc.dst.into();
+                    let result_type = map.get_or_add(builder, SpirvType::from(dest_t));
+                    let clamped = builder.id();
+                    builder.ext_inst(
+                        result_type,
+                        Some(clamped),
+                        opencl,
+                        spirv::CLOp::fclamp as u32,
+                        [
+                            dr::Operand::IdRef(arg.src),
+                            dr::Operand::IdRef(zero),
+                            dr::Operand::IdRef(one),
+                        ]
+                        .iter()
+                        .cloned(),
+                    )?;
+                    builder.copy_object(result_type, Some(arg.dst), clamped)?;
+                    if std::env::var_os("ZLUDA_PTX_DISABLE_SAT").is_some() {
+                        return Ok(());
                     }
-                    Some(ast::RoundingMode::Zero) => {
-                        builder.ext_inst(
-                            result_type,
-                            Some(arg.dst),
-                            opencl,
-                            spirv::CLOp::trunc as u32,
-                            [dr::Operand::IdRef(arg.src)].iter().cloned(),
-                        )?;
-                    }
-                    Some(ast::RoundingMode::NegativeInf) => {
-                        builder.ext_inst(
-                            result_type,
-                            Some(arg.dst),
-                            opencl,
-                            spirv::CLOp::floor as u32,
-                            [dr::Operand::IdRef(arg.src)].iter().cloned(),
-                        )?;
-                    }
-                    Some(ast::RoundingMode::PositiveInf) => {
-                        builder.ext_inst(
-                            result_type,
-                            Some(arg.dst),
-                            opencl,
-                            spirv::CLOp::ceil as u32,
-                            [dr::Operand::IdRef(arg.src)].iter().cloned(),
-                        )?;
-                    }
-                    None => {
-                        builder.copy_object(result_type, Some(arg.dst), arg.src)?;
-                    }
+                } else {
+                    // f64->f32 or f32->f64 with saturate: clamp [0,1] then convert
+                    let dest_t: ast::ScalarType = desc.dst.into();
+                    let src_t: ast::ScalarType = desc.src.into();
+                    let src_type = map.get_or_add(builder, SpirvType::from(src_t));
+                    let zero = builder.constant_f64(src_type, None, 0.0);
+                    let one = builder.constant_f64(src_type, None, 1.0);
+                    let clamped = builder.id();
+                    builder.ext_inst(
+                        src_type,
+                        Some(clamped),
+                        opencl,
+                        spirv::CLOp::fclamp as u32,
+                        [
+                            dr::Operand::IdRef(arg.src),
+                            dr::Operand::IdRef(zero),
+                            dr::Operand::IdRef(one),
+                        ]
+                        .iter()
+                        .cloned(),
+                    )?;
+                    let result_type = map.get_or_add(builder, SpirvType::from(dest_t));
+                    builder.f_convert(result_type, Some(arg.dst), clamped)?;
+                    emit_rounding_decoration(builder, arg.dst, desc.rounding);
                 }
             } else {
-                builder.f_convert(result_type, Some(arg.dst), arg.src)?;
-                emit_rounding_decoration(builder, arg.dst, desc.rounding);
+                let dest_t: ast::ScalarType = desc.dst.into();
+                let result_type = map.get_or_add(builder, SpirvType::from(dest_t));
+                if desc.dst == desc.src {
+                    match desc.rounding {
+                        Some(ast::RoundingMode::NearestEven) => {
+                            builder.ext_inst(
+                                result_type,
+                                Some(arg.dst),
+                                opencl,
+                                spirv::CLOp::rint as u32,
+                                [dr::Operand::IdRef(arg.src)].iter().cloned(),
+                            )?;
+                        }
+                        Some(ast::RoundingMode::Zero) => {
+                            builder.ext_inst(
+                                result_type,
+                                Some(arg.dst),
+                                opencl,
+                                spirv::CLOp::trunc as u32,
+                                [dr::Operand::IdRef(arg.src)].iter().cloned(),
+                            )?;
+                        }
+                        Some(ast::RoundingMode::NegativeInf) => {
+                            builder.ext_inst(
+                                result_type,
+                                Some(arg.dst),
+                                opencl,
+                                spirv::CLOp::floor as u32,
+                                [dr::Operand::IdRef(arg.src)].iter().cloned(),
+                            )?;
+                        }
+                        Some(ast::RoundingMode::PositiveInf) => {
+                            builder.ext_inst(
+                                result_type,
+                                Some(arg.dst),
+                                opencl,
+                                spirv::CLOp::ceil as u32,
+                                [dr::Operand::IdRef(arg.src)].iter().cloned(),
+                            )?;
+                        }
+                        None => {
+                            builder.copy_object(result_type, Some(arg.dst), arg.src)?;
+                        }
+                    }
+                } else {
+                    let converted = builder.f_convert(result_type, None, arg.src)?;
+                    emit_rounding_decoration(builder, converted, desc.rounding);
+                    builder.copy_object(result_type, Some(arg.dst), converted)?;
+                }
             }
         }
         ast::CvtDetails::FloatFromInt(desc) => {
-            if desc.saturate {
-                todo!()
-            }
             let dest_t: ast::ScalarType = desc.dst.into();
             let result_type = map.get_or_add(builder, SpirvType::from(dest_t));
-            if desc.src.kind() == ast::ScalarKind::Signed {
-                builder.convert_s_to_f(result_type, Some(arg.dst), arg.src)?;
+            let converted = if desc.src.kind() == ast::ScalarKind::Signed {
+                builder.convert_s_to_f(result_type, None, arg.src)?
             } else {
-                builder.convert_u_to_f(result_type, Some(arg.dst), arg.src)?;
+                builder.convert_u_to_f(result_type, None, arg.src)?
+            };
+            emit_rounding_decoration(builder, converted, desc.rounding);
+            if desc.saturate && dest_t == ast::ScalarType::F32 {
+                // "cvt.sat.f32.s32" clamps the result to [0, 1].
+                let zero = builder.constant_f32(result_type, None, 0.0);
+                let one = builder.constant_f32(result_type, None, 1.0);
+                builder.ext_inst(
+                    result_type,
+                    Some(arg.dst),
+                    opencl,
+                    spirv::CLOp::fclamp as u32,
+                    [
+                        dr::Operand::IdRef(converted),
+                        dr::Operand::IdRef(zero),
+                        dr::Operand::IdRef(one),
+                    ]
+                    .iter()
+                    .cloned(),
+                )?;
+            } else {
+                builder.copy_object(result_type, Some(arg.dst), converted)?;
             }
-            emit_rounding_decoration(builder, arg.dst, desc.rounding);
         }
         ast::CvtDetails::IntFromFloat(desc) => {
             let dest_t: ast::ScalarType = desc.dst.into();
             let result_type = map.get_or_add(builder, SpirvType::from(dest_t));
-            if desc.dst.kind() == ast::ScalarKind::Signed {
-                builder.convert_f_to_s(result_type, Some(arg.dst), arg.src)?;
+            let converted = if desc.dst.kind() == ast::ScalarKind::Signed {
+                builder.convert_f_to_s(result_type, None, arg.src)?
             } else {
-                builder.convert_f_to_u(result_type, Some(arg.dst), arg.src)?;
-            }
-            emit_rounding_decoration(builder, arg.dst, desc.rounding);
-            emit_saturating_decoration(builder, arg.dst, desc.saturate);
+                builder.convert_f_to_u(result_type, None, arg.src)?
+            };
+            emit_rounding_decoration(builder, converted, desc.rounding);
+            emit_saturating_decoration(builder, converted, desc.saturate);
+            builder.copy_object(result_type, Some(arg.dst), converted)?;
         }
         ast::CvtDetails::IntFromInt(desc) => {
             let dest_t: ast::ScalarType = desc.dst.into();
@@ -3596,12 +6733,90 @@ fn emit_cvt(
     Ok(())
 }
 
+/// The arithmetic operations that PTX allows a rounding mode on.
+enum RoundedFloatOp {
+    Add,
+    Sub,
+    Mul,
+    /// A fused multiply-add, with the addend.
+    Mad(spirv::Word),
+}
+
+/// Whether a floating-point operation has to be evaluated in double precision
+/// to honour its rounding mode.
+///
+/// SPIR-V has no rounding-mode operand on the arithmetic instructions, only
+/// the FPRoundingMode decoration on a result, and the backend honours that
+/// decoration on conversions but ignores it everywhere else: an `add.rz`
+/// comes out rounded to nearest, which is silent corruption of anything that
+/// depends on the direction. Double precision has enough bits for the product
+/// of two floats to be exact and for the sum of a product and an addend to be
+/// exact whenever their exponents are no more than twenty-nine apart, so the
+/// operation is evaluated there and only the conversion back needs the mode.
+///
+/// A double precision operation with a rounding mode of its own has no wider
+/// type to go to, so those keep the nearest-even behaviour; nothing emits one.
+fn needs_wide_rounding(typ: ast::Type, rounding: Option<ast::RoundingMode>) -> bool {
+    match rounding {
+        None | Some(ast::RoundingMode::NearestEven) => false,
+        Some(_) => matches!(typ, ast::Type::Scalar(ast::ScalarType::F32)),
+    }
+}
+
+fn emit_rounded_float(
+    builder: &mut dr::Builder,
+    map: &mut TypeWordMap,
+    opencl: spirv::Word,
+    op: RoundedFloatOp,
+    rounding: Option<ast::RoundingMode>,
+    dst: spirv::Word,
+    src1: spirv::Word,
+    src2: spirv::Word,
+) -> Result<(), dr::Error> {
+    let f64_type = map.get_or_add_scalar(builder, ast::ScalarType::F64);
+    let f32_type = map.get_or_add_scalar(builder, ast::ScalarType::F32);
+    let a = builder.f_convert(f64_type, None, src1)?;
+    let b = builder.f_convert(f64_type, None, src2)?;
+    let wide = match op {
+        RoundedFloatOp::Add => builder.f_add(f64_type, None, a, b)?,
+        RoundedFloatOp::Sub => builder.f_sub(f64_type, None, a, b)?,
+        RoundedFloatOp::Mul => builder.f_mul(f64_type, None, a, b)?,
+        RoundedFloatOp::Mad(addend) => {
+            let c = builder.f_convert(f64_type, None, addend)?;
+            builder.ext_inst(
+                f64_type,
+                None,
+                opencl,
+                spirv::CLOp::fma as spirv::Word,
+                [
+                    dr::Operand::IdRef(a),
+                    dr::Operand::IdRef(b),
+                    dr::Operand::IdRef(c),
+                ]
+                .iter()
+                .cloned(),
+            )?
+        }
+    };
+    // The conversion is the only instruction the backend rounds as asked, and
+    // the decoration has to sit on its own result.
+    let converted = builder.id();
+    builder.f_convert(f32_type, Some(converted), wide)?;
+    emit_rounding_decoration(builder, converted, rounding);
+    builder.copy_object(f32_type, Some(dst), converted)?;
+    Ok(())
+}
+
 fn emit_saturating_decoration(builder: &mut dr::Builder, dst: u32, saturate: bool) {
     if saturate {
         builder.decorate(dst, spirv::Decoration::SaturatedConversion, iter::empty());
     }
 }
 
+// SPIR-V only allows the FPRoundingMode decoration on a conversion
+// instruction, so it is applied to the temporary that the conversion
+// defines. A PTX register can be written by several instructions, so the
+// register itself is not always defined by the conversion.
 fn emit_rounding_decoration(
     builder: &mut dr::Builder,
     dst: spirv::Word,
@@ -3771,25 +6986,16 @@ fn emit_mul_sint(
             )?;
         }
         ast::MulIntControl::Wide => {
-            let mul_ext_type = SpirvType::Struct(vec![
-                SpirvScalarKey::from(instruction_type),
-                SpirvScalarKey::from(instruction_type),
-            ]);
-            let mul_ext_type_id = map.get_or_add(builder, mul_ext_type);
-            let mul = builder.s_mul_extended(mul_ext_type_id, None, arg.src1, arg.src2)?;
             let instr_width = instruction_type.size_of();
             let instr_kind = instruction_type.kind();
             let dst_type = ast::ScalarType::from_parts(instr_width * 2, instr_kind);
             let dst_type_id = map.get_or_add_scalar(builder, dst_type);
-            struct2_bitcast_to_wide(
-                builder,
-                map,
-                SpirvScalarKey::from(instruction_type),
-                inst_type,
-                arg.dst,
-                dst_type_id,
-                mul,
-            )?;
+            // PTX mul.wide.{s,u}32 computes the full 64-bit product. IGC does not
+            // provide __spirv_{S,U}MulExtended intrinsics, so widen the operands
+            // to 64 bits (sign/zero extend) and multiply in 64-bit.
+            let src1_wide = builder.s_convert(dst_type_id, None, arg.src1)?;
+            let src2_wide = builder.s_convert(dst_type_id, None, arg.src2)?;
+            builder.i_mul(dst_type_id, Some(arg.dst), src1_wide, src2_wide)?;
         }
     }
     Ok(())
@@ -3820,25 +7026,14 @@ fn emit_mul_uint(
             )?;
         }
         ast::MulIntControl::Wide => {
-            let mul_ext_type = SpirvType::Struct(vec![
-                SpirvScalarKey::from(instruction_type),
-                SpirvScalarKey::from(instruction_type),
-            ]);
-            let mul_ext_type_id = map.get_or_add(builder, mul_ext_type);
-            let mul = builder.u_mul_extended(mul_ext_type_id, None, arg.src1, arg.src2)?;
             let instr_width = instruction_type.size_of();
             let instr_kind = instruction_type.kind();
             let dst_type = ast::ScalarType::from_parts(instr_width * 2, instr_kind);
             let dst_type_id = map.get_or_add_scalar(builder, dst_type);
-            struct2_bitcast_to_wide(
-                builder,
-                map,
-                SpirvScalarKey::from(instruction_type),
-                inst_type,
-                arg.dst,
-                dst_type_id,
-                mul,
-            )?;
+            // Zero-extend to 64-bit and multiply: full 64-bit unsigned product.
+            let src1_wide = builder.u_convert(dst_type_id, None, arg.src1)?;
+            let src2_wide = builder.u_convert(dst_type_id, None, arg.src2)?;
+            builder.i_mul(dst_type_id, Some(arg.dst), src1_wide, src2_wide)?;
         }
     }
     Ok(())
@@ -3890,14 +7085,31 @@ fn emit_abs(
 fn emit_add_int(
     builder: &mut dr::Builder,
     map: &mut TypeWordMap,
+    opencl: spirv::Word,
     typ: ast::ScalarType,
     saturate: bool,
     arg: &ast::Arg3<ExpandedArgParams>,
 ) -> Result<(), dr::Error> {
-    if saturate {
-        todo!()
-    }
     let inst_type = map.get_or_add(builder, SpirvType::from(ast::ScalarType::from(typ)));
+    if saturate {
+        // The saturating add is the OpenCL one: it clamps to the range of the
+        // type instead of wrapping, for every width.
+        let op = if typ.kind() == ast::ScalarKind::Signed {
+            spirv::CLOp::s_add_sat
+        } else {
+            spirv::CLOp::u_add_sat
+        };
+        builder.ext_inst(
+            inst_type,
+            Some(arg.dst),
+            opencl,
+            op as spirv::Word,
+            [dr::Operand::IdRef(arg.src1), dr::Operand::IdRef(arg.src2)]
+                .iter()
+                .cloned(),
+        )?;
+        return Ok(());
+    }
     builder.i_add(inst_type, Some(arg.dst), arg.src1, arg.src2)?;
     Ok(())
 }
@@ -3905,14 +7117,29 @@ fn emit_add_int(
 fn emit_sub_int(
     builder: &mut dr::Builder,
     map: &mut TypeWordMap,
+    opencl: spirv::Word,
     typ: ast::ScalarType,
     saturate: bool,
     arg: &ast::Arg3<ExpandedArgParams>,
 ) -> Result<(), dr::Error> {
-    if saturate {
-        todo!()
-    }
     let inst_type = map.get_or_add(builder, SpirvType::from(ast::ScalarType::from(typ)));
+    if saturate {
+        let op = if typ.kind() == ast::ScalarKind::Signed {
+            spirv::CLOp::s_sub_sat
+        } else {
+            spirv::CLOp::u_sub_sat
+        };
+        builder.ext_inst(
+            inst_type,
+            Some(arg.dst),
+            opencl,
+            op as spirv::Word,
+            [dr::Operand::IdRef(arg.src1), dr::Operand::IdRef(arg.src2)]
+                .iter()
+                .cloned(),
+        )?;
+        return Ok(());
+    }
     builder.i_sub(inst_type, Some(arg.dst), arg.src1, arg.src2)?;
     Ok(())
 }
@@ -3930,20 +7157,54 @@ fn emit_implicit_conversion(
                 builder,
                 SpirvType::pointer_to(cv.to_type.clone(), cv.to_space.to_spirv()),
             );
-            builder.convert_u_to_ptr(dst_type, Some(cv.dst), cv.src)?;
+            // BitToPtr in 64-bit PTX converts a pointer-sized value (int or
+            // pointer) to a pointer. OpConvertUToPtr requires an int operand;
+            // when the source is already a pointer (e.g. after byte-pointer
+            // arithmetic rewrites) OpBitcast across storage classes is the only
+            // legal form.
+            if from_parts.kind == TypeKind::Scalar {
+                // PTX treats the address of a symbol as a generic one, and
+                // arithmetic on it keeps it generic, so a number that names a
+                // shared or a local address arrives here as a generic address
+                // and has to be cast into the space the access names.
+                let space = cv.to_space.to_spirv();
+                if space == spirv::StorageClass::Generic
+                    || space == spirv::StorageClass::CrossWorkgroup
+                {
+                    builder.convert_u_to_ptr(dst_type, Some(cv.dst), cv.src)?;
+                } else {
+                    let generic_type = map.get_or_add(
+                        builder,
+                        SpirvType::pointer_to(cv.to_type.clone(), spirv::StorageClass::Generic),
+                    );
+                    let generic = builder.convert_u_to_ptr(generic_type, None, cv.src)?;
+                    builder.generic_cast_to_ptr(dst_type, Some(cv.dst), generic)?;
+                }
+            } else {
+                builder.bitcast(dst_type, Some(cv.dst), cv.src)?;
+            }
         }
         (TypeKind::Scalar, TypeKind::Scalar, &ConversionKind::Default) => {
             if from_parts.width == to_parts.width {
                 let dst_type = map.get_or_add(builder, SpirvType::new(cv.to_type.clone()));
-                if from_parts.scalar_kind != ast::ScalarKind::Float
-                    && to_parts.scalar_kind != ast::ScalarKind::Float
-                {
-                    // It is noop, but another instruction expects result of this conversion
+                // A packed pair of halves lives in a 32-bit register: only its
+                // bit pattern matters, so it is reinterpreted and not
+                // converted.
+                let float_kind = |kind: ast::ScalarKind| {
+                    kind == ast::ScalarKind::Float || kind == ast::ScalarKind::Float2
+                };
+                if !float_kind(from_parts.scalar_kind) && !float_kind(to_parts.scalar_kind) {
                     builder.copy_object(dst_type, Some(cv.dst), cv.src)?;
                 } else {
                     builder.bitcast(dst_type, Some(cv.dst), cv.src)?;
                 }
             } else {
+                if std::env::var_os("ZLUDA_TRACE_PTX").is_some() {
+                    eprintln!(
+                        "conversion: from width={}, to width={}",
+                        from_parts.width, to_parts.width
+                    );
+                }
                 // This block is safe because it's illegal to implictly convert between floating point values
                 let same_width_bit_type = map.get_or_add(
                     builder,
@@ -3989,6 +7250,20 @@ fn emit_implicit_conversion(
                 }
             }
         }
+        (TypeKind::Scalar, TypeKind::Scalar, &ConversionKind::Truncate) => {
+            if std::env::var_os("ZLUDA_TRACE_PTX").is_some() {
+                eprintln!(
+                    "truncate: from width={} to width={}",
+                    cv.from_type.size_of(),
+                    cv.to_type.size_of()
+                );
+            }
+            // The instruction wants a narrower value than the register holds:
+            // keep the low bits. An 8-bit value lives in the low byte of a
+            // 16-bit register in PTX.
+            let result_type = map.get_or_add(builder, SpirvType::new(cv.to_type.clone()));
+            builder.u_convert(result_type, Some(cv.dst), cv.src)?;
+        }
         (TypeKind::Scalar, TypeKind::Scalar, &ConversionKind::SignExtend) => {
             let result_type = map.get_or_add(builder, SpirvType::new(cv.to_type.clone()));
             builder.s_convert(result_type, Some(cv.dst), cv.src)?;
@@ -4011,19 +7286,165 @@ fn emit_implicit_conversion(
         }
         (_, _, &ConversionKind::AddressOf) => {
             let dst_type = map.get_or_add(builder, SpirvType::new(cv.to_type.clone()));
-            builder.convert_ptr_to_u(dst_type, Some(cv.dst), cv.src)?;
+            let address = generic_address(builder, map, cv.src, &cv.from_type, cv.from_space)?;
+            builder.convert_ptr_to_u(dst_type, Some(cv.dst), address)?;
+        }
+        // A 64-bit value and a pair of 32-bit values hold the same bits
+        // (`mov.b64 {%r0,%r1}, %rd2;`). SPIR-V cannot bitcast between a
+        // scalar and a vector, so the halves are moved explicitly.
+        (TypeKind::Vector, TypeKind::Scalar, &ConversionKind::Default)
+            if cv.from_type.size_of() == cv.to_type.size_of() =>
+        {
+            // The source is a pair of 32-bit values; join them into the
+            // 64-bit value the destination expects.
+            let elem_type = match cv.from_type {
+                ast::Type::Vector(scalar_t, _) => scalar_t,
+                _ => unreachable!(),
+            };
+            let vector_type = map.get_or_add(
+                builder,
+                SpirvType::Vector(SpirvScalarKey::from(elem_type), 2),
+            );
+            let scalar_type = map.get_or_add(builder, SpirvType::new(ast::Type::Scalar(elem_type)));
+            let wide_type = map.get_or_add(builder, SpirvType::new(cv.to_type.clone()));
+            // The pieces are integers of the element's width: a packed pair
+            // of half precision values is put together out of two 16-bit
+            // pieces, a pair of 32-bit values out of two 32-bit ones.
+            let elem_bits = elem_type.size_of() as u32 * 8;
+            let int_elem_type = map.get_or_add_scalar(
+                builder,
+                match elem_bits {
+                    16 => ast::ScalarType::U16,
+                    _ => ast::ScalarType::U32,
+                },
+            );
+            let low = builder.composite_extract(scalar_type, None, cv.src, [0].iter().copied())?;
+            let high = builder.composite_extract(scalar_type, None, cv.src, [1].iter().copied())?;
+            // A half precision piece is an integer in the register; only its
+            // bit pattern matters.
+            let low = if scalar_type == int_elem_type {
+                low
+            } else {
+                builder.bitcast(int_elem_type, None, low)?
+            };
+            let high = if scalar_type == int_elem_type {
+                high
+            } else {
+                builder.bitcast(int_elem_type, None, high)?
+            };
+            let low64 = builder.u_convert(wide_type, None, low)?;
+            let high64 = builder.u_convert(wide_type, None, high)?;
+            let shift = map.get_or_add_constant(
+                builder,
+                &ast::Type::Scalar(ast::ScalarType::U64),
+                &vec_repr(elem_bits as u64),
+            )?;
+            let high_shifted = builder.shift_left_logical(wide_type, None, high64, shift)?;
+            let joined = builder.bitwise_or(wide_type, None, low64, high_shifted)?;
+            let result_type = map.get_or_add(builder, SpirvType::new(cv.to_type.clone()));
+            builder.copy_object(result_type, Some(cv.dst), joined)?;
+            let _ = vector_type;
+        }
+        (TypeKind::Scalar, TypeKind::Vector, &ConversionKind::Default)
+            if cv.from_type.size_of() == cv.to_type.size_of() =>
+        {
+            // Split the 64-bit scalar into its two 32-bit halves.
+            let elem_type = match cv.to_type {
+                ast::Type::Vector(scalar_t, _) => scalar_t,
+                _ => unreachable!(),
+            };
+            let scalar_type = map.get_or_add(builder, SpirvType::new(ast::Type::Scalar(elem_type)));
+            let vector_type = map.get_or_add(
+                builder,
+                SpirvType::Vector(SpirvScalarKey::from(elem_type), 2),
+            );
+            // The source is a wider value; work in its width and cut the
+            // halves out of it. The halves are integers of the element's
+            // width: a packed pair of half precision values is cut into two
+            // 16-bit pieces, a pair of 32-bit values into two 32-bit ones.
+            let wide_type = map.get_or_add(builder, SpirvType::new(cv.from_type.clone()));
+            let elem_bits = match cv.to_type {
+                ast::Type::Vector(scalar_t, _) => scalar_t.size_of() as u32 * 8,
+                _ => unreachable!(),
+            };
+            let int_elem_type = map.get_or_add_scalar(
+                builder,
+                match elem_bits {
+                    16 => ast::ScalarType::U16,
+                    _ => ast::ScalarType::U32,
+                },
+            );
+            let mask = map.get_or_add_constant(
+                builder,
+                &ast::Type::Scalar(ast::ScalarType::U64),
+                &vec_repr((1u64 << elem_bits) - 1),
+            )?;
+            let shift = map.get_or_add_constant(
+                builder,
+                &ast::Type::Scalar(ast::ScalarType::U64),
+                &vec_repr(elem_bits as u64),
+            )?;
+            let low64 = builder.bitwise_and(wide_type, None, cv.src, mask)?;
+            let high64 = builder.shift_right_logical(wide_type, None, cv.src, shift)?;
+            let low = builder.u_convert(int_elem_type, None, low64)?;
+            let high = builder.u_convert(int_elem_type, None, high64)?;
+            // A half precision piece is an integer in the register; only its
+            // bit pattern matters.
+            let low = if scalar_type == int_elem_type {
+                low
+            } else {
+                builder.bitcast(scalar_type, None, low)?
+            };
+            let high = if scalar_type == int_elem_type {
+                high
+            } else {
+                builder.bitcast(scalar_type, None, high)?
+            };
+            let vector = builder.composite_construct(
+                vector_type,
+                None,
+                [low, high].iter().copied(),
+            )?;
+            let result_type = map.get_or_add(builder, SpirvType::new(cv.to_type.clone()));
+            builder.bitcast(result_type, Some(cv.dst), vector)?;
         }
         (TypeKind::Pointer, TypeKind::Scalar, &ConversionKind::Default) => {
             let result_type = map.get_or_add(builder, SpirvType::new(cv.to_type.clone()));
-            builder.convert_ptr_to_u(result_type, Some(cv.dst), cv.src)?;
-        }
-        (TypeKind::Scalar, TypeKind::Pointer, &ConversionKind::Default) => {
+            let address = generic_address(builder, map, cv.src, &cv.from_type, cv.from_space)?;
+            builder.convert_ptr_to_u(result_type, Some(cv.dst), address)?;
+        }        (TypeKind::Scalar, TypeKind::Pointer, &ConversionKind::Default) => {
             let result_type = map.get_or_add(builder, SpirvType::new(cv.to_type.clone()));
             builder.convert_u_to_ptr(result_type, Some(cv.dst), cv.src)?;
         }
         _ => unreachable!(),
     }
     Ok(())
+}
+
+/// The address of a pointer as a number a generic operation can use.
+///
+/// A pointer in the shared or the local space converts to its offset inside
+/// that space, which is not an address a generic load may use: PTX treats the
+/// address of a symbol as a generic one, so the pointer is cast to the generic
+/// space first.
+fn generic_address(
+    builder: &mut dr::Builder,
+    map: &mut TypeWordMap,
+    pointer: spirv::Word,
+    pointee: &ast::Type,
+    space: ast::StateSpace,
+) -> Result<spirv::Word, TranslateError> {
+    let storage_class = space.to_spirv();
+    if storage_class == spirv::StorageClass::Generic
+        || storage_class == spirv::StorageClass::CrossWorkgroup
+    {
+        return Ok(pointer);
+    }
+    let generic_type = map.get_or_add(
+        builder,
+        SpirvType::Pointer(Box::new(SpirvType::new(pointee.clone())), spirv::StorageClass::Generic),
+    );
+    Ok(builder.ptr_cast_to_generic(generic_type, None, pointer)?)
 }
 
 fn emit_load_var(
@@ -4091,15 +7512,23 @@ fn normalize_identifiers<'input, 'b>(
 ) -> Result<Vec<NormalizedStatement>, TranslateError> {
     for s in func.iter() {
         match s {
-            ast::Statement::Label(id) => {
+            ast::Statement::Label(id) | ast::Statement::BranchTargets(id, _) => {
                 id_defs.add_def(*id, None, false);
             }
             _ => (),
         }
     }
+    // The jump tables of the function: the label that names the table, and the
+    // labels of its targets in order.
+    let mut branch_tables: HashMap<&str, Vec<&str>> = HashMap::new();
+    for s in func.iter() {
+        if let ast::Statement::BranchTargets(name, targets) = s {
+            branch_tables.insert(*name, targets.clone());
+        }
+    }
     let mut result = Vec::new();
     for s in func {
-        expand_map_variables(id_defs, fn_defs, &mut result, s)?;
+        expand_map_variables(id_defs, fn_defs, &branch_tables, &mut result, s)?;
     }
     Ok(result)
 }
@@ -4107,18 +7536,50 @@ fn normalize_identifiers<'input, 'b>(
 fn expand_map_variables<'a, 'b>(
     id_defs: &mut FnStringIdResolver<'a, 'b>,
     fn_defs: &GlobalFnDeclResolver<'a, 'b>,
+    branch_tables: &HashMap<&str, Vec<&str>>,
     result: &mut Vec<NormalizedStatement>,
     s: ast::Statement<ast::ParsedArgParams<'a>>,
 ) -> Result<(), TranslateError> {
     match s {
         ast::Statement::Block(block) => {
-            id_defs.start_block();
-            for s in block {
-                expand_map_variables(id_defs, fn_defs, result, s)?;
+            // A block that only declares variables (".reg .f16 low, high;")
+            // does not open a new scope: the registers belong to the
+            // enclosing block, which is where they are used.
+            let only_variables = block
+                .iter()
+                .all(|s| matches!(s, ast::Statement::Variable(_)));
+            if !only_variables {
+                id_defs.start_block();
             }
-            id_defs.end_block();
+            for s in block {
+                expand_map_variables(id_defs, fn_defs, branch_tables, result, s)?;
+            }
+            if !only_variables {
+                id_defs.end_block();
+            }
         }
         ast::Statement::Label(name) => result.push(Statement::Label(id_defs.get_id(name)?)),
+        // A jump table is not code: its labels are used by the branch.
+        ast::Statement::BranchTargets(..) => {}
+        ast::Statement::Instruction(p, ast::Instruction::BrxIdx(index, table, _)) => {
+            let table_name = match &table {
+                Some(ast::Operand::Reg(name)) => *name,
+                _ => return Err(error_unreachable()),
+            };
+            let targets = branch_tables
+                .get(table_name)
+                .ok_or_else(|| TranslateError::UnknownSymbolName(table_name.to_string()))?;
+            let mut target_ids = Vec::with_capacity(targets.len());
+            for target in targets.iter() {
+                target_ids.push(id_defs.get_id(target)?);
+            }
+            let index = index.map_variable(&mut |id| id_defs.get_id(id))?;
+            result.push(Statement::Instruction((
+                p.map(|p| p.map_variable(&mut |id| id_defs.get_id(id)))
+                    .transpose()?,
+                ast::Instruction::BrxIdx(index, None, target_ids),
+            )))
+        }
         ast::Statement::Instruction(p, i) => result.push(Statement::Instruction((
             p.map(|p| p.map_variable(&mut |id| id_defs.get_id(id)))
                 .transpose()?,
@@ -4151,6 +7612,19 @@ fn expand_map_variables<'a, 'b>(
                         array_init: var.var.array_init,
                     }));
                 }
+            }
+            // Further registers of the same declaration: ".reg .f16 a, b;"
+            for extra in var.extra {
+                let extra_type = extra.v_type.clone();
+                let new_id =
+                    id_defs.add_def(extra.name, Some((extra_type, extra.state_space)), true);
+                result.push(Statement::Variable(ast::Variable {
+                    align: extra.align,
+                    v_type: extra.v_type,
+                    state_space: extra.state_space,
+                    name: new_id,
+                    array_init: extra.array_init,
+                }));
             }
         }
     };
@@ -4274,11 +7748,29 @@ fn convert_to_stateful_memory_access<'a, 'input>(
                 }
             }
             _ => {}
+
         }
     }
     if stateful_markers.len() == 0 {
         drop(method_decl);
         return Ok((func_args, func_body));
+    }
+    // Registers whose base is a .shared symbol must be typed as Shared
+    // (Workgroup) pointers, not Global (CrossWorkgroup), or the shared-memory
+    // accesses they feed will roundtrip through the wrong address space.
+    let mut shared_ptr_dsts = HashSet::new();
+    for statement in func_body.iter() {
+        if let Statement::Instruction(ast::Instruction::Mov(_, arg)) = statement {
+            if let (TypedOperand::Reg(dst), Some(src)) =
+                (arg.dst, arg.src.upcast().underlying_register())
+            {
+                if let Ok((_, sp, _)) = id_defs.get_typed(*src) {
+                    if sp == ast::StateSpace::Shared {
+                        shared_ptr_dsts.insert(dst);
+                    }
+                }
+            }
+        }
     }
     let mut func_args_ptr = HashSet::new();
     let mut regs_ptr_current = HashSet::new();
@@ -4348,15 +7840,20 @@ fn convert_to_stateful_memory_access<'a, 'input>(
     let mut remapped_ids = HashMap::new();
     let mut result = Vec::with_capacity(regs_ptr_seen.len() + func_body.len());
     for reg in regs_ptr_seen {
+        let space = if shared_ptr_dsts.contains(&reg) {
+            ast::StateSpace::Shared
+        } else {
+            ast::StateSpace::Global
+        };
         let new_id = id_defs.register_variable(
-            ast::Type::Pointer(ast::ScalarType::U8, ast::StateSpace::Global),
+            ast::Type::Pointer(ast::ScalarType::U8, space),
             ast::StateSpace::Reg,
         );
         result.push(Statement::Variable(ast::Variable {
             align: None,
             name: new_id,
             array_init: Vec::new(),
-            v_type: ast::Type::Pointer(ast::ScalarType::U8, ast::StateSpace::Global),
+            v_type: ast::Type::Pointer(ast::ScalarType::U8, space),
             state_space: ast::StateSpace::Reg,
         }));
         remapped_ids.insert(reg, new_id);
@@ -4378,6 +7875,8 @@ fn convert_to_stateful_memory_access<'a, 'input>(
         match statement {
             l @ Statement::Label(_) => result.push(l),
             c @ Statement::Conditional(_) => result.push(c),
+            // A constant needs no stateful memory access processing.
+            c @ Statement::Constant(_) => result.push(c),
             Statement::Variable(var) => {
                 if !remapped_ids.contains_key(&var.name) {
                     result.push(Statement::Variable(var));
@@ -4561,7 +8060,9 @@ fn convert_to_stateful_memory_access_postprocess(
                 converting_id
             }
         }
-        None => arg_desc.op,
+        None => {
+            arg_desc.op
+        }
     })
 }
 
@@ -4637,6 +8138,24 @@ enum PtxSpecialRegister {
     Ctaid64,
     Nctaid,
     Nctaid64,
+    // %laneid: the thread's index inside its warp.
+    Laneid,
+    // %warpid: the warp's index inside the CTA.
+    Warpid,
+    // %nwarpid: the number of warps in the CTA.
+    Nwarpid,
+    // %lanemask_*: a mask of the lanes of the warp relative to this one.
+    // Not SPIR-V builtins; computed from the lane id in
+    // fix_special_registers.
+    LanemaskLt,
+    LanemaskLe,
+    LanemaskEq,
+    LanemaskGe,
+    LanemaskGt,
+    // CUDA kernel parameter-buffer base registers (%envreg1..%envreg32).
+    // Not SPIR-V builtins; lowered to zero constants in fix_special_registers.
+    Envreg1,
+    Envreg2,
 }
 
 impl PtxSpecialRegister {
@@ -4646,6 +8165,16 @@ impl PtxSpecialRegister {
             "%ntid" => Some(Self::Ntid),
             "%ctaid" => Some(Self::Ctaid),
             "%nctaid" => Some(Self::Nctaid),
+            "%laneid" => Some(Self::Laneid),
+            "%warpid" => Some(Self::Warpid),
+            "%nwarpid" => Some(Self::Nwarpid),
+            "%lanemask_lt" => Some(Self::LanemaskLt),
+            "%lanemask_le" => Some(Self::LanemaskLe),
+            "%lanemask_eq" => Some(Self::LanemaskEq),
+            "%lanemask_ge" => Some(Self::LanemaskGe),
+            "%lanemask_gt" => Some(Self::LanemaskGt),
+            "%envreg1" => Some(Self::Envreg1),
+            "%envreg2" => Some(Self::Envreg2),
             _ => None,
         }
     }
@@ -4660,6 +8189,17 @@ impl PtxSpecialRegister {
             PtxSpecialRegister::Ctaid64 => ast::Type::Vector(ast::ScalarType::U64, 3),
             PtxSpecialRegister::Nctaid => ast::Type::Vector(ast::ScalarType::U32, 4),
             PtxSpecialRegister::Nctaid64 => ast::Type::Vector(ast::ScalarType::U64, 3),
+            PtxSpecialRegister::Laneid
+            | PtxSpecialRegister::Warpid
+            | PtxSpecialRegister::Nwarpid
+            | PtxSpecialRegister::LanemaskLt
+            | PtxSpecialRegister::LanemaskLe
+            | PtxSpecialRegister::LanemaskEq
+            | PtxSpecialRegister::LanemaskGe
+            | PtxSpecialRegister::LanemaskGt => ast::Type::Scalar(ast::ScalarType::U32),
+            PtxSpecialRegister::Envreg1 | PtxSpecialRegister::Envreg2 => {
+                ast::Type::Scalar(ast::ScalarType::U32)
+            }
         }
     }
 
@@ -4675,7 +8215,38 @@ impl PtxSpecialRegister {
             PtxSpecialRegister::Nctaid | PtxSpecialRegister::Nctaid64 => {
                 spirv::BuiltIn::NumWorkgroups
             }
+            // %laneid is the x component of the subgroup-local invocation id.
+            PtxSpecialRegister::Laneid => spirv::BuiltIn::SubgroupLocalInvocationId,
+            // %warpid / %nwarpid have no direct SPIR-V builtin; they are
+            // derived from the subgroup id and the subgroup size.
+            PtxSpecialRegister::Warpid | PtxSpecialRegister::Nwarpid => {
+                spirv::BuiltIn::SubgroupId
+            }
+            // Computed from the lane id, not a builtin of its own.
+            PtxSpecialRegister::LanemaskLt
+            | PtxSpecialRegister::LanemaskLe
+            | PtxSpecialRegister::LanemaskEq
+            | PtxSpecialRegister::LanemaskGe
+            | PtxSpecialRegister::LanemaskGt => unreachable!(),
+            // CUDA-specific, no SPIR-V equivalent (never emitted as a builtin)
+            PtxSpecialRegister::Envreg1 | PtxSpecialRegister::Envreg2 => unreachable!(),
         }
+    }
+
+    /// True for registers that map to a real SPIR-V BuiltIn variable.
+    /// The envregs and the lane masks are lowered by hand and must stay out of
+    /// the builtin/interface emission.
+    fn is_spirv_builtin(self) -> bool {
+        !matches!(
+            self,
+            PtxSpecialRegister::Envreg1
+                | PtxSpecialRegister::Envreg2
+                | PtxSpecialRegister::LanemaskLt
+                | PtxSpecialRegister::LanemaskLe
+                | PtxSpecialRegister::LanemaskEq
+                | PtxSpecialRegister::LanemaskGe
+                | PtxSpecialRegister::LanemaskGt
+        )
     }
 
     fn normalized_sreg_and_type(self) -> Option<(PtxSpecialRegister, ast::ScalarType, u8)> {
@@ -4692,6 +8263,19 @@ impl PtxSpecialRegister {
             | PtxSpecialRegister::Ntid64
             | PtxSpecialRegister::Ctaid64
             | PtxSpecialRegister::Nctaid64 => None,
+            // The warp-level registers are already 32-bit scalars; there is no
+            // 64-bit counterpart, so they are used as-is.
+            PtxSpecialRegister::Laneid
+            | PtxSpecialRegister::Warpid
+            | PtxSpecialRegister::Nwarpid
+            | PtxSpecialRegister::LanemaskLt
+            | PtxSpecialRegister::LanemaskLe
+            | PtxSpecialRegister::LanemaskEq
+            | PtxSpecialRegister::LanemaskGe
+            | PtxSpecialRegister::LanemaskGt => None,
+            // Envregs have no normalized 64-bit counterpart; they are lowered
+            // to zero constants before SSA emission.
+            PtxSpecialRegister::Envreg1 | PtxSpecialRegister::Envreg2 => None,
         }
     }
 }
@@ -4711,7 +8295,7 @@ impl SpecialRegistersMap {
 
     fn builtins<'a>(&'a self) -> impl Iterator<Item = (PtxSpecialRegister, spirv::Word)> + 'a {
         self.reg_to_id.iter().filter_map(|(sreg, id)| {
-            if sreg.normalized_sreg_and_type().is_none() {
+            if sreg.is_spirv_builtin() && sreg.normalized_sreg_and_type().is_none() {
                 Some((*sreg, *id))
             } else {
                 None
@@ -4723,7 +8307,7 @@ impl SpecialRegistersMap {
         self.reg_to_id
             .iter()
             .filter_map(|(sreg, id)| {
-                if sreg.normalized_sreg_and_type().is_none() {
+                if sreg.is_spirv_builtin() && sreg.normalized_sreg_and_type().is_none() {
                     Some(*id)
                 } else {
                     None
@@ -4793,16 +8377,17 @@ impl<'input> FnSigMapper<'input> {
             .collect::<Vec<_>>();
         let mut func_decl_return_iter = func_decl.return_arguments.iter();
         let mut func_decl_input_iter = func_decl.input_arguments[input_arguments.len()..].iter();
+        let call_name = format!("{:?}", call_inst.func);
         for (idx, id) in call_inst.ret_params.iter().enumerate() {
             let stays_as_return = match self.return_param_args.get(idx) {
                 Some(x) => *x,
-                None => return Err(TranslateError::MismatchedType),
+                None => return Err(TranslateError::MismatchedTypeIn(call_name.clone())),
             };
             if stays_as_return {
                 if let Some(var) = func_decl_return_iter.next() {
                     return_arguments.push((*id, var.v_type.clone(), var.state_space));
                 } else {
-                    return Err(TranslateError::MismatchedType);
+                    return Err(TranslateError::MismatchedTypeIn(call_name.clone()));
                 }
             } else {
                 if let Some(var) = func_decl_input_iter.next() {
@@ -4812,14 +8397,14 @@ impl<'input> FnSigMapper<'input> {
                         var.state_space,
                     ));
                 } else {
-                    return Err(TranslateError::MismatchedType);
+                    return Err(TranslateError::MismatchedTypeIn(call_name.clone()));
                 }
             }
         }
         if return_arguments.len() != func_decl.return_arguments.len()
             || input_arguments.len() != func_decl.input_arguments.len()
         {
-            return Err(TranslateError::MismatchedType);
+            return Err(TranslateError::MismatchedTypeIn(call_name.clone()));
         }
         Ok(ResolvedCall {
             return_arguments,
@@ -4885,7 +8470,7 @@ impl<'input> GlobalStringIdResolver<'input> {
         self.variables
             .get(id)
             .copied()
-            .ok_or(TranslateError::UnknownSymbol)
+            .ok_or(TranslateError::UnknownSymbolName(id.to_string()))
     }
 
     fn current_id(&self) -> spirv::Word {
@@ -4947,7 +8532,9 @@ pub struct GlobalFnDeclResolver<'input, 'a> {
 
 impl<'input, 'a> GlobalFnDeclResolver<'input, 'a> {
     fn get_fn_sig_resolver(&self, id: spirv::Word) -> Result<&FnSigMapper<'input>, TranslateError> {
-        self.fns.get(&id).ok_or(TranslateError::UnknownSymbol)
+        self.fns
+            .get(&id)
+            .ok_or(TranslateError::UnknownSymbolName(format!("fn#{}", id)))
     }
 }
 
@@ -4986,10 +8573,10 @@ impl<'a, 'b> FnStringIdResolver<'a, 'b> {
             }
         }
         match self.global_variables.get(id) {
-            Some(id) => Ok(*id),
+            Some(found_id) => Ok(*found_id),
             None => {
-                let sreg =
-                    PtxSpecialRegister::try_parse(id).ok_or(TranslateError::UnknownSymbol)?;
+                let sreg = PtxSpecialRegister::try_parse(id)
+                    .ok_or_else(|| TranslateError::UnknownSymbolName(id.to_string()))?;
                 Ok(self.special_registers.get_or_add(self.current_id, sreg))
             }
         }
@@ -5057,12 +8644,12 @@ impl<'b> NumericIdResolver<'b> {
     ) -> Result<(ast::Type, ast::StateSpace, bool), TranslateError> {
         match self.type_check.get(&id) {
             Some(Some(x)) => Ok(x.clone()),
-            Some(None) => Err(TranslateError::UntypedSymbol),
+            Some(None) => Err(TranslateError::UntypedSymbolName(id.to_string())),
             None => match self.special_registers.get(id) {
                 Some(x) => Ok((x.get_type(), ast::StateSpace::Sreg, true)),
                 None => match self.global_type_check.get(&id) {
                     Some(Some(result)) => Ok(result.clone()),
-                    Some(None) | None => Err(TranslateError::UntypedSymbol),
+                    Some(None) | None => Err(TranslateError::UntypedSymbolName(id.to_string())),
                 },
             },
         }
@@ -5077,7 +8664,6 @@ impl<'b> NumericIdResolver<'b> {
         *self.current_id += 1;
         new_id
     }
-
     fn register_intermediate(&mut self, typ: Option<(ast::Type, ast::StateSpace)>) -> spirv::Word {
         let new_id = *self.current_id;
         self.type_check
@@ -5085,6 +8671,7 @@ impl<'b> NumericIdResolver<'b> {
         *self.current_id += 1;
         new_id
     }
+
 }
 
 struct MutableNumericIdResolver<'b> {
@@ -5242,6 +8829,14 @@ struct RepackVectorDetails {
     typ: ast::ScalarType,
     packed: spirv::Word,
     unpacked: Vec<spirv::Word>,
+    /// Number of elements in the pack. A pack of two 32-bit registers can
+    /// also spell a single 64-bit value (`mov.b64 {%r0,%r1}, %rd2;`), in which
+    /// case the pack is assembled into a 64-bit value instead of a vector.
+    pack_width: u8,
+    /// The type of the packed value when it is a scalar that the pack
+    /// splits into pieces ("mov.b64 {%r0,%r1}, %rd2;" splits a 64-bit value
+    /// into two 32-bit halves). None when the packed value is a vector.
+    packed_scalar: Option<ast::ScalarType>,
     non_default_implicit_conversion: Option<
         fn(
             (ast::StateSpace, &ast::Type),
@@ -5251,6 +8846,15 @@ struct RepackVectorDetails {
 }
 
 impl RepackVectorDetails {
+    /// The type of the packed value: a vector for a real vector pack, a
+    /// scalar for the "the pack names the pieces of a wider value" form.
+    fn packed_type(&self) -> ast::Type {
+        match self.packed_scalar {
+            Some(scalar) => ast::Type::Scalar(scalar),
+            None => ast::Type::Vector(self.typ, self.unpacked.len() as u8),
+        }
+    }
+
     fn map<
         From: ArgParamsEx<Id = spirv::Word>,
         To: ArgParamsEx<Id = spirv::Word>,
@@ -5266,10 +8870,7 @@ impl RepackVectorDetails {
                 is_memory_access: false,
                 non_default_implicit_conversion: None,
             },
-            Some((
-                &ast::Type::Vector(self.typ, self.unpacked.len() as u8),
-                ast::StateSpace::Reg,
-            )),
+            Some((&self.packed_type(), ast::StateSpace::Reg)),
         )?;
         let scalar_type = self.typ;
         let is_extract = self.is_extract;
@@ -5278,6 +8879,10 @@ impl RepackVectorDetails {
             .unpacked
             .into_iter()
             .map(|id| {
+                if id == 0 {
+                    // A hole in the pack: the element is not written.
+                    return Ok(0);
+                }
                 visitor.id(
                     ArgumentDescriptor {
                         op: id,
@@ -5294,6 +8899,8 @@ impl RepackVectorDetails {
             typ: self.typ,
             packed: scalar,
             unpacked: vector,
+            pack_width: self.pack_width,
+            packed_scalar: self.packed_scalar,
             non_default_implicit_conversion,
         })
     }
@@ -5589,9 +9196,20 @@ where
             ast::Operand::VecMember(id, member) => ast::Operand::VecMember(self(id)?, member),
             ast::Operand::VecPack(ref ids) => ast::Operand::VecPack(
                 ids.into_iter()
-                    .map(|id| self.id(desc.new_op(id), Some((typ, state_space))))
+                    .map(|id| {
+                        if *id == "_" {
+                            // A hole in the pack: the element is not written.
+                            // 0 is never a valid SPIR-V id.
+                            Ok(0)
+                        } else {
+                            self.id(desc.new_op(id), Some((typ, state_space)))
+                        }
+                    })
                     .collect::<Result<Vec<_>, _>>()?,
             ),
+            // A vector literal of constants: "st.global.v2.b32 [addr], {99, 0};"
+            // The elements carry no identifiers, so nothing to resolve here.
+            ast::Operand::ImmPack(values) => ast::Operand::ImmPack(values),
         })
     }
 }
@@ -5645,6 +9263,357 @@ impl<T: ArgParamsEx> ast::Instruction<T> {
             ast::Instruction::Mov(d, a) => {
                 let mapped = a.map(visitor, &d)?;
                 ast::Instruction::Mov(d, mapped)
+            }
+            ast::Instruction::CpAsync(d, a) => {
+                // Both operands are plain addresses in registers: the shared
+                // one is an offset into the shared window, the global one a
+                // byte address.
+                let dst = visitor.operand(
+                    ArgumentDescriptor {
+                        op: a.dst,
+                        is_dst: false,
+                        is_memory_access: false,
+                        non_default_implicit_conversion: None,
+                    },
+                    &ast::Type::Scalar(ast::ScalarType::B32),
+                    ast::StateSpace::Reg,
+                )?;
+                let src = visitor.operand(
+                    ArgumentDescriptor {
+                        op: a.src,
+                        is_dst: false,
+                        is_memory_access: false,
+                        non_default_implicit_conversion: None,
+                    },
+                    &ast::Type::Scalar(ast::ScalarType::B64),
+                    ast::StateSpace::Reg,
+                )?;
+                let src_size = match a.src_size {
+                    Some(size) => Some(visitor.operand(
+                        ArgumentDescriptor {
+                            op: size,
+                            is_dst: false,
+                            is_memory_access: false,
+                            non_default_implicit_conversion: None,
+                        },
+                        &ast::Type::Scalar(ast::ScalarType::B32),
+                        ast::StateSpace::Reg,
+                    )?),
+                    None => None,
+                };
+                ast::Instruction::CpAsync(
+                    d,
+                    ast::ArgCpAsync {
+                        dst,
+                        src,
+                        src_size,
+                    },
+                )
+            }
+            ast::Instruction::Trap => ast::Instruction::Trap,
+            ast::Instruction::BrxIdx(index, table, targets) => {
+                let u32 = ast::Type::Scalar(ast::ScalarType::U32);
+                let index = visitor.operand(
+                    ArgumentDescriptor {
+                        op: index,
+                        is_dst: false,
+                        is_memory_access: false,
+                        non_default_implicit_conversion: None,
+                    },
+                    &u32,
+                    ast::StateSpace::Reg,
+                )?;
+                // The table is a label, not a value: it carries no type and
+                // takes part in no conversion, so the operand field is filled
+                // with the index (the emitter reads only the targets).
+                ast::Instruction::BrxIdx(index, None, targets)
+            }
+            ast::Instruction::VSub4(a) => {
+                let b32 = ast::Type::Scalar(ast::ScalarType::B32);
+                let map_arg = |op, is_dst, visitor: &mut V| -> Result<U::Operand, TranslateError> {
+                    visitor.operand(
+                        ArgumentDescriptor {
+                            op,
+                            is_dst,
+                            is_memory_access: false,
+                            non_default_implicit_conversion: None,
+                        },
+                        &b32,
+                        ast::StateSpace::Reg,
+                    )
+                };
+                ast::Instruction::VSub4(ast::Arg3 {
+                    dst: map_arg(a.dst, true, visitor)?,
+                    src1: map_arg(a.src1, false, visitor)?,
+                    src2: map_arg(a.src2, false, visitor)?,
+                })
+            }
+            ast::Instruction::VSet4(op, a) => {
+                let b32 = ast::Type::Scalar(ast::ScalarType::B32);
+                let map_arg = |op, is_dst, visitor: &mut V| -> Result<U::Operand, TranslateError> {
+                    visitor.operand(
+                        ArgumentDescriptor {
+                            op,
+                            is_dst,
+                            is_memory_access: false,
+                            non_default_implicit_conversion: None,
+                        },
+                        &b32,
+                        ast::StateSpace::Reg,
+                    )
+                };
+                ast::Instruction::VSet4(
+                    op,
+                    ast::Arg3 {
+                        dst: map_arg(a.dst, true, visitor)?,
+                        src1: map_arg(a.src1, false, visitor)?,
+                        src2: map_arg(a.src2, false, visitor)?,
+                    },
+                )
+            }
+            ast::Instruction::Redux(op, typ, a) => {
+                let value_type = ast::Type::Scalar(typ);
+                let dst = visitor.operand(
+                    ArgumentDescriptor {
+                        op: a.dst,
+                        is_dst: true,
+                        is_memory_access: false,
+                        non_default_implicit_conversion: None,
+                    },
+                    &value_type,
+                    ast::StateSpace::Reg,
+                )?;
+                let src1 = visitor.operand(
+                    ArgumentDescriptor {
+                        op: a.src1,
+                        is_dst: false,
+                        is_memory_access: false,
+                        non_default_implicit_conversion: None,
+                    },
+                    &value_type,
+                    ast::StateSpace::Reg,
+                )?;
+                let src2 = visitor.operand(
+                    ArgumentDescriptor {
+                        op: a.src2,
+                        is_dst: false,
+                        is_memory_access: false,
+                        non_default_implicit_conversion: None,
+                    },
+                    &ast::Type::Scalar(ast::ScalarType::B32),
+                    ast::StateSpace::Reg,
+                )?;
+                ast::Instruction::Redux(op, typ, ast::Arg3 { dst, src1, src2 })
+            }
+            ast::Instruction::CvtPacked(typ, a) => {
+                // One 32-bit register holds the two converted elements.
+                let b32 = ast::Type::Scalar(ast::ScalarType::B32);
+                let f32 = ast::Type::Scalar(ast::ScalarType::F32);
+                let dst = visitor.operand(
+                    ArgumentDescriptor {
+                        op: a.dst,
+                        is_dst: true,
+                        is_memory_access: false,
+                        non_default_implicit_conversion: None,
+                    },
+                    &b32,
+                    ast::StateSpace::Reg,
+                )?;
+                let src1 = visitor.operand(
+                    ArgumentDescriptor {
+                        op: a.src1,
+                        is_dst: false,
+                        is_memory_access: false,
+                        non_default_implicit_conversion: None,
+                    },
+                    &f32,
+                    ast::StateSpace::Reg,
+                )?;
+                let src2 = visitor.operand(
+                    ArgumentDescriptor {
+                        op: a.src2,
+                        is_dst: false,
+                        is_memory_access: false,
+                        non_default_implicit_conversion: None,
+                    },
+                    &f32,
+                    ast::StateSpace::Reg,
+                )?;
+                ast::Instruction::CvtPacked(typ, ast::Arg3 { dst, src1, src2 })
+            }
+            ast::Instruction::MovMatrix(a) => {
+                // Both operands are one 32-bit register holding two halves.
+                let b32 = ast::Type::Scalar(ast::ScalarType::B32);
+                let dst = visitor.operand(
+                    ArgumentDescriptor {
+                        op: a.dst,
+                        is_dst: true,
+                        is_memory_access: false,
+                        non_default_implicit_conversion: None,
+                    },
+                    &b32,
+                    ast::StateSpace::Reg,
+                )?;
+                let src = visitor.operand(
+                    ArgumentDescriptor {
+                        op: a.src,
+                        is_dst: false,
+                        is_memory_access: false,
+                        non_default_implicit_conversion: None,
+                    },
+                    &b32,
+                    ast::StateSpace::Reg,
+                )?;
+                ast::Instruction::MovMatrix(ast::Arg2 { dst, src })
+            }
+            ast::Instruction::Mma(d, a) => {
+                // Every thread owns four elements of D (and of C), one 32-bit
+                // register each for a float accumulation. A half precision
+                // accumulation packs two elements per register, and the
+                // register keeps its 32 bits, so the fragment is two registers
+                // holding 32-bit values rather than two halves.
+                // The accumulator fragment is four floats, four integers or
+                // two packed pairs of halves.
+                let result_bits: u32 = match d.dst {
+                    ast::ScalarType::F32 | ast::ScalarType::S32 | ast::ScalarType::U32 => 32,
+                    ast::ScalarType::F16 | ast::ScalarType::S16 | ast::ScalarType::U16 => 16,
+                    _ => return Err(TranslateError::Todo),
+                };
+                let result_registers =
+                    ((d.m as u32 * d.n as u32 / 32) * result_bits / 32) as u8;
+                // Only the float form keeps its values as floats; a packed
+                // pair of halves and an integer both live in a 32-bit register.
+                let result_type = if d.dst == ast::ScalarType::F32 {
+                    ast::ScalarType::F32
+                } else {
+                    ast::ScalarType::B32
+                };
+                // The fragment sizes follow from the shape and the element
+                // width: every thread holds m*k/32 elements of A, k*n/32 of B
+                // and m*n/32 of D, and a register holds 32 bits of them.
+                let element_bits: u8 = match d.a {
+                    ast::ScalarType::F16 | ast::ScalarType::B16 => 16,
+                    ast::ScalarType::B32 => 32,
+                    ast::ScalarType::S8 | ast::ScalarType::U8 => 8,
+                    _ => return Err(TranslateError::Todo),
+                };
+                let a_registers = ((d.m as u32 * d.k as u32 / 32) * element_bits as u32 / 32) as u8;
+                let b_registers = ((d.n as u32 * d.k as u32 / 32) * element_bits as u32 / 32) as u8;
+                let dst = visitor.operand(
+                    ArgumentDescriptor {
+                        op: a.dst,
+                        is_dst: true,
+                        is_memory_access: false,
+                        non_default_implicit_conversion: None,
+                    },
+                    &if result_registers == 1 {
+                        ast::Type::Scalar(result_type)
+                    } else {
+                        ast::Type::Vector(result_type, result_registers)
+                    },
+                    ast::StateSpace::Reg,
+                )?;
+                let a_regs = visitor.operand(
+                    ArgumentDescriptor {
+                        op: a.a,
+                        is_dst: false,
+                        is_memory_access: false,
+                        non_default_implicit_conversion: None,
+                    },
+                    &if a_registers == 1 {
+                        ast::Type::Scalar(ast::ScalarType::B32)
+                    } else {
+                        ast::Type::Vector(ast::ScalarType::B32, a_registers)
+                    },
+                    ast::StateSpace::Reg,
+                )?;
+                let b_regs = visitor.operand(
+                    ArgumentDescriptor {
+                        op: a.b,
+                        is_dst: false,
+                        is_memory_access: false,
+                        non_default_implicit_conversion: None,
+                    },
+                    &if b_registers == 1 {
+                        ast::Type::Scalar(ast::ScalarType::B32)
+                    } else {
+                        ast::Type::Vector(ast::ScalarType::B32, b_registers)
+                    },
+                    ast::StateSpace::Reg,
+                )?;
+                let c_regs = visitor.operand(
+                    ArgumentDescriptor {
+                        op: a.c,
+                        is_dst: false,
+                        is_memory_access: false,
+                        non_default_implicit_conversion: None,
+                    },
+                    &if result_registers == 1 {
+                        ast::Type::Scalar(result_type)
+                    } else {
+                        ast::Type::Vector(result_type, result_registers)
+                    },
+                    ast::StateSpace::Reg,
+                )?;
+                ast::Instruction::Mma(
+                    d,
+                    ast::ArgMma {
+                        dst,
+                        a: a_regs,
+                        b: b_regs,
+                        c: c_regs,
+                    },
+                )
+            }
+            ast::Instruction::Shf(d, a) => {
+                ast::Instruction::Shf(d, a.map(visitor, &ast::Type::Scalar(ast::ScalarType::B32), false)?)
+            }
+            ast::Instruction::Copysign(t, a) => {
+                ast::Instruction::Copysign(
+                    t,
+                    a.map_non_shift(visitor, &ast::Type::Scalar(t), false)?,
+                )
+            }
+            ast::Instruction::Dp4a(t, a) => {
+                ast::Instruction::Dp4a(t, a.map(visitor, &ast::Type::Scalar(t), false)?)
+            }
+            ast::Instruction::Prmt(t, a) => {
+                ast::Instruction::Prmt(t, a.map(visitor, &ast::Type::Scalar(t), false)?)
+            }
+            ast::Instruction::Nanosleep(a) => ast::Instruction::Nanosleep(
+                a.map(visitor, Some((&ast::Type::Scalar(ast::ScalarType::U32), ast::StateSpace::Reg)))?,
+            ),
+            ast::Instruction::CpAsyncCommitGroup => ast::Instruction::CpAsyncCommitGroup,
+            ast::Instruction::CpAsyncWaitGroup(n) => ast::Instruction::CpAsyncWaitGroup(n),
+            ast::Instruction::CpAsyncWaitAll => ast::Instruction::CpAsyncWaitAll,
+            ast::Instruction::LdMatrix(d, a) => {
+                // The fragments are a vector of 32-bit registers, the address
+                // a 64-bit value.
+                let dst = visitor.operand(
+                    ArgumentDescriptor {
+                        op: a.dst,
+                        is_dst: true,
+                        is_memory_access: false,
+                        non_default_implicit_conversion: None,
+                    },
+                    &if d.num == 1 {
+                        ast::Type::Scalar(ast::ScalarType::B32)
+                    } else {
+                        ast::Type::Vector(ast::ScalarType::B32, d.num)
+                    },
+                    ast::StateSpace::Reg,
+                )?;
+                let src = visitor.operand(
+                    ArgumentDescriptor {
+                        op: a.src,
+                        is_dst: false,
+                        is_memory_access: true,
+                        non_default_implicit_conversion: None,
+                    },
+                    &ast::Type::Scalar(ast::ScalarType::B64),
+                    ast::StateSpace::Reg,
+                )?;
+                ast::Instruction::LdMatrix(d, ast::Arg2LdMatrix { dst, src })
             }
             ast::Instruction::Mul(d, a) => {
                 let inst_type = d.get_type();
@@ -5738,6 +9707,135 @@ impl<T: ArgParamsEx> ast::Instruction<T> {
             ),
             ast::Instruction::Selp(t, a) => ast::Instruction::Selp(t, a.map_selp(visitor, t)?),
             ast::Instruction::Bar(d, a) => ast::Instruction::Bar(d, a.map(visitor)?),
+            ast::Instruction::Membar(scope) => ast::Instruction::Membar(scope),
+            ast::Instruction::Shfl(m, t, a) => {
+                let typ = ast::Type::Scalar(t);
+                // The optional destination predicate is a predicate register.
+                let dst_predicate = match a.dst_predicate {
+                    Some(op) => Some(visitor.operand(
+                        ArgumentDescriptor {
+                            op,
+                            is_dst: true,
+                            is_memory_access: false,
+                            non_default_implicit_conversion: None,
+                        },
+                        &ast::Type::Scalar(ast::ScalarType::Pred),
+                        ast::StateSpace::Reg,
+                    )?),
+                    None => None,
+                };
+                let mut map_operand = |op: T::Operand, is_dst: bool| {
+                    visitor.operand(
+                        ArgumentDescriptor {
+                            op,
+                            is_dst,
+                            is_memory_access: false,
+                            non_default_implicit_conversion: None,
+                        },
+                        &typ,
+                        ast::StateSpace::Reg,
+                    )
+                };
+                ast::Instruction::Shfl(
+                    m,
+                    t,
+                    ast::ArgShfl {
+                        dst: map_operand(a.dst, true)?,
+                        dst_predicate,
+                        src: map_operand(a.src, false)?,
+                        lane: map_operand(a.lane, false)?,
+                        clamp: map_operand(a.clamp, false)?,
+                        member_mask: map_operand(a.member_mask, false)?,
+                    },
+                )
+            }
+            ast::Instruction::Vote(m, t, a) => {
+                let typ = ast::Type::Scalar(t);
+                let pred_typ = ast::Type::Scalar(ast::ScalarType::Pred);
+                // The destination keeps the instruction type (b32 for the
+                // ballot form, pred for the reduction forms), the source is
+                // always a predicate register and the member mask is a 32-bit
+                // integer.
+                let dst = visitor.operand(
+                    ArgumentDescriptor {
+                        op: a.dst,
+                        is_dst: true,
+                        is_memory_access: false,
+                        non_default_implicit_conversion: None,
+                    },
+                    &typ,
+                    ast::StateSpace::Reg,
+                )?;
+                let src = visitor.operand(
+                    ArgumentDescriptor {
+                        op: a.src,
+                        is_dst: false,
+                        is_memory_access: false,
+                        non_default_implicit_conversion: None,
+                    },
+                    &pred_typ,
+                    ast::StateSpace::Reg,
+                )?;
+                let member_mask = visitor.operand(
+                    ArgumentDescriptor {
+                        op: a.member_mask,
+                        is_dst: false,
+                        is_memory_access: false,
+                        non_default_implicit_conversion: None,
+                    },
+                    &ast::Type::Scalar(ast::ScalarType::U32),
+                    ast::StateSpace::Reg,
+                )?;
+                ast::Instruction::Vote(
+                    m,
+                    t,
+                    ast::ArgVote {
+                        dst,
+                        src,
+                        member_mask,
+                    },
+                )
+            }
+            ast::Instruction::BarRedPred(and, d, b, p) => {
+                let pred_t = &ast::Type::Scalar(ast::ScalarType::Pred);
+                let b32_t = &ast::Type::Scalar(ast::ScalarType::B32);
+                let new_d = visitor.operand(
+                    ArgumentDescriptor { op: d, is_dst: true, is_memory_access: false, non_default_implicit_conversion: None },
+                    pred_t,
+                    ast::StateSpace::Reg,
+                )?;
+                let new_b = visitor.operand(
+                    ArgumentDescriptor { op: b, is_dst: false, is_memory_access: false, non_default_implicit_conversion: None },
+                    b32_t,
+                    ast::StateSpace::Reg,
+                )?;
+                let new_p = visitor.operand(
+                    ArgumentDescriptor { op: p, is_dst: false, is_memory_access: false, non_default_implicit_conversion: None },
+                    pred_t,
+                    ast::StateSpace::Reg,
+                )?;
+                ast::Instruction::BarRedPred(and, new_d, new_b, new_p)
+            }
+            ast::Instruction::BarRedPopc(d, b, p) => {
+                let t = &ast::Type::Scalar(ast::ScalarType::U32);
+                let pred_t = &ast::Type::Scalar(ast::ScalarType::Pred);
+                let new_d = visitor.operand(
+                    ArgumentDescriptor { op: d, is_dst: true, is_memory_access: false, non_default_implicit_conversion: None },
+                    t,
+                    ast::StateSpace::Reg,
+                )?;
+                let new_b = visitor.operand(
+                    ArgumentDescriptor { op: b, is_dst: false, is_memory_access: false, non_default_implicit_conversion: None },
+                    t,
+                    ast::StateSpace::Reg,
+                )?;
+                let new_p = visitor.operand(
+                    ArgumentDescriptor { op: p, is_dst: false, is_memory_access: false, non_default_implicit_conversion: None },
+                    pred_t,
+                    ast::StateSpace::Reg,
+                )?;
+                ast::Instruction::BarRedPopc(new_d, new_b, new_p)
+            }
             ast::Instruction::Atom(d, a) => {
                 ast::Instruction::Atom(d, a.map_atom(visitor, d.inner.get_type(), d.space)?)
             }
@@ -5788,6 +9886,14 @@ impl<T: ArgParamsEx> ast::Instruction<T> {
                 let dst_type = ast::Type::Scalar(ast::ScalarType::B32);
                 let src_type = ast::Type::Scalar(typ.into());
                 ast::Instruction::Clz {
+                    typ,
+                    arg: arg.map_different_types(visitor, &dst_type, &src_type)?,
+                }
+            }
+            ast::Instruction::Bfind { typ, arg } => {
+                let dst_type = ast::Type::Scalar(ast::ScalarType::B32);
+                let src_type = ast::Type::Scalar(typ.into());
+                ast::Instruction::Bfind {
                     typ,
                     arg: arg.map_different_types(visitor, &dst_type, &src_type)?,
                 }
@@ -5953,6 +10059,14 @@ impl ast::Type {
                 {
                     return Err(TranslateError::MismatchedType);
                 }
+                let width = scalar.size_of();
+                if (kind != ast::ScalarKind::Signed
+                    && kind != ast::ScalarKind::Unsigned
+                    && kind != ast::ScalarKind::Bit)
+                    || (width == 8)
+                {
+                    return Err(TranslateError::MismatchedType);
+                }
                 Ok(ast::Type::Scalar(ast::ScalarType::from_parts(
                     width * 2,
                     kind,
@@ -5984,6 +10098,13 @@ impl ast::Type {
                 scalar_kind: scalar.kind(),
                 width: scalar.size_of(),
                 components: components.clone(),
+            },
+            ast::Type::Struct(members) => TypeParts {
+                kind: TypeKind::Array,
+                state_space: ast::StateSpace::Reg,
+                scalar_kind: ast::ScalarKind::Unsigned,
+                width: 4,
+                components: vec![members.len() as u32],
             },
             ast::Type::Pointer(scalar, space) => TypeParts {
                 kind: TypeKind::Pointer,
@@ -6022,6 +10143,7 @@ impl ast::Type {
             ast::Type::Array(typ, len) => len
                 .iter()
                 .fold(typ.size_of() as usize, |x, y| (x as usize) * (*y as usize)),
+            ast::Type::Struct(members) => 4 * members.len(),
             ast::Type::Pointer(..) => mem::size_of::<usize>(),
         }
     }
@@ -6058,6 +10180,26 @@ impl ast::Instruction<ExpandedArgParams> {
         match self {
             ast::Instruction::Ld(_, _) => None,
             ast::Instruction::St(_, _) => None,
+            ast::Instruction::LdMatrix(_, _) => None,
+            ast::Instruction::CpAsync(_, _) => None,
+            ast::Instruction::Prmt(_, _) => None,
+            ast::Instruction::Dp4a(_, _) => None,
+            // copysign is a bit operation, the rounding of the input is the
+            // caller's business.
+            ast::Instruction::Copysign(_, _) => None,
+            ast::Instruction::Trap => None,
+            ast::Instruction::Shf(_, _) => None,
+            ast::Instruction::Mma(_, _) => None,
+            ast::Instruction::MovMatrix(_) => None,
+            ast::Instruction::CvtPacked(_, _) => None,
+            ast::Instruction::Redux(_, _, _) => None,
+            ast::Instruction::VSub4(_) => None,
+            ast::Instruction::VSet4(_, _) => None,
+            ast::Instruction::BrxIdx(_, _, _) => None,
+            ast::Instruction::Nanosleep(_) => None,
+            ast::Instruction::CpAsyncCommitGroup => None,
+            ast::Instruction::CpAsyncWaitGroup(_) => None,
+            ast::Instruction::CpAsyncWaitAll => None,
             ast::Instruction::Mov(_, _) => None,
             ast::Instruction::Not(_, _) => None,
             ast::Instruction::Bra(_, _) => None,
@@ -6070,6 +10212,11 @@ impl ast::Instruction<ExpandedArgParams> {
             ast::Instruction::Cvta(_, _) => None,
             ast::Instruction::Selp(_, _) => None,
             ast::Instruction::Bar(_, _) => None,
+            ast::Instruction::Membar(_) => None,
+            ast::Instruction::BarRedPopc(_, _, _) => None,
+            ast::Instruction::BarRedPred(_, _, _, _) => None,
+            ast::Instruction::Shfl(_, _, _) => None,
+            ast::Instruction::Vote(_, _, _) => None,
             ast::Instruction::Atom(_, _) => None,
             ast::Instruction::AtomCas(_, _) => None,
             ast::Instruction::Sub(ast::ArithDetails::Signed(_), _) => None,
@@ -6089,6 +10236,7 @@ impl ast::Instruction<ExpandedArgParams> {
             ast::Instruction::Div(ast::DivDetails::Unsigned(_), _) => None,
             ast::Instruction::Div(ast::DivDetails::Signed(_), _) => None,
             ast::Instruction::Clz { .. } => None,
+            ast::Instruction::Bfind { .. } => None,
             ast::Instruction::Brev { .. } => None,
             ast::Instruction::Popc { .. } => None,
             ast::Instruction::Xor { .. } => None,
@@ -6181,6 +10329,8 @@ enum ConversionKind {
     Default,
     // zero-extend/chop/bitcast depending on types
     SignExtend,
+    // The value is wider than the instruction wants: keep the low bits.
+    Truncate,
     BitToPtr,
     PtrToPtr,
     AddressOf,
@@ -6318,7 +10468,7 @@ impl<T: ArgParamsEx> ast::Arg2<T> {
                 op: self.src,
                 is_dst: false,
                 is_memory_access: false,
-                non_default_implicit_conversion: None,
+                non_default_implicit_conversion: Some(should_convert_relaxed_src_wrapper),
             },
             src_t,
             ast::StateSpace::Reg,
@@ -6734,7 +10884,9 @@ impl<T: ArgParamsEx> ast::Arg4<T> {
             typ,
             ast::StateSpace::Reg,
         )?;
-        let u32_type = ast::Type::Scalar(ast::ScalarType::U32);
+        // The second operand is compared against the first, so it has the
+        // comparison's type. Typing it as u32 made a `.s16` comparison
+        // against -1 emit an out-of-range 16-bit constant.
         let src2 = visitor.operand(
             ArgumentDescriptor {
                 op: self.src2,
@@ -6742,9 +10894,12 @@ impl<T: ArgParamsEx> ast::Arg4<T> {
                 is_memory_access: false,
                 non_default_implicit_conversion: None,
             },
-            &u32_type,
+            typ,
             ast::StateSpace::Reg,
         )?;
+        // The offset and the width are operands of the bit field extraction,
+        // which requires them to have the width of the result: a 64-bit bfe
+        // with a 32-bit width is rejected by the backend.
         let src3 = visitor.operand(
             ArgumentDescriptor {
                 op: self.src3,
@@ -6752,7 +10907,7 @@ impl<T: ArgParamsEx> ast::Arg4<T> {
                 is_memory_access: false,
                 non_default_implicit_conversion: None,
             },
-            &u32_type,
+            typ,
             ast::StateSpace::Reg,
         )?;
         Ok(ast::Arg4 {
@@ -6982,6 +11137,7 @@ impl<T> ast::Operand<T> {
             ast::Operand::VecPack(vec) => {
                 ast::Operand::VecPack(vec.into_iter().map(f).collect::<Result<_, _>>()?)
             }
+            ast::Operand::ImmPack(values) => ast::Operand::ImmPack(values),
         })
     }
 }
@@ -7136,7 +11292,7 @@ impl<T> ast::Operand<T> {
             ast::Operand::Reg(r)
             | ast::Operand::RegOffset(r, _)
             | ast::Operand::VecMember(r, _) => Some(r),
-            ast::Operand::Imm(_) | ast::Operand::VecPack(..) => None,
+            ast::Operand::Imm(_) | ast::Operand::VecPack(..) | ast::Operand::ImmPack(..) => None,
         }
     }
 }
@@ -7216,18 +11372,32 @@ fn default_implicit_conversion_space(
                 | ast::StateSpace::Generic
                 | ast::StateSpace::Const
                 | ast::StateSpace::Local
-                | ast::StateSpace::Shared => Ok(Some(ConversionKind::BitToPtr)),
-                _ => Err(TranslateError::MismatchedType),
+                | ast::StateSpace::Shared
+                | ast::StateSpace::Param
+                // A 64-bit register holding an address is the normal way PTX
+                // spells a generic pointer.
+                | ast::StateSpace::Reg => Ok(Some(ConversionKind::BitToPtr)),
+                _ => {
+                    Err(TranslateError::MismatchedType)
+                }
             },
             ast::Type::Scalar(ast::ScalarType::B32)
             | ast::Type::Scalar(ast::ScalarType::U32)
             | ast::Type::Scalar(ast::ScalarType::S32) => match instruction_space {
-                ast::StateSpace::Const | ast::StateSpace::Local | ast::StateSpace::Shared => {
-                    Ok(Some(ConversionKind::BitToPtr))
-                }
+                ast::StateSpace::Const
+                | ast::StateSpace::Local
+                | ast::StateSpace::Shared
+                // A 32-bit integer used as an address is legal in PTX (it is
+                // zero-extended); nvcc emits it for global/shared pointers
+                // that are known to fit in 32 bits.
+                | ast::StateSpace::Global
+                | ast::StateSpace::Generic
+                | ast::StateSpace::Param => Ok(Some(ConversionKind::BitToPtr)),
                 _ => Err(TranslateError::MismatchedType),
             },
-            _ => Err(TranslateError::MismatchedType),
+            _ => {
+                Err(TranslateError::MismatchedType)
+            }
         }
     } else if instruction_space.is_compatible(ast::StateSpace::Reg) {
         match instruction_type {
@@ -7254,10 +11424,27 @@ fn default_implicit_conversion_type(
     instruction_type: &ast::Type,
 ) -> Result<Option<ConversionKind>, TranslateError> {
     if space.is_compatible(ast::StateSpace::Reg) {
+        // The instruction wants a narrower value than the register holds (an
+        // 8-bit value lives in the low byte of a 16-bit register): keep the
+        // low bits.
+        if let (ast::Type::Scalar(instr), ast::Type::Scalar(operand)) =
+            (instruction_type, operand_type)
+        {
+            if instr.size_of() < operand.size_of()
+                && operand.kind() == ast::ScalarKind::Bit
+                && instr.kind() != ast::ScalarKind::Float
+            {
+                return Ok(Some(ConversionKind::Truncate));
+            }
+        }
         if should_bitcast(instruction_type, operand_type) {
             Ok(Some(ConversionKind::Default))
         } else {
-            Err(TranslateError::MismatchedType)
+            Err(TranslateError::MismatchedTypeIn(format!(
+                "instruction wants {}, operand is {}",
+                describe_type(instruction_type),
+                describe_type(operand_type)
+            )))
         }
     } else {
         Ok(Some(ConversionKind::PtrToPtr))
@@ -7281,13 +11468,30 @@ fn should_bitcast(instr: &ast::Type, operand: &ast::Type) -> bool {
                     operand.kind() == ast::ScalarKind::Bit
                         || operand.kind() == ast::ScalarKind::Signed
                 }
-                ast::ScalarKind::Float2 => false,
+                // A packed half lives in a 32-bit register: the bits are
+                // reinterpreted, not converted.
+                ast::ScalarKind::Float2 => operand.kind() == ast::ScalarKind::Bit,
                 ast::ScalarKind::Pred => false,
             }
         }
         (ast::Type::Vector(inst, _), ast::Type::Vector(operand, _))
         | (ast::Type::Array(inst, _), ast::Type::Array(operand, _)) => {
             should_bitcast(&ast::Type::Scalar(*inst), &ast::Type::Scalar(*operand))
+        }
+        // A 64-bit value and a pair of 32-bit values hold the same bits; PTX
+        // lets a `.b64` register be named as two `.b32` registers
+        // (`mov.b64 {%r0,%r1}, %rd2;`).
+        (ast::Type::Vector(inst, 2), ast::Type::Scalar(operand)) => {
+            inst.size_of() == 4
+                && operand.size_of() == 8
+                && inst.kind() == ast::ScalarKind::Bit
+                && operand.kind() == ast::ScalarKind::Bit
+        }
+        (ast::Type::Scalar(inst), ast::Type::Vector(operand, 2)) => {
+            inst.size_of() == 8
+                && operand.size_of() == 4
+                && inst.kind() == ast::ScalarKind::Bit
+                && operand.kind() == ast::ScalarKind::Bit
         }
         _ => false,
     }
@@ -7312,7 +11516,10 @@ fn implicit_conversion_mov(
     // * kernel arg
     // * func arg
     // * variable
-    } else if operand_space.is_addressable() {
+    // Clang-emitted PTX materializes by-value struct params (.param
+    // vectors/arrays) through mov.b64 address-of; the 2021 baseline never
+    // saw such PTX, so Param joins the addressable set here only.
+    } else if operand_space.is_addressable() || operand_space == ast::StateSpace::Param {
         return Ok(Some(ConversionKind::AddressOf));
     }
     default_implicit_conversion(
@@ -7616,5 +11823,40 @@ mod tests {
     #[test]
     fn should_convert_relaxed_dst_all_combinations() {
         assert_conversion_table(RELAXED_DST_CONVERSION_TABLE, should_convert_relaxed_dst);
+    }
+}
+
+/// Human-readable type name, for error messages.
+fn describe_type(ty: &ast::Type) -> String {
+    match ty {
+        ast::Type::Scalar(s) => format!("scalar({})", scalar_name(s)),
+        ast::Type::Vector(s, n) => format!("vector({},{})", scalar_name(s), n),
+        ast::Type::Array(s, n) => format!("array({},{:?})", scalar_name(s), n),
+        ast::Type::Pointer(t, _) => format!("pointer({})", scalar_name(t)),
+        ast::Type::Struct(members) => {
+            format!("struct({} members)", members.len())
+        }
+    }
+}
+
+fn scalar_name(s: &ast::ScalarType) -> String {
+    match s {
+        ast::ScalarType::B8 => "b8".to_string(),
+        ast::ScalarType::B16 => "b16".to_string(),
+        ast::ScalarType::B32 => "b32".to_string(),
+        ast::ScalarType::B64 => "b64".to_string(),
+        ast::ScalarType::U8 => "u8".to_string(),
+        ast::ScalarType::U16 => "u16".to_string(),
+        ast::ScalarType::U32 => "u32".to_string(),
+        ast::ScalarType::U64 => "u64".to_string(),
+        ast::ScalarType::S8 => "s8".to_string(),
+        ast::ScalarType::S16 => "s16".to_string(),
+        ast::ScalarType::S32 => "s32".to_string(),
+        ast::ScalarType::S64 => "s64".to_string(),
+        ast::ScalarType::F16 => "f16".to_string(),
+        ast::ScalarType::F16x2 => "f16x2".to_string(),
+        ast::ScalarType::F32 => "f32".to_string(),
+        ast::ScalarType::F64 => "f64".to_string(),
+        ast::ScalarType::Pred => "pred".to_string(),
     }
 }

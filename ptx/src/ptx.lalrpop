@@ -13,6 +13,8 @@ extern {
 
 match {
     r"\s+" => { },
+    // The cache hints of cp.async (".L2::256B") carry no meaning for us.
+    r"\.L2::[0-9]+B" => { },
     r"//[^\n\r]*[\n\r]*" => { },
     r"/\*([^\*]*\*+[^\*/])*([^\*]*\*+|[^\*])*\*/" => { },
     r"0[fF][0-9a-zA-Z]{8}" => F32NumToken,
@@ -41,12 +43,16 @@ match {
     ".address_size",
     ".align",
     ".aligned",
+    ".all",
     ".and",
+    ".any",
     ".approx",
     ".b16",
     ".b32",
     ".b64",
     ".b8",
+    ".ballot",
+    ".bfly",
     ".ca",
     ".cas",
     ".cg",
@@ -55,6 +61,7 @@ match {
     ".cta",
     ".cv",
     ".dec",
+    ".down",
     ".entry",
     ".eq",
     ".equ",
@@ -76,6 +83,7 @@ match {
     ".gtu",
     ".hi",
     ".hs",
+    ".idx",
     ".inc",
     ".le",
     ".leu",
@@ -90,10 +98,34 @@ match {
     ".maxnreg",
     ".maxntid",
     ".minnctapersm",
+    ".async",
+    ".cc",
+    ".clamp",
+    ".l",
+    ".r",
+    ".commit_group",
+    ".m8n8",
+    ".wait_all",
+    ".wait_group",
+    ".wrap",
+    ".m16n8k16",
+    ".m16n8k32",
+    ".m16n8k8",
+    ".row",
+    ".col",
+    ".tf32",
+    ".satfinite",
     ".min",
+    ".trans",
+    ".x1",
+    ".x2",
+    ".x4",
     ".nan",
     ".NaN",
     ".nc",
+    ".bf16",
+    ".bf16x2",
+    ".noreturn",
     ".ne",
     ".neu",
     ".num",
@@ -101,9 +133,12 @@ match {
     ".param",
     ".pragma",
     ".pred",
+    ".popc",
+    ".ptr",
     ".reg",
     ".relaxed",
     ".release",
+    ".red",
     ".reqntid",
     ".rm",
     ".rmi",
@@ -129,11 +164,13 @@ match {
     ".u64",
     ".u8" ,
     ".uni",
+    ".up",
     ".v2",
     ".v4",
     ".version",
     ".visible",
     ".volatile",
+    ".warp",
     ".wb",
     ".weak",
     ".wide",
@@ -148,9 +185,12 @@ match {
     "bar",
     "barrier",
     "bfe",
+    "bfind",
     "bfi",
     "bra",
     "brev",
+    "brx",
+    ".branchtargets",
     "call",
     "clz",
     "cos",
@@ -163,9 +203,19 @@ match {
     "ld",
     "lg2",
     "mad",
+    "madc",
     "map_f64_to_f32",
+    "copysign",
+    "cp",
+    "dp4a",
+    "ldmatrix",
+    "nanosleep",
+    "prmt",
+    "membar",
     "max",
     "min",
+    "mma",
+    "movmatrix",
     "mov",
     "mul",
     "neg",
@@ -174,23 +224,35 @@ match {
     "popc",
     "rcp",
     "rem",
+    "redux",
     "ret",
     "rsqrt",
     "selp",
     "setp",
+    "shf",
+    "shfl",
     "shl",
     "shr",
     "sin",
-    r"sm_[0-9]+" => ShaderModel,
+    // The architecture suffix varies ("sm_90a", "sm_120a") and a target the
+    // translator does not model still has to parse: the directive only tells
+    // ptxas what to generate, and this translates to SPIR-V instead.
+    r"sm_[0-9]+[a-z]?" => ShaderModel,
     "sqrt",
     "st",
     "sub",
     "texmode_independent",
     "texmode_unified",
+    "trap",
+    "vsub4",
+    "vset4",
+    "vote",
     "xor",
 } else {
     // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#identifiers
-    r"[a-zA-Z][a-zA-Z0-9_$]*|[_$%][a-zA-Z0-9_$]+" => ID,
+    // A lone "_" is the placeholder of a register pack ("mov.b64 {_, %r1},
+    // %rd2" leaves the low half alone), so the pattern has to accept it.
+    r"[a-zA-Z][a-zA-Z0-9_$]*|[_$%][a-zA-Z0-9_$]*" => ID,
     r"\.[a-zA-Z][a-zA-Z0-9_$]*" => DotID,
 }
 
@@ -206,6 +268,7 @@ ExtendedID : &'input str = {
     "bra",
     "brev",
     "call",
+    "bfind",
     "clz",
     "cos",
     "cvt",
@@ -218,8 +281,16 @@ ExtendedID : &'input str = {
     "lg2",
     "mad",
     "map_f64_to_f32",
+    "copysign",
+    "cp",
+    "dp4a",
+    "ldmatrix",
+    "nanosleep",
+    "prmt",
+    "membar",
     "max",
     "min",
+    "mma",
     "mov",
     "mul",
     "neg",
@@ -232,6 +303,8 @@ ExtendedID : &'input str = {
     "rsqrt",
     "selp",
     "setp",
+    "shf",
+    "shfl",
     "shl",
     "shr",
     "sin",
@@ -241,6 +314,10 @@ ExtendedID : &'input str = {
     "sub",
     "texmode_independent",
     "texmode_unified",
+    "trap",
+    "vsub4",
+    "vset4",
+    "vote",
     "xor",
     ID
 }
@@ -336,6 +413,7 @@ Target = {
 TargetSpecifier = {
     ShaderModel,
     "texmode_unified",
+    "trap",
     "texmode_independent",
     "debug",
     "map_f64_to_f32"
@@ -381,6 +459,8 @@ LinkingDirective: ast::LinkingDirective = {
 
 TuningDirective: ast::TuningDirective = {
     ".maxnreg" <ncta:U32Num> => ast::TuningDirective::MaxNReg(ncta),
+    // ".noreturn" marks a function that never returns.
+    ".noreturn" => ast::TuningDirective::NoReturn,
     ".maxntid" <nx:U32Num> => ast::TuningDirective::MaxNtid(nx, 1, 1),
     ".maxntid" <nx:U32Num> "," <ny:U32Num> => ast::TuningDirective::MaxNtid(nx, ny, 1),
     ".maxntid" <nx:U32Num> "," <ny:U32Num> "," <nz:U32Num> => ast::TuningDirective::MaxNtid(nx, ny, nz),
@@ -431,8 +511,14 @@ KernelInput: ast::Variable<&'input str> = {
 }
 
 FnInput: ast::Variable<&'input str> = {
-    <v:RegVariable> => {
-        let (align, v_type, name) = v;
+    // A vector register declared in the parameter list of a function. Only
+    // the vector form is accepted here: the scalar form shares its prefix
+    // with the multi-name register declaration (".reg .f16 a, b;"), and the
+    // two would be ambiguous in the parameter list, where a comma separates
+    // the parameters.
+    ".reg" <var:VariableVector<SizedScalarType>> => {
+        let (align, v_len, t, name) = var;
+        let v_type = ast::Type::Vector(t, v_len);
         let state_space = ast::StateSpace::Reg;
         ast::Variable{ align, v_type, state_space, name, array_init: Vec::new() }
     },
@@ -480,7 +566,32 @@ ScalarType: ast::ScalarType = {
 
 Statement: Option<ast::Statement<ast::ParsedArgParams<'input>>> = {
     <l:Label> => Some(ast::Statement::Label(l)),
+    // $L: .branchtargets $L0, $L1, ...;
+    <l:Label> ".branchtargets" <targets:CommaNonEmpty<ExtendedID>> ";" => {
+        Some(ast::Statement::BranchTargets(l, targets))
+    },
     DebugDirective => None,
+    // A register declaration: ".reg .f32 %r<701>;" or ".reg .f16 a, b;"
+    <v:RegVariable> <count:VariableParam?> ";" => {
+        let (align, v_type, names) = v;
+        let mut names = names.into_iter();
+        let first = names.next().unwrap();
+        let var = ast::Variable {
+            align,
+            v_type: v_type.clone(),
+            state_space: ast::StateSpace::Reg,
+            name: first,
+            array_init: Vec::new(),
+        };
+        let extra = names.map(|name| ast::Variable {
+            align,
+            v_type: v_type.clone(),
+            state_space: ast::StateSpace::Reg,
+            name,
+            array_init: Vec::new(),
+        }).collect();
+        Some(ast::Statement::Variable(ast::MultiVariable { var, count, extra }))
+    },
     <v:MultiVariable> ";" => Some(ast::Statement::Variable(v)),
     <p:PredAt?> <i:Instruction> ";" => Some(ast::Statement::Instruction(p, i)),
     PragmaStatement => None,
@@ -515,7 +626,11 @@ Align: u32 = {
 
 // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parameterized-variable-names
 MultiVariable: ast::MultiVariable<&'input str> = {
-    <var:Variable> <count:VariableParam?> => ast::MultiVariable{<>}
+    <var:Variable> <count:VariableParam?> => ast::MultiVariable {
+        var,
+        count,
+        extra: Vec::new(),
+    }
 }
 
 VariableParam: u32 = {
@@ -523,11 +638,6 @@ VariableParam: u32 = {
 }
 
 Variable: ast::Variable<&'input str> = {
-    <v:RegVariable> => {
-        let (align, v_type, name) = v;
-        let state_space = ast::StateSpace::Reg;
-        ast::Variable {align, v_type, state_space, name, array_init: Vec::new()}
-    },
     LocalVariable,
     <v:ParamVariable> => {
         let (align, array_init, v_type, name) = v;
@@ -537,16 +647,25 @@ Variable: ast::Variable<&'input str> = {
     SharedVariable,
 };
 
-RegVariable: (Option<u32>, ast::Type, &'input str) = {
-    ".reg" <var:VariableScalar<ScalarType>> => {
-        let (align, t, name) = var;
-        let v_type = ast::Type::Scalar(t);
-        (align, v_type, name)
+// The name of a register declaration.
+RegName: &'input str = {
+    <r:ID> => r,
+}
+
+// A register declaration. Several registers of the same type can be
+// declared at once (".reg .f16 a, b;"), which is what CUDA's inline
+// assembly uses.
+RegVariable: (Option<u32>, ast::Type, Vec<&'input str>) = {
+    // The names of a register declaration are plain identifiers. They are
+    // not parsed as ExtendedID so that the follow set of ExtendedID (which
+    // is shared with the operand rules) does not change.
+    ".reg" <align:Align?> <v_type:ScalarType> <names:CommaNonEmpty<RegName>> => {
+        (align, ast::Type::Scalar(v_type), names)
     },
     ".reg" <var:VariableVector<SizedScalarType>> => {
         let (align, v_len, t, name) = var;
         let v_type = ast::Type::Vector(t, v_len);
-        (align, v_type, name)
+        (align, v_type, vec![name])
     }
 }
 
@@ -617,6 +736,25 @@ ModuleVariable: (ast::LinkingDirective, ast::Variable<&'input str>) = {
         let state_space = ast::StateSpace::Shared;
         (linking, ast::Variable { align, v_type, state_space, name, array_init: Vec::new() })
     },
+    // clang emits file-scope read-only constants as `.const`; treat them as global
+    // (CrossWorkgroup) since that storage class is fully supported by the translator.
+    <linking:LinkingDirectives> ".const" <var:VariableArrayOrPointer<SizedScalarType>> =>? {
+        let (align, t, name, arr_or_ptr) = var;
+        let (v_type, array_init) = match arr_or_ptr {
+            ast::ArrayOrPointer::Array { dimensions, init } => (ast::Type::Array(t, dimensions), init),
+            ast::ArrayOrPointer::Pointer => {
+                return Err(ParseError::User { error: ast::PtxError::NonExternPointer });
+            }
+        };
+        let state_space = ast::StateSpace::Global;
+        Ok((linking, ast::Variable { align, v_type, state_space, name, array_init }))
+    },
+    // (CrossWorkgroup) since that storage class is fully supported by the translator.
+    <linking:LinkingDirectives> ".const" <def:GlobalVariableDefinitionNoArray> => {
+        let (align, v_type, name, array_init) = def;
+        let state_space = ast::StateSpace::Global;
+        (linking, ast::Variable { align, v_type, state_space, name, array_init })
+    },
     <linking:LinkingDirectives> <space:Or<".global", ".shared">> <var:VariableArrayOrPointer<SizedScalarType>> =>? {
         let (align, t, name, arr_or_ptr) = var;
         let (v_type, state_space, array_init) = match arr_or_ptr {
@@ -648,6 +786,11 @@ ParamVariable: (Option<u32>, Vec<u8>, ast::Type, &'input str) = {
         let (align, t, name) = var;
         let v_type = ast::Type::Scalar(t);
         (align, Vec::new(), v_type, name)
+    },
+    // clang emits pointer params as `.param .u64 .ptr .align N name`
+    ".param" <align:Align?> <t:LdStScalarType> ".ptr" <ptr_align:Align?> <name:ExtendedID> => {
+        let v_type = ast::Type::Scalar(t);
+        (align.or(ptr_align), Vec::new(), v_type, name)
     },
     ".param" <var:VariableArrayOrPointer<SizedScalarType>> => {
         let (align, t, name, arr_or_ptr) = var;
@@ -751,6 +894,24 @@ Instruction: ast::Instruction<ast::ParsedArgParams<'input>> = {
     InstRcp,
     InstSelp,
     InstBar,
+    InstMembar,
+    InstShfl,
+    InstLdMatrix,
+    InstCpAsync,
+    InstPrmt,
+    InstNanosleep,
+    InstDp4a,
+    InstCopysign,
+    InstTrap,
+    InstShf,
+    InstMma,
+    InstMovMatrix,
+    InstVote,
+    InstCvtPacked,
+    InstRedux,
+    InstVSub4,
+    InstVSet4,
+    InstBrxIdx,
     InstAtom,
     InstAtomCas,
     InstDiv,
@@ -762,6 +923,7 @@ Instruction: ast::Instruction<ast::ParsedArgParams<'input>> = {
     InstLg2,
     InstEx2,
     InstClz,
+    InstBfind,
     InstBrev,
     InstPopc,
     InstXor,
@@ -1139,6 +1301,52 @@ InstCvt: ast::Instruction<ast::ParsedArgParams<'input>> = {
             }
         ), a)
     },
+    // bfloat16 conversions. There is no bf16 type in SPIR-V: the value is a
+    // 16-bit integer that holds the upper half of an f32.
+    "cvt" <r:RoundingModeFloat> ".bf16" ".f32" <a:Arg2> => {
+        ast::Instruction::Cvt(ast::CvtDetails::FloatFromFloat(
+            ast::CvtDesc {
+                rounding: Some(r),
+                flush_to_zero: None,
+                saturate: false,
+                dst: ast::ScalarType::B16,
+                src: ast::ScalarType::F32
+            }
+        ), a)
+    },
+    "cvt" ".f32" ".bf16" <a:Arg2> => {
+        ast::Instruction::Cvt(ast::CvtDetails::FloatFromFloat(
+            ast::CvtDesc {
+                rounding: None,
+                flush_to_zero: None,
+                saturate: false,
+                dst: ast::ScalarType::F32,
+                src: ast::ScalarType::B16
+            }
+        ), a)
+    },
+    "cvt" <r:RoundingModeFloat> ".bf16" ".f16" <a:Arg2> => {
+        ast::Instruction::Cvt(ast::CvtDetails::FloatFromFloat(
+            ast::CvtDesc {
+                rounding: Some(r),
+                flush_to_zero: None,
+                saturate: false,
+                dst: ast::ScalarType::B16,
+                src: ast::ScalarType::F16
+            }
+        ), a)
+    },
+    "cvt" ".f16" ".bf16" <a:Arg2> => {
+        ast::Instruction::Cvt(ast::CvtDetails::FloatFromFloat(
+            ast::CvtDesc {
+                rounding: None,
+                flush_to_zero: None,
+                saturate: false,
+                dst: ast::ScalarType::F16,
+                src: ast::ScalarType::B16
+            }
+        ), a)
+    },
     "cvt" <r:RoundingModeInt?> <f:".ftz"?> <s:".sat"?> ".f32" ".f32" <a:Arg2> => {
         ast::Instruction::Cvt(ast::CvtDetails::FloatFromFloat(
             ast::CvtDesc {
@@ -1344,7 +1552,25 @@ InstAbs: ast::Instruction<ast::ParsedArgParams<'input>> = {
 // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#floating-point-instructions-mad
 InstMad: ast::Instruction<ast::ParsedArgParams<'input>> = {
     "mad" <d:MulDetails> <a:Arg4> => ast::Instruction::Mad(d, a),
+    // ".cc" writes the carry-out to a predicate; without a predicate
+    // destination the carry is not observable.
+    "mad" ".lo" ".cc" <t:SignedIntType> <a:Arg4> =>
+        ast::Instruction::Mad(ast::MulDetails::Signed(ast::MulSInt { typ: t, control: ast::MulIntControl::Low }), a),
+    "mad" ".lo" ".cc" <t:UIntType> <a:Arg4> =>
+        ast::Instruction::Mad(ast::MulDetails::Unsigned(ast::MulUInt { typ: t, control: ast::MulIntControl::Low }), a),
     "mad" ".hi" ".sat" ".s32" => todo!(),
+    "madc" ".lo" <t:UIntType> <a:Arg4> =>
+        ast::Instruction::Mad(ast::MulDetails::Unsigned(ast::MulUInt { typ: t, control: ast::MulIntControl::Low }), a),
+    "madc" ".hi" <t:UIntType> <a:Arg4> =>
+        ast::Instruction::Mad(ast::MulDetails::Unsigned(ast::MulUInt { typ: t, control: ast::MulIntControl::High }), a),
+    "madc" ".wide" <t:UIntType> <a:Arg4> =>
+        ast::Instruction::Mad(ast::MulDetails::Unsigned(ast::MulUInt { typ: t, control: ast::MulIntControl::Wide }), a),
+    "madc" ".lo" <t:SIntType> <a:Arg4> =>
+        ast::Instruction::Mad(ast::MulDetails::Signed(ast::MulSInt { typ: t, control: ast::MulIntControl::Low }), a),
+    "madc" ".hi" <t:SIntType> <a:Arg4> =>
+        ast::Instruction::Mad(ast::MulDetails::Signed(ast::MulSInt { typ: t, control: ast::MulIntControl::High }), a),
+    "madc" ".wide" <t:SIntType> <a:Arg4> =>
+        ast::Instruction::Mad(ast::MulDetails::Signed(ast::MulSInt { typ: t, control: ast::MulIntControl::Wide }), a),
     "fma" <f:ArithFloatMustRound> <a:Arg4> => ast::Instruction::Mad(ast::MulDetails::Float(f), a),
 };
 
@@ -1446,10 +1672,295 @@ SelpType: ast::ScalarType = {
     ".f64" => ast::ScalarType::F64,
 };
 
+// https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#memory-consistency-model-membar
+InstMembar: ast::Instruction<ast::ParsedArgParams<'input>> = {
+    "membar" <scope:MemScope> => ast::Instruction::Membar(scope)
+}
+
 // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-bar
 InstBar: ast::Instruction<ast::ParsedArgParams<'input>> = {
+    "barrier" ".sync" <a:Arg1Bar> => ast::Instruction::Bar(ast::BarDetails::SyncAligned, a),
     "barrier" ".sync" ".aligned" <a:Arg1Bar> => ast::Instruction::Bar(ast::BarDetails::SyncAligned, a),
-    "bar" ".sync" <a:Arg1Bar> => ast::Instruction::Bar(ast::BarDetails::SyncAligned, a)
+    "bar" ".sync" <a:Arg1Bar> => ast::Instruction::Bar(ast::BarDetails::SyncAligned, a),
+    "bar" ".sync" ".aligned" <a:Arg1Bar> => ast::Instruction::Bar(ast::BarDetails::SyncAligned, a),
+    // bar.warp.sync - a barrier that synchronizes only the warp
+    "bar" ".warp" ".sync" <a:Arg1Bar> => ast::Instruction::Bar(ast::BarDetails::WarpSync, a),
+    // bar.red.popc.u32 %dst, %barrier, %pred - count threads with pred true at barrier
+    "bar" ".red" ".popc" ".u32" <dst:Operand> "," <bar_id:Operand> "," <pred:Operand> =>
+        ast::Instruction::BarRedPopc(dst, bar_id, pred),
+    // bar.red.or.pred %dst, %barrier, %pred - the disjunction (or the
+    // conjunction) of a predicate across the workgroup, at a barrier.
+    // The flag says "conjunction": false is the disjunction.
+    "bar" ".red" ".or" ".pred" <dst:Operand> "," <bar_id:Operand> "," <pred:Operand> =>
+        ast::Instruction::BarRedPred(false, dst, bar_id, pred),
+    "bar" ".red" ".and" ".pred" <dst:Operand> "," <bar_id:Operand> "," <pred:Operand> =>
+        ast::Instruction::BarRedPred(true, dst, bar_id, pred)
+}
+
+// https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#warp-shuffle-functions
+//
+// shfl.sync.mode.b32 d[|p], a, b, c, membermask;
+//   d = destination (optionally followed by |p, a predicate that is set when
+//       the computed source lane was in range)
+//   a = value to send
+//   b = source lane (or the delta for .up/.down/.bfly)
+//   c = packed value: clamp in bits [4:0] and segment mask in bits [12:8]
+//   membermask = 32-bit mask of the participating threads
+// https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#warp-level-matrix-instructions-ldmatrix
+//   ldmatrix.sync.aligned.m8n8.x1.b16 {d0}, [p];
+//   ldmatrix.sync.aligned.m8n8.x2.b16 {d0, d1}, [p];
+//   ldmatrix.sync.aligned.m8n8.x4.b16 {d0, d1, d2, d3}, [p];
+// with an optional ".trans" that distributes the transposed matrix.
+InstLdMatrix: ast::Instruction<ast::ParsedArgParams<'input>> = {
+    "ldmatrix" ".sync" ".aligned" ".m8n8" <num:LdMatrixNum> <trans:".trans"?> ".b16" <dst:DstOperandVec> "," <src:MemoryOperand> => {
+        ast::Instruction::LdMatrix(
+            ast::LdMatrixDetails {
+                num,
+                trans: trans.is_some(),
+            },
+            ast::Arg2LdMatrix { dst, src },
+        )
+    },
+};
+
+// https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#warp-level-matrix-instructions-movmatrix
+//   movmatrix.sync.aligned.m8n8.trans.b16 d, a;
+InstMovMatrix: ast::Instruction<ast::ParsedArgParams<'input>> = {
+    "movmatrix" ".sync" ".aligned" ".m8n8" ".trans" ".b16" <a:Arg2> => {
+        ast::Instruction::MovMatrix(a)
+    },
+};
+
+// https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-cp-async
+//   cp.async.cg.shared.global [dst], [src], 16;
+//   cp.async.ca.shared.global [dst], [src], 4{, src-size};
+//   cp.async.commit_group; / cp.async.wait_group N; / cp.async.wait_all;
+// https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-prmt
+InstPrmt: ast::Instruction<ast::ParsedArgParams<'input>> = {
+    "prmt" ".b32" <a:Arg4> => ast::Instruction::Prmt(ast::ScalarType::B32, a)
+};
+
+// https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-redux-sync
+//   redux.sync.add.s32 d, a, membermask;
+InstRedux: ast::Instruction<ast::ParsedArgParams<'input>> = {
+    "redux" ".sync" ".add" <t:ScalarType> <d:Operand> "," <a:Operand> "," <mask:Operand> =>
+        ast::Instruction::Redux(ast::ReduxOp::Add, t, ast::Arg3 { dst: d, src1: a, src2: mask }),
+    "redux" ".sync" ".min" <t:ScalarType> <d:Operand> "," <a:Operand> "," <mask:Operand> =>
+        ast::Instruction::Redux(ast::ReduxOp::Min, t, ast::Arg3 { dst: d, src1: a, src2: mask }),
+    "redux" ".sync" ".max" <t:ScalarType> <d:Operand> "," <a:Operand> "," <mask:Operand> =>
+        ast::Instruction::Redux(ast::ReduxOp::Max, t, ast::Arg3 { dst: d, src1: a, src2: mask }),
+    "redux" ".sync" ".and" <t:BitType> <d:Operand> "," <a:Operand> "," <mask:Operand> =>
+        ast::Instruction::Redux(ast::ReduxOp::And, t, ast::Arg3 { dst: d, src1: a, src2: mask }),
+    "redux" ".sync" ".or" <t:BitType> <d:Operand> "," <a:Operand> "," <mask:Operand> =>
+        ast::Instruction::Redux(ast::ReduxOp::Or, t, ast::Arg3 { dst: d, src1: a, src2: mask }),
+    "redux" ".sync" ".xor" <t:BitType> <d:Operand> "," <a:Operand> "," <mask:Operand> =>
+        ast::Instruction::Redux(ast::ReduxOp::Xor, t, ast::Arg3 { dst: d, src1: a, src2: mask }),
+};
+
+// The packed forms of the float conversion: two floats, one register.
+//   cvt.rn.f16x2.f32 d, a, b;   -> d = { b (low), a (high) }
+InstCvtPacked: ast::Instruction<ast::ParsedArgParams<'input>> = {
+    "cvt" <rnd:RoundingModeFloat> ".f16x2" ".f32" <d:Operand> "," <a:Operand> "," <b:Operand> => {
+        let _ = rnd;
+        ast::Instruction::CvtPacked(ast::ScalarType::F16x2, ast::Arg3 { dst: d, src1: a, src2: b })
+    },
+    "cvt" <rnd:RoundingModeFloat> ".bf16x2" ".f32" <d:Operand> "," <a:Operand> "," <b:Operand> => {
+        let _ = rnd;
+        ast::Instruction::CvtPacked(ast::ScalarType::B16, ast::Arg3 { dst: d, src1: a, src2: b })
+    },
+};
+
+// https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#control-flow-instructions-brx
+//   brx.idx %r, $L_brx_0;      jump to the n-th label of the table
+InstBrxIdx: ast::Instruction<ast::ParsedArgParams<'input>> = {
+    "brx" ".idx" <index:Operand> "," <table:ExtendedID> => {
+        // The table is resolved to its labels when the identifiers of the
+        // function are resolved; the target list is filled in there.
+        ast::Instruction::BrxIdx(index, Some(ast::Operand::Reg(table)), Vec::new())
+    },
+};
+
+// https://docs.nvidia.com/cuda/parallel-tensor-thread-execution -- see
+// "Video Instructions". Four bytes are operated on in parallel:
+//   vsub4.u32.u32.u32 d, a, b, c;    per byte: a - b, wrapped into the byte
+//   vset4.u32.u32.ne  d, a, b, c;    per byte: a != b, one or zero
+// The fourth operand is the secondary operand of the general form; the forms
+// the compiler emits carry no secondary operation, so it is unused.
+InstVSub4: ast::Instruction<ast::ParsedArgParams<'input>> = {
+    "vsub4" ".u32" ".u32" ".u32" <a:Arg4> => ast::Instruction::VSub4(ast::Arg3 {
+        dst: a.dst,
+        src1: a.src1,
+        src2: a.src2,
+    }),
+};
+
+InstVSet4: ast::Instruction<ast::ParsedArgParams<'input>> = {
+    "vset4" ".u32" ".u32" ".eq" <a:Arg4> => ast::Instruction::VSet4(ast::CompareOp::Eq, ast::Arg3 {
+        dst: a.dst,
+        src1: a.src1,
+        src2: a.src2,
+    }),
+    "vset4" ".u32" ".u32" ".ne" <a:Arg4> => ast::Instruction::VSet4(ast::CompareOp::Ne, ast::Arg3 {
+        dst: a.dst,
+        src1: a.src1,
+        src2: a.src2,
+    }),
+    "vset4" ".u32" ".u32" ".lt" <a:Arg4> => ast::Instruction::VSet4(ast::CompareOp::Lt, ast::Arg3 {
+        dst: a.dst,
+        src1: a.src1,
+        src2: a.src2,
+    }),
+    "vset4" ".u32" ".u32" ".le" <a:Arg4> => ast::Instruction::VSet4(ast::CompareOp::Le, ast::Arg3 {
+        dst: a.dst,
+        src1: a.src1,
+        src2: a.src2,
+    }),
+    "vset4" ".u32" ".u32" ".gt" <a:Arg4> => ast::Instruction::VSet4(ast::CompareOp::Gt, ast::Arg3 {
+        dst: a.dst,
+        src1: a.src1,
+        src2: a.src2,
+    }),
+    "vset4" ".u32" ".u32" ".ge" <a:Arg4> => ast::Instruction::VSet4(ast::CompareOp::Ge, ast::Arg3 {
+        dst: a.dst,
+        src1: a.src1,
+        src2: a.src2,
+    }),
+};
+
+InstNanosleep: ast::Instruction<ast::ParsedArgParams<'input>> = {
+    "nanosleep" ".u32" <a:Arg1> => ast::Instruction::Nanosleep(a)
+};
+
+// https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#floating-point-instructions-copysign
+// https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-shf
+//   shf.l.wrap.b32 d, a, b, c;   d = (b << c) | (a >> (32 - c))
+//   shf.r.wrap.b32 d, a, b, c;   d = (a >> c) | (b << (32 - c))
+// https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#warp-level-matrix-instructions-mma
+//   mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+//       {d0,d1,d2,d3}, {a0,a1,a2,a3}, {b0,b1}, {c0,c1,c2,c3};
+InstMma: ast::Instruction<ast::ParsedArgParams<'input>> = {
+    "mma" ".sync" ".aligned" <shape:MmaShape> <_l1:MmaLayout> <_l2:MmaLayout> <dst:MmaType> <a:MmaType> <b:MmaType> <c:MmaType> <d:DstOperandVec> "," <fa:SrcOperandVec> "," <fb:SrcOperandVec> "," <fc:SrcOperandVec> => {
+        let (m, n, k) = shape;
+        ast::Instruction::Mma(
+            ast::MmaDetails { m, n, k, dst, a, b, c },
+            ast::ArgMma { dst: d, a: fa, b: fb, c: fc },
+        )
+    },
+};
+
+MmaShape: (u8, u8, u8) = {
+    ".m16n8k8" => (16, 8, 8),
+    ".m16n8k16" => (16, 8, 16),
+    ".m16n8k32" => (16, 8, 32),
+};
+
+MmaLayout: () = {
+    ".row" => (),
+    ".col" => (),
+};
+
+// The type names of the mma form don't carry the leading dot in the
+// nonterminal, so the grammar can name them individually.
+MmaType: ast::ScalarType = {
+    ".f16" => ast::ScalarType::F16,
+    ".bf16" => ast::ScalarType::B16,
+    ".f32" => ast::ScalarType::F32,
+    ".s32" => ast::ScalarType::S32,
+    ".u32" => ast::ScalarType::U32,
+    ".s8" => ast::ScalarType::S8,
+    ".u8" => ast::ScalarType::U8,
+    ".tf32" => ast::ScalarType::B32,
+};
+
+InstShf: ast::Instruction<ast::ParsedArgParams<'input>> = {
+    "shf" ".l" ".wrap" ".b32" <a:Arg4> => ast::Instruction::Shf(ast::ShfDetails { left: true, wrap: true }, a),
+    "shf" ".l" ".clamp" ".b32" <a:Arg4> => ast::Instruction::Shf(ast::ShfDetails { left: true, wrap: false }, a),
+    "shf" ".r" ".wrap" ".b32" <a:Arg4> => ast::Instruction::Shf(ast::ShfDetails { left: false, wrap: true }, a),
+    "shf" ".r" ".clamp" ".b32" <a:Arg4> => ast::Instruction::Shf(ast::ShfDetails { left: false, wrap: false }, a),
+};
+
+InstTrap: ast::Instruction<ast::ParsedArgParams<'input>> = {
+    "trap" => ast::Instruction::Trap
+};
+
+InstCopysign: ast::Instruction<ast::ParsedArgParams<'input>> = {
+    "copysign" ".f32" <a:Arg3> => ast::Instruction::Copysign(ast::ScalarType::F32, a)
+};
+
+// https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#integer-arithmetic-instructions-dp4a
+InstDp4a: ast::Instruction<ast::ParsedArgParams<'input>> = {
+    "dp4a" ".s32" ".s32" <a:Arg4> => ast::Instruction::Dp4a(ast::ScalarType::S32, a),
+    "dp4a" ".u32" ".u32" <a:Arg4> => ast::Instruction::Dp4a(ast::ScalarType::U32, a),
+};
+
+// The cache operator of a cp.async: it only selects the cache level the copy
+// goes through.
+CpAsyncCacheOp: () = {
+    ".ca" => (),
+    ".cg" => (),
+};
+
+InstCpAsync: ast::Instruction<ast::ParsedArgParams<'input>> = {
+    "cp" ".async" <_cache:CpAsyncCacheOp?> ".shared" ".global" "[" <dst:Operand> "]" "," "[" <src:Operand> "]" "," <size:DecimalNumToken> <src_size:("," <Operand>)?> => {
+        ast::Instruction::CpAsync(
+            ast::CpAsyncDetails { size: size.parse().unwrap_or(0) },
+            ast::ArgCpAsync { dst, src, src_size },
+        )
+    },
+    "cp" ".async" ".commit_group" => ast::Instruction::CpAsyncCommitGroup,
+    "cp" ".async" ".wait_group" <n:DecimalNumToken> => ast::Instruction::CpAsyncWaitGroup(n.parse().unwrap_or(0)),
+    "cp" ".async" ".wait_all" => ast::Instruction::CpAsyncWaitAll,
+};
+
+LdMatrixNum: u8 = {
+    ".x1" => 1,
+    ".x2" => 2,
+    ".x4" => 4,
+};
+
+InstShfl: ast::Instruction<ast::ParsedArgParams<'input>> = {
+    "shfl" ".sync" ".idx" ".b32" <dst:Operand> <pred:OptionalDstOperand?> "," <src:Operand> "," <lane:Operand> "," <clamp:Operand> "," <mask:Operand> =>
+        ast::Instruction::Shfl(ast::ShflMode::Idx, ast::ScalarType::B32, ast::ArgShfl { dst, dst_predicate: pred, src, lane, clamp, member_mask: mask }),
+    "shfl" ".sync" ".idx" ".u32" <dst:Operand> <pred:OptionalDstOperand?> "," <src:Operand> "," <lane:Operand> "," <clamp:Operand> "," <mask:Operand> =>
+        ast::Instruction::Shfl(ast::ShflMode::Idx, ast::ScalarType::U32, ast::ArgShfl { dst, dst_predicate: pred, src, lane, clamp, member_mask: mask }),
+    "shfl" ".sync" ".up" ".b32" <dst:Operand> <pred:OptionalDstOperand?> "," <src:Operand> "," <lane:Operand> "," <clamp:Operand> "," <mask:Operand> =>
+        ast::Instruction::Shfl(ast::ShflMode::Up, ast::ScalarType::B32, ast::ArgShfl { dst, dst_predicate: pred, src, lane, clamp, member_mask: mask }),
+    "shfl" ".sync" ".up" ".u32" <dst:Operand> <pred:OptionalDstOperand?> "," <src:Operand> "," <lane:Operand> "," <clamp:Operand> "," <mask:Operand> =>
+        ast::Instruction::Shfl(ast::ShflMode::Up, ast::ScalarType::U32, ast::ArgShfl { dst, dst_predicate: pred, src, lane, clamp, member_mask: mask }),
+    "shfl" ".sync" ".down" ".b32" <dst:Operand> <pred:OptionalDstOperand?> "," <src:Operand> "," <lane:Operand> "," <clamp:Operand> "," <mask:Operand> =>
+        ast::Instruction::Shfl(ast::ShflMode::Down, ast::ScalarType::B32, ast::ArgShfl { dst, dst_predicate: pred, src, lane, clamp, member_mask: mask }),
+    "shfl" ".sync" ".down" ".u32" <dst:Operand> <pred:OptionalDstOperand?> "," <src:Operand> "," <lane:Operand> "," <clamp:Operand> "," <mask:Operand> =>
+        ast::Instruction::Shfl(ast::ShflMode::Down, ast::ScalarType::U32, ast::ArgShfl { dst, dst_predicate: pred, src, lane, clamp, member_mask: mask }),
+    "shfl" ".sync" ".bfly" ".b32" <dst:Operand> <pred:OptionalDstOperand?> "," <src:Operand> "," <lane:Operand> "," <clamp:Operand> "," <mask:Operand> =>
+        ast::Instruction::Shfl(ast::ShflMode::Bfly, ast::ScalarType::B32, ast::ArgShfl { dst, dst_predicate: pred, src, lane, clamp, member_mask: mask }),
+    "shfl" ".sync" ".bfly" ".u32" <dst:Operand> <pred:OptionalDstOperand?> "," <src:Operand> "," <lane:Operand> "," <clamp:Operand> "," <mask:Operand> =>
+        ast::Instruction::Shfl(ast::ShflMode::Bfly, ast::ScalarType::U32, ast::ArgShfl { dst, dst_predicate: pred, src, lane, clamp, member_mask: mask }),
+}
+
+// https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#warp-vote-functions
+//
+// vote.sync.mode.pred   d, a, membermask;   // d and a are predicate registers
+// vote.sync.ballot.b32 d, a, membermask;   // d is a bitmask, a is a predicate
+// .mode = { .all, .any, .uni }
+InstVote: ast::Instruction<ast::ParsedArgParams<'input>> = {
+    "vote" ".sync" ".all" ".pred" <dst:Operand> "," <src:Operand> "," <mask:Operand> =>
+        ast::Instruction::Vote(ast::VoteMode::All, ast::ScalarType::Pred, ast::ArgVote { dst, src, member_mask: mask }),
+    "vote" ".sync" ".any" ".pred" <dst:Operand> "," <src:Operand> "," <mask:Operand> =>
+        ast::Instruction::Vote(ast::VoteMode::Any, ast::ScalarType::Pred, ast::ArgVote { dst, src, member_mask: mask }),
+    "vote" ".sync" ".uni" ".pred" <dst:Operand> "," <src:Operand> "," <mask:Operand> =>
+        ast::Instruction::Vote(ast::VoteMode::Uni, ast::ScalarType::Pred, ast::ArgVote { dst, src, member_mask: mask }),
+    "vote" ".sync" ".ballot" ".b32" <dst:Operand> "," <src:Operand> "," <mask:Operand> =>
+        ast::Instruction::Vote(ast::VoteMode::Ballot, ast::ScalarType::B32, ast::ArgVote { dst, src, member_mask: mask }),
+    // The ISA also spells the vote with the operation before the barrier:
+    // "vote.ballot.sync.b32 d, p, mask;"
+    "vote" ".all" ".sync" ".pred" <dst:Operand> "," <src:Operand> "," <mask:Operand> =>
+        ast::Instruction::Vote(ast::VoteMode::All, ast::ScalarType::Pred, ast::ArgVote { dst, src, member_mask: mask }),
+    "vote" ".any" ".sync" ".pred" <dst:Operand> "," <src:Operand> "," <mask:Operand> =>
+        ast::Instruction::Vote(ast::VoteMode::Any, ast::ScalarType::Pred, ast::ArgVote { dst, src, member_mask: mask }),
+    "vote" ".uni" ".sync" ".pred" <dst:Operand> "," <src:Operand> "," <mask:Operand> =>
+        ast::Instruction::Vote(ast::VoteMode::Uni, ast::ScalarType::Pred, ast::ArgVote { dst, src, member_mask: mask }),
+    "vote" ".ballot" ".sync" ".b32" <dst:Operand> "," <src:Operand> "," <mask:Operand> =>
+        ast::Instruction::Vote(ast::VoteMode::Ballot, ast::ScalarType::B32, ast::ArgVote { dst, src, member_mask: mask }),
 }
 
 // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-atom
@@ -1499,6 +2010,15 @@ InstAtom: ast::Instruction<ast::ParsedArgParams<'input>> = {
             scope: scope.unwrap_or(ast::MemScope::Gpu),
             space: space.unwrap_or(ast::StateSpace::Generic),
             inner: ast::AtomInnerDetails::Float { op, typ }
+        };
+        ast::Instruction::Atom(details,a)
+    },
+    "atom" <op: AtomUIntOp> <sema:AtomSemantics> <scope:MemScope?> <space:AtomSpace?> <typ:UIntType3264> <a:Arg3Atom> => {
+        let details = ast::AtomDetails {
+            semantics: sema,
+            scope: scope.unwrap_or(ast::MemScope::Gpu),
+            space: space.unwrap_or(ast::StateSpace::Generic),
+            inner: ast::AtomInnerDetails::Unsigned { op, typ }
         };
         ast::Instruction::Atom(details,a)
     },
@@ -1709,6 +2229,15 @@ InstClz: ast::Instruction<ast::ParsedArgParams<'input>> = {
     "clz" <typ:BitType> <arg:Arg2> => ast::Instruction::Clz{ <> }
 }
 
+// https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#integer-arithmetic-instructions-bfind
+// bfind: index of the most significant set bit (0 when the input is 0).
+InstBfind: ast::Instruction<ast::ParsedArgParams<'input>> = {
+    "bfind" ".u32" <arg:Arg2> => ast::Instruction::Bfind{ typ: ast::ScalarType::U32, arg },
+    "bfind" ".s32" <arg:Arg2> => ast::Instruction::Bfind{ typ: ast::ScalarType::S32, arg },
+    "bfind" ".b32" <arg:Arg2> => ast::Instruction::Bfind{ typ: ast::ScalarType::B32, arg },
+    "bfind" ".b64" <arg:Arg2> => ast::Instruction::Bfind{ typ: ast::ScalarType::B64, arg },
+}
+
 // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#integer-arithmetic-instructions-brev
 InstBrev: ast::Instruction<ast::ParsedArgParams<'input>> = {
     "brev" <typ:BitType> <arg:Arg2> => ast::Instruction::Brev{ <> }
@@ -1823,7 +2352,11 @@ ArithFloatMustRound: ast::ArithFloat = {
 Operand: ast::Operand<&'input str> = {
     <r:ExtendedID> => ast::Operand::Reg(r),
     <r:ExtendedID> "+" <offset:S32Num> => ast::Operand::RegOffset(r, offset),
-    <x:ImmediateValue> => ast::Operand::Imm(x)
+    <x:ImmediateValue> => ast::Operand::Imm(x),
+    <mem_op:MemberOperand> => {
+        let (reg, idx) = mem_op;
+        ast::Operand::VecMember(reg, idx)
+    }
 };
 
 CallOperand: ast::Operand<&'input str> = {
@@ -1891,12 +2424,23 @@ MemberOperand: (&'input str, u8) = {
 };
 
 VectorExtract: Vec<&'input str> = {
-    "{" <r1:ExtendedID> "," <r2:ExtendedID> "}" => {
+    // A pack of one element: "ldmatrix.sync.aligned.m8n8.x1.b16 {%r3}, [%rd10];"
+    "{" <r1:ExtendedIDOrHole> "}" => {
+        vec![r1]
+    },
+    // A vector pack may leave some elements unwritten: "mov.b64 {_, %r1}, %rd2;"
+    // writes only the high half of the 64-bit register.
+    "{" <r1:ExtendedIDOrHole> "," <r2:ExtendedIDOrHole> "}" => {
         vec![r1, r2]
     },
-    "{" <r1:ExtendedID> "," <r2:ExtendedID> "," <r3:ExtendedID> "," <r4:ExtendedID> "}" => {
+    "{" <r1:ExtendedIDOrHole> "," <r2:ExtendedIDOrHole> "," <r3:ExtendedIDOrHole> "," <r4:ExtendedIDOrHole> "}" => {
         vec![r1, r2, r3, r4]
     },
+};
+
+// An element of a vector pack: either a register or "_" (do not write).
+ExtendedIDOrHole: &'input str = {
+    <r:ExtendedID> => r,
 };
 
 Arg3: ast::Arg3<ast::ParsedArgParams<'input>> = {
@@ -1940,6 +2484,11 @@ OptionalDst: &'input str = {
     "|" <dst2:ExtendedID> => dst2
 }
 
+// The optional predicate output of shfl.sync ("d[|p]").
+OptionalDstOperand: ast::Operand<&'input str> = {
+    "|" <dst2:ExtendedID> => ast::Operand::Reg(dst2),
+}
+
 SrcOperand: ast::Operand<&'input str> = {
     <r:ExtendedID> => ast::Operand::Reg(r),
     <r:ExtendedID> "+" <offset:S32Num> => ast::Operand::RegOffset(r, offset),
@@ -1952,8 +2501,16 @@ SrcOperand: ast::Operand<&'input str> = {
 
 SrcOperandVec: ast::Operand<&'input str> = {
     <normal:SrcOperand> => normal,
-    <vec:VectorExtract> => ast::Operand::VecPack(vec),
-}
+    <vec:VectorExtract> => if vec.len() == 1 { ast::Operand::Reg(vec[0]) } else { ast::Operand::VecPack(vec) },
+    // A vector literal of immediates: "st.global.v2.b32 [%rd], {99, 0};"
+    <vec:VectorImmediate> => ast::Operand::ImmPack(vec),
+};
+
+// A vector literal whose elements are constants.
+VectorImmediate: Vec<ast::ImmediateValue> = {
+    "{" <a:ImmediateValue> "," <b:ImmediateValue> "}" => vec![a, b],
+    "{" <a:ImmediateValue> "," <b:ImmediateValue> "," <c:ImmediateValue> "," <d:ImmediateValue> "}" => vec![a, b, c, d],
+};
 
 DstOperand: ast::Operand<&'input str> = {
     <r:ExtendedID> => ast::Operand::Reg(r),
@@ -1965,7 +2522,7 @@ DstOperand: ast::Operand<&'input str> = {
 
 DstOperandVec: ast::Operand<&'input str> = {
     <normal:DstOperand> => normal,
-    <vec:VectorExtract> => ast::Operand::VecPack(vec),
+    <vec:VectorExtract> => if vec.len() == 1 { ast::Operand::Reg(vec[0]) } else { ast::Operand::VecPack(vec) },
 }
 
 VectorPrefix: u8 = {

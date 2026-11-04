@@ -43,6 +43,36 @@ pub enum PtxError {
 #[derive(Copy, Clone, Eq, PartialEq)]
 pub enum BarDetails {
     SyncAligned,
+    RedPopc,
+    /// `bar.warp.sync` - a barrier that only synchronizes the warp.
+    WarpSync,
+}
+
+/// Mode of a `shfl.sync` instruction.
+#[derive(Copy, Clone, Eq, PartialEq)]
+pub enum ShflMode {
+    /// `shfl.sync.idx` - take the value from the lane given by the source
+    /// lane operand.
+    Idx,
+    /// `shfl.sync.up` - take the value from lane - delta.
+    Up,
+    /// `shfl.sync.down` - take the value from lane + delta.
+    Down,
+    /// `shfl.sync.bfly` - butterfly exchange with lane XOR delta.
+    Bfly,
+}
+
+/// Mode of a `vote.sync` instruction.
+#[derive(Copy, Clone, Eq, PartialEq)]
+pub enum VoteMode {
+    /// `vote.sync.all.pred` - all threads in the mask voted true.
+    All,
+    /// `vote.sync.any.pred` - at least one thread in the mask voted true.
+    Any,
+    /// `vote.sync.uni.pred` - the threads in the mask disagree.
+    Uni,
+    /// `vote.sync.ballot.b32` - collect the votes into a bitmask.
+    Ballot,
 }
 
 pub trait UnwrapWithVec<E, To> {
@@ -118,6 +148,11 @@ pub enum Type {
     // .param.b32 foo[4];
     // -> OpTypeArray
     Array(ScalarType, Vec<u32>),
+    // A by-value struct that arrives as ".param .b8 name[N]" with N larger
+    // than a vector holds: an OpTypeStruct of 32-bit members, which the
+    // backend accepts as a kernel argument where an array is rejected.
+    // -> OpTypeStruct
+    Struct(Vec<ScalarType>),
     /*
         Variables of this type almost never exist in the original .ptx and are
         usually artificially created. Some examples below:
@@ -207,6 +242,10 @@ impl Default for ScalarType {
 
 pub enum Statement<P: ArgParams> {
     Label(P::Id),
+    /// `$L: .branchtargets $L0, $L1, ...;` - the jump table of an indirect
+    /// branch. Produces no code of its own; the labels it names are its
+    /// meaning.
+    BranchTargets(P::Id, Vec<P::Id>),
     Variable(MultiVariable<P::Id>),
     Instruction(Option<PredAt<P::Id>>, Instruction<P>),
     Block(Vec<Statement<P>>),
@@ -215,6 +254,8 @@ pub enum Statement<P: ArgParams> {
 pub struct MultiVariable<ID> {
     pub var: Variable<ID>,
     pub count: Option<u32>,
+    /// Further registers declared in the same statement: ".reg .f16 a, b;"
+    pub extra: Vec<Variable<ID>>,
 }
 
 #[derive(Clone)]
@@ -269,6 +310,61 @@ pub enum Instruction<P: ArgParams> {
     And(ScalarType, Arg3<P>),
     Selp(ScalarType, Arg4<P>),
     Bar(BarDetails, Arg1Bar<P>),
+    /// "membar.cta;" - a memory barrier.
+    Membar(MemScope),
+    BarRedPopc(P::Operand, P::Operand, P::Operand),
+    /// `bar.red.or.pred d, barrier, p;` - a barrier that also reduces a
+    /// predicate across the workgroup. `and` selects the conjunction.
+    BarRedPred(bool, P::Operand, P::Operand, P::Operand),
+    Shfl(ShflMode, ScalarType, ArgShfl<P>),
+    LdMatrix(LdMatrixDetails, Arg2LdMatrix<P>),
+    CpAsync(CpAsyncDetails, ArgCpAsync<P>),
+    /// `prmt.b32 d, a, b, c;` - permute the eight bytes of a and b into d
+    /// under the control of the four nibbles of c.
+    Prmt(ScalarType, Arg4<P>),
+    /// `nanosleep.u32 n;` - a scheduling hint, it has no result.
+    Nanosleep(Arg1<P>),
+    /// `dp4a.s32.s32 d, a, b, c;` - the dot product of four byte pairs,
+    /// accumulated into c.
+    Dp4a(ScalarType, Arg4<P>),
+    /// `copysign.f32 d, a, b;` - the magnitude of a with the sign of b.
+    Copysign(ScalarType, Arg3<P>),
+    /// `trap;` - abort the kernel. SPIR-V has no equivalent that keeps the
+    /// rest of the block valid, so the abort is not emitted (the trap only
+    /// follows an assert that already reported the failure).
+    Trap,
+    /// `shf.l.wrap.b32 d, a, b, c;` - the funnel shift: the 64-bit value
+    /// a:b shifted left by c, low 32 bits.
+    Shf(ShfDetails, Arg4<P>),
+    /// `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32` - the tensor-core
+    /// matrix multiply-accumulate.
+    Mma(MmaDetails, ArgMma<P>),
+    /// `movmatrix.sync.aligned.m8n8.trans.b16 d, a;` - the transpose of the
+    /// matrix a warp holds in registers.
+    MovMatrix(Arg2<P>),
+    /// `redux.sync.add.s32 d, a, mask;` - a reduction across the warp.
+    Redux(ReduxOp, ScalarType, Arg3<P>),
+    /// `vsub4.u32.u32.u32 d, a, b, c;` - four bytes subtracted in parallel,
+    /// each result wrapped into its byte.
+    VSub4(Arg3<P>),
+    /// `vset4.u32.u32.ne d, a, b, c;` - four bytes compared in parallel, each
+    /// result one or zero.
+    VSet4(CompareOp, Arg3<P>),
+    /// `brx.idx %r, $L;` - jump to the n-th label of the table `$L`. The
+    /// table label and its target labels are resolved together when the
+    /// identifiers of the function are.
+    BrxIdx(P::Operand, Option<P::Operand>, Vec<u32>),
+    /// `cvt.rn.f16x2.f32 d, a, b;` - two floats converted to a packed pair,
+    /// the first one in the low half. The type is F16x2 for the half precision
+    /// form and B16 for the bfloat one, which has no SPIR-V type of its own.
+    CvtPacked(ScalarType, Arg3<P>),
+    /// `cp.async.commit_group;` - the copies issued so far form a group.
+    CpAsyncCommitGroup,
+    /// `cp.async.wait_group n;` - wait for all but the last n groups.
+    CpAsyncWaitGroup(usize),
+    /// `cp.async.wait_all;` - wait for every group.
+    CpAsyncWaitAll,
+    Vote(VoteMode, ScalarType, ArgVote<P>),
     Atom(AtomDetails, Arg3<P>),
     AtomCas(AtomCasDetails, Arg4<P>),
     Div(DivDetails, Arg3<P>),
@@ -280,6 +376,7 @@ pub enum Instruction<P: ArgParams> {
     Lg2 { flush_to_zero: bool, arg: Arg2<P> },
     Ex2 { flush_to_zero: bool, arg: Arg2<P> },
     Clz { typ: ScalarType, arg: Arg2<P> },
+    Bfind { typ: ScalarType, arg: Arg2<P> },
     Brev { typ: ScalarType, arg: Arg2<P> },
     Popc { typ: ScalarType, arg: Arg2<P> },
     Xor { typ: ScalarType, arg: Arg3<P> },
@@ -330,6 +427,127 @@ pub struct Arg1<P: ArgParams> {
 
 pub struct Arg1Bar<P: ArgParams> {
     pub src: P::Operand,
+}
+
+/// `shfl.sync.<mode>.<type> d[|p], a, b, c, membermask;`
+///
+/// `d` receives the value, `a` is the value to send, `b` is the source lane
+/// (or the delta for up/down/bfly), `c` packs the segment mask and the clamp
+/// value, and the last operand is the member mask. The optional `|p` after
+/// the destination is a predicate that is set when the computed source lane
+/// was in range.
+/// `ldmatrix.sync.aligned.m8n8.x{num}.b16 [.trans] {d...}, [p];`
+///
+/// Loads 8x8 matrices of 16-bit elements from shared memory into the
+/// registers of all threads of the warp: the rows of matrix i come from the
+/// addresses of threads 8i..8i+7, and thread t receives the two elements at
+/// row t/4, columns 2*(t%4) and 2*(t%4)+1 of every matrix.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct LdMatrixDetails {
+    /// The number of 8x8 matrices: 1, 2 or 4.
+    pub num: u8,
+    /// The matrix is transposed when distributed to the threads.
+    pub trans: bool,
+}
+
+/// `cp.async.cg.shared.global [dst], [src], 16;`
+///
+/// Asynchronously copies `size` bytes of global memory into shared memory.
+/// The copy is lowered to a plain copy (the point of the instruction is to
+/// overlap it with the arithmetic, which a synchronous copy does not, but
+/// the result is the same).
+/// The shape and the types of a `mma.sync` instruction.
+/// The comparison of the byte-wise `vset4` family.
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub enum CompareOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+/// The operation of a warp reduction.
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub enum ReduxOp {
+    Add,
+    Min,
+    Max,
+    And,
+    Or,
+    Xor,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub struct MmaDetails {
+    pub m: u8,
+    pub n: u8,
+    pub k: u8,
+    pub dst: ScalarType,
+    pub a: ScalarType,
+    pub b: ScalarType,
+    pub c: ScalarType,
+}
+
+pub struct ArgMma<P: ArgParams> {
+    /// The D fragment: m*n/32 register(s) per thread.
+    pub dst: P::Operand,
+    /// The A fragment.
+    pub a: P::Operand,
+    /// The B fragment.
+    pub b: P::Operand,
+    /// The C fragment (the accumulator input).
+    pub c: P::Operand,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct ShfDetails {
+    /// True for the left funnel shift, false for the right one.
+    pub left: bool,
+    /// The shift count wraps around instead of saturating.
+    pub wrap: bool,
+}
+
+pub struct CpAsyncDetails {
+    pub size: u8,
+}
+
+pub struct ArgCpAsync<P: ArgParams> {
+    /// The shared-memory destination address (an offset into the window).
+    pub dst: P::Operand,
+    /// The global source address.
+    pub src: P::Operand,
+    /// Optional number of source bytes to copy; the rest is zero-filled.
+    pub src_size: Option<P::Operand>,
+}
+
+pub struct Arg2LdMatrix<P: ArgParams> {
+    /// The fragment registers: num b32 registers, one per matrix.
+    pub dst: P::Operand,
+    /// The shared-memory address (one per thread, 16 bytes per row).
+    pub src: P::Operand,
+}
+
+pub struct ArgShfl<P: ArgParams> {
+    pub dst: P::Operand,
+    /// Optional predicate output ("the source lane was in range").
+    pub dst_predicate: Option<P::Operand>,
+    pub src: P::Operand,
+    pub lane: P::Operand,
+    pub clamp: P::Operand,
+    pub member_mask: P::Operand,
+}
+
+/// `vote.sync.mode.pred   d[|p], a, membermask;`
+/// `vote.sync.ballot.b32 d, a, membermask;`
+///
+/// `d` and `a` are predicate registers (the ballot form's destination is a
+/// b32 bitmask), `membermask` is a 32-bit integer.
+pub struct ArgVote<P: ArgParams> {
+    pub dst: P::Operand,
+    pub src: P::Operand,
+    pub member_mask: P::Operand,
 }
 
 pub struct Arg2<P: ArgParams> {
@@ -402,6 +620,8 @@ pub enum Operand<Id> {
     Imm(ImmediateValue),
     VecMember(Id, u8),
     VecPack(Vec<Id>),
+    /// A vector literal of constants: `{99, 0}`.
+    ImmPack(Vec<ImmediateValue>),
 }
 
 pub enum VectorPrefix {
@@ -968,6 +1188,8 @@ pub enum TuningDirective {
     MaxNtid(u32, u32, u32),
     ReqNtid(u32, u32, u32),
     MinNCtaPerSm(u32),
+    /// ".noreturn" - the function never returns.
+    NoReturn,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

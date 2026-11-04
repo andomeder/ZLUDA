@@ -7,28 +7,28 @@
                OpCapability Int64
                OpCapability Float16
                OpCapability Float64
-         %40 = OpExtInstImport "OpenCL.std"
+               OpCapability KernelAttributesINTEL
+               OpCapability SubgroupShuffleINTEL
+               OpCapability GroupNonUniformVote
+               OpCapability GroupNonUniformBallot
+               OpExtension "SPV_INTEL_kernel_attributes"
+               OpExtension "SPV_INTEL_subgroups"
+         %35 = OpExtInstImport "OpenCL.std"
                OpMemoryModel Physical64 OpenCL
                OpEntryPoint Kernel %1 "bfe"
-               OpDecorate %34 LinkageAttributes "__zluda_ptx_impl__bfe_u32" Import
+               OpExecutionMode %1 MaxWorkgroupSizeINTEL 256 256 256
        %void = OpTypeVoid
-       %uint = OpTypeInt 32 0
-         %43 = OpTypeFunction %uint %uint %uint %uint
       %ulong = OpTypeInt 64 0
-         %45 = OpTypeFunction %void %ulong %ulong
+         %38 = OpTypeFunction %void %ulong %ulong
 %_ptr_Function_ulong = OpTypePointer Function %ulong
+       %uint = OpTypeInt 32 0
 %_ptr_Function_uint = OpTypePointer Function %uint
 %_ptr_Generic_uint = OpTypePointer Generic %uint
     %ulong_4 = OpConstant %ulong 4
       %uchar = OpTypeInt 8 0
 %_ptr_Generic_uchar = OpTypePointer Generic %uchar
     %ulong_8 = OpConstant %ulong 8
-         %34 = OpFunction %uint None %43
-         %36 = OpFunctionParameter %uint
-         %37 = OpFunctionParameter %uint
-         %38 = OpFunctionParameter %uint
-               OpFunctionEnd
-          %1 = OpFunction %void None %45
+          %1 = OpFunction %void None %38
           %9 = OpFunctionParameter %ulong
          %10 = OpFunctionParameter %ulong
          %33 = OpLabel
@@ -51,22 +51,22 @@
                OpStore %6 %13
          %16 = OpLoad %ulong %4
          %30 = OpConvertUToPtr %_ptr_Generic_uint %16
-         %51 = OpBitcast %_ptr_Generic_uchar %30
-         %52 = OpInBoundsPtrAccessChain %_ptr_Generic_uchar %51 %ulong_4
-         %26 = OpBitcast %_ptr_Generic_uint %52
+         %45 = OpBitcast %_ptr_Generic_uchar %30
+         %46 = OpInBoundsPtrAccessChain %_ptr_Generic_uchar %45 %ulong_4
+         %26 = OpBitcast %_ptr_Generic_uint %46
          %15 = OpLoad %uint %26 Aligned 4
                OpStore %7 %15
          %18 = OpLoad %ulong %4
          %31 = OpConvertUToPtr %_ptr_Generic_uint %18
-         %53 = OpBitcast %_ptr_Generic_uchar %31
-         %54 = OpInBoundsPtrAccessChain %_ptr_Generic_uchar %53 %ulong_8
-         %28 = OpBitcast %_ptr_Generic_uint %54
+         %47 = OpBitcast %_ptr_Generic_uchar %31
+         %48 = OpInBoundsPtrAccessChain %_ptr_Generic_uchar %47 %ulong_8
+         %28 = OpBitcast %_ptr_Generic_uint %48
          %17 = OpLoad %uint %28 Aligned 4
                OpStore %8 %17
          %20 = OpLoad %uint %6
          %21 = OpLoad %uint %7
          %22 = OpLoad %uint %8
-         %19 = OpFunctionCall %uint %34 %20 %21 %22
+         %19 = OpBitFieldUExtract %uint %20 %21 %22
                OpStore %6 %19
          %23 = OpLoad %ulong %5
          %24 = OpLoad %uint %6

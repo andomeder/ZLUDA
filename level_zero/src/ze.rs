@@ -235,15 +235,34 @@ impl Context {
         Ok(result)
     }
 
-    // This operation is safe because Level Zero impl tracks allocations
-    pub fn mem_free(&self, ptr: *mut c_void) -> Result<()> {
+// This operation is safe because Level Zero impl tracks allocations
+pub fn mem_free(&self, ptr: *mut c_void) -> Result<()> {
+check! {
+sys::zeMemFree(
+self.as_ffi(),
+ptr,
+)
+};
+Ok(())
+    }
+
+    pub fn mem_alloc_host(&self, size: usize, alignment: usize) -> Result<*mut c_void> {
+        let descr = sys::ze_host_mem_alloc_desc_t {
+            stype: sys::ze_structure_type_t::ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC,
+            pNext: ptr::null(),
+            flags: sys::ze_host_mem_alloc_flags_t(0),
+};
+        let mut result = ptr::null_mut();
         check! {
-            sys::zeMemFree(
+            sys::zeMemAllocHost(
                 self.as_ffi(),
-                ptr,
+                &descr,
+                size,
+                alignment,
+                &mut result,
             )
         };
-        Ok(())
+        Ok(result)
     }
 }
 
@@ -426,8 +445,12 @@ impl<'a> Module<'a> {
         binaries: &[&'buffers [u8]],
         opts: Option<&CStr>,
     ) -> (Result<Self>, Option<BuildLog>) {
-        let ocl_program = match Self::build_link_spirv_impl(binaries, opts) {
-            Err(_) => {
+        let (ocl_options, ze_options) = Self::split_build_options(opts);
+        let ocl_program = match Self::build_link_spirv_impl(binaries, Some(&ocl_options)) {
+            Err(e) => {
+                if std::env::var_os("ZLUDA_TRACE_BUILD").is_some() {
+                    eprintln!("link failed: {:?}", e);
+                }
                 return (
                     Err(sys::ze_result_t::ZE_RESULT_ERROR_MODULE_LINK_FAILURE),
                     None,
@@ -437,7 +460,13 @@ impl<'a> Module<'a> {
         };
         match ocl_core::get_program_info(&ocl_program, ocl_core::ProgramInfo::Binaries) {
             Ok(ocl_core::ProgramInfoResult::Binaries(binaries)) => {
-                let (module, build_log) = Self::build_native_logged(ctx, d, &binaries[0]);
+                let ze_options = if ze_options.is_empty() {
+                    None
+                } else {
+                    Some(ze_options.as_c_str())
+                };
+                let (module, build_log) =
+                    Self::build_native_logged(ctx, d, &binaries[0], ze_options);
                 (module, Some(build_log))
             }
             _ => return (Err(sys::ze_result_t::ZE_RESULT_ERROR_UNKNOWN), None),
@@ -485,18 +514,8 @@ impl<'a> Module<'a> {
             Some(o) => o.to_owned(),
             None => CString::default(),
         };
-        for program in programs.iter() {
-            ocl_core::compile_program(
-                program,
-                Some(&[device]),
-                &options,
-                &[],
-                &[],
-                None,
-                None,
-                None,
-            )?;
-        }
+        // The programs hold SPIR-V that the linker compiles itself; building
+        // them separately first only adds a step that can fail on its own.
         ocl_core::link_program::<ocl_core::DeviceId, _>(
             &ocl_ctx,
             Some(&[device]),
@@ -505,6 +524,31 @@ impl<'a> Module<'a> {
             None,
             None,
             None,
+        )
+    }
+
+    /// The build options that the PTX translator produces mix OpenCL options
+    /// ("-cl-opt-disable") with Level Zero ones ("-ze-denorms-are-zero"). The
+    /// OpenCL calls only accept the former, the module creation only the
+    /// latter: handing a Level Zero option to the OpenCL compiler makes it
+    /// reject the whole build.
+    fn split_build_options(opts: Option<&CStr>) -> (CString, CString) {
+        let opts = match opts {
+            Some(o) => o.to_string_lossy().into_owned(),
+            None => String::new(),
+        };
+        let mut ocl = Vec::new();
+        let mut ze = Vec::new();
+        for opt in opts.split_whitespace() {
+            if opt.starts_with("-cl-") {
+                ocl.push(opt);
+            } else {
+                ze.push(opt);
+            }
+        }
+        (
+            CString::new(ocl.join(" ")).unwrap(),
+            CString::new(ze.join(" ")).unwrap(),
         )
     }
 
@@ -530,8 +574,9 @@ impl<'a> Module<'a> {
         ctx: &'a Context,
         d: Device,
         bin: &[u8],
+        opts: Option<&CStr>,
     ) -> (Result<Self>, BuildLog) {
-        Module::new_logged(ctx, false, d, bin, None)
+        Module::new_logged(ctx, false, d, bin, opts)
     }
 
     fn new(
@@ -843,6 +888,39 @@ impl<'a> CommandList<'a> {
         })
     }
 
+    /// 2D/3D region copy (zeCommandListAppendMemoryCopyRegion).
+    pub unsafe fn append_memory_copy_region_raw(
+        &self,
+        dst: *mut c_void,
+        dst_pitch: u32,
+        dst_slice_pitch: u32,
+        dst_region: sys::ze_copy_region_t,
+        src: *const c_void,
+        src_pitch: u32,
+        src_slice_pitch: u32,
+        src_region: sys::ze_copy_region_t,
+        signal: Option<&Event>,
+        wait: &[&Event],
+    ) -> Result<()> {
+        let signal_event = signal.map_or(ptr::null_mut(), |e| e.as_ffi());
+        Event::with_raw_slice(wait, |wait_len, wait_ptr| {
+            check!(sys::zeCommandListAppendMemoryCopyRegion(
+                self.as_ffi(),
+                dst,
+                &dst_region,
+                dst_pitch,
+                dst_slice_pitch,
+                src,
+                &src_region,
+                src_pitch,
+                src_slice_pitch,
+                signal_event,
+                wait_len,
+                wait_ptr
+            ));
+            Ok(())
+        })
+    }
     pub unsafe fn append_memory_fill<'dep, T: Copy + Sized + 'dep, Dst: Into<Slice<'dep, T>>>(
         &'a self,
         dst: Dst,
@@ -906,17 +984,19 @@ impl<'a> CommandList<'a> {
             groupCountZ: group_count[2],
         };
         let signal_event = signal.map_or(ptr::null_mut(), |e| e.as_ffi());
-        Event::with_raw_slice(wait, |wait_len, wait_ptr| {
-            check!(sys::zeCommandListAppendLaunchKernel(
+        let result = Event::with_raw_slice(wait, |wait_len, wait_ptr| {
+            unsafe { sys::zeCommandListAppendLaunchKernel(
                 self.as_ffi(),
                 kernel.as_ffi(),
                 &gr_count,
                 signal_event,
                 wait_len,
                 wait_ptr,
-            ));
-            Ok(())
-        })
+            ) }
+        });
+        check!({ result });
+        check!({ result });
+        Ok(())
     }
 
     pub unsafe fn append_barrier(&self, signal: Option<&Event>, wait: &[&Event]) -> Result<()> {
@@ -1146,7 +1226,10 @@ impl<'a> Event<'a> {
     }
 
     pub fn host_synchronize(&self, timeout_ns: u64) -> Result<()> {
-        check! { sys::zeEventHostSynchronize(self.as_ffi(), timeout_ns) };
+        let raw = unsafe { sys::zeEventHostSynchronize(self.as_ffi(), timeout_ns) };
+        if raw.0 != 0 && raw.0 < 0x70000000 {
+        }
+        check!(raw);
         Ok(())
     }
 
@@ -1244,17 +1327,15 @@ impl<'a> Kernel<'a> {
     }
 
     pub unsafe fn set_arg_raw(&self, index: u32, size: usize, value: *const c_void) -> Result<()> {
-        check!(sys::zeKernelSetArgumentValue(
-            self.as_ffi(),
-            index,
-            size,
-            value
-        ));
+        let result = sys::zeKernelSetArgumentValue(self.as_ffi(), index, size, value);
+        check!({ result });
+        check!({ result });
         Ok(())
     }
-
     pub fn set_group_size(&self, x: u32, y: u32, z: u32) -> Result<()> {
-        check!(sys::zeKernelSetGroupSize(self.as_ffi(), x, y, z));
+        let result = unsafe { sys::zeKernelSetGroupSize(self.as_ffi(), x, y, z) };
+        check!({ result });
+        check!({ result });
         Ok(())
     }
 

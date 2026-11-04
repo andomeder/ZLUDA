@@ -1,0 +1,15 @@
+.version 7.0
+.target sm_80
+.address_size 64
+.visible .entry atom_test(
+    .param .u64 out
+)
+{
+    .reg .u32 %r<4>;
+    .reg .u64 %rd<3>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd1, %rd1;
+    mov.u32 %r1, 1;
+    atom.global.add.u32 %r2, [%rd1], %r1;
+    ret;
+}

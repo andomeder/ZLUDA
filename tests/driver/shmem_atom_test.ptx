@@ -1,0 +1,25 @@
+.version 7.0
+.target sm_80
+.address_size 64
+.visible .entry shmem_atom_test(
+    .param .u64 out
+)
+{
+    .shared .align 4 .b32 smem[32];
+    .reg .u32 %r<6>;
+    .reg .u64 %rd<3>;
+    .reg .pred %p<2>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd1, %rd1;
+    mov.u32 %r1, 1;
+    // atomic increment on static shared array slot 0
+    atom.shared.add.u32 %r2, [smem], %r1;
+    barrier.sync.aligned 0;
+    mov.u32 %r3, %tid.x;
+    setp.ne.s32 %p1, %r3, 0;
+    @%p1 bra done;
+    ld.shared.u32 %r4, [smem];
+    st.global.u32 [%rd1], %r4;
+done:
+    ret;
+}

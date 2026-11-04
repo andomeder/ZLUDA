@@ -1,0 +1,31 @@
+.version 7.0
+.target sm_80
+.address_size 64
+.visible .entry shmem_test(
+    .param .u64 out
+)
+{
+    .shared .align 4 .b32 smem[128];
+    .reg .u32 %r<10>;
+    .reg .u64 %rd<3>;
+    .reg .pred %p<2>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd1, %rd1;
+    mov.u32 %r1, %tid.x;
+    // take the shared array base address, then index by tid
+    mov.u32 %r2, smem;
+    mul.lo.s32 %r3, %r1, 4;
+    add.s32 %r4, %r2, %r3;
+    st.shared.u32 [%r4], %r1;
+    barrier.sync.aligned 0;
+    setp.ne.s32 %p1, %r1, 0;
+    @%p1 bra done;
+    mov.u32 %r5, %ntid.x;
+    sub.s32 %r6, %r5, 1;
+    mul.lo.s32 %r7, %r6, 4;
+    add.s32 %r8, %r2, %r7;
+    ld.shared.u32 %r9, [%r8];
+    st.global.u32 [%rd1], %r9;
+done:
+    ret;
+}

@@ -236,7 +236,7 @@ match {
     "sin",
     // The architecture suffix varies ("sm_90a", "sm_120a") and a target the
     // translator does not model still has to parse: the directive only tells
-    // ptxas what to generate, and this translates to SPIR-V instead.
+    // ptxas what to generate.
     r"sm_[0-9]+[a-z]?" => ShaderModel,
     "sqrt",
     "st",
@@ -383,8 +383,13 @@ U32Num: u32 = {
 S32Num: i32 = {
     <sign:"-"?> <x:NumToken> =>? {
         let (text, radix, _) = x;
-        match i32::from_str_radix(text, radix) {
-            Ok(x) => Ok(if sign.is_some() { -x } else { x }),
+        // An offset is a bit pattern, so 0xfffffffc is -4 rather than an
+        // overflow of the signed range.
+        match u32::from_str_radix(text, radix) {
+            Ok(x) => {
+                let magnitude = x as i32;
+                Ok(if sign.is_some() { magnitude.wrapping_neg() } else { magnitude })
+            }
             Err(err) => Err(ParseError::User { error: ast::PtxError::from(err) })
         }
     }
@@ -749,7 +754,6 @@ ModuleVariable: (ast::LinkingDirective, ast::Variable<&'input str>) = {
         let state_space = ast::StateSpace::Global;
         Ok((linking, ast::Variable { align, v_type, state_space, name, array_init }))
     },
-    // (CrossWorkgroup) since that storage class is fully supported by the translator.
     <linking:LinkingDirectives> ".const" <def:GlobalVariableDefinitionNoArray> => {
         let (align, v_type, name, array_init) = def;
         let state_space = ast::StateSpace::Global;
@@ -1689,8 +1693,8 @@ InstBar: ast::Instruction<ast::ParsedArgParams<'input>> = {
     "bar" ".red" ".popc" ".u32" <dst:Operand> "," <bar_id:Operand> "," <pred:Operand> =>
         ast::Instruction::BarRedPopc(dst, bar_id, pred),
     // bar.red.or.pred %dst, %barrier, %pred - the disjunction (or the
-    // conjunction) of a predicate across the workgroup, at a barrier.
-    // The flag says "conjunction": false is the disjunction.
+    // conjunction) of a predicate across the workgroup; the flag says
+    // "conjunction", false being the disjunction.
     "bar" ".red" ".or" ".pred" <dst:Operand> "," <bar_id:Operand> "," <pred:Operand> =>
         ast::Instruction::BarRedPred(false, dst, bar_id, pred),
     "bar" ".red" ".and" ".pred" <dst:Operand> "," <bar_id:Operand> "," <pred:Operand> =>
@@ -1698,19 +1702,9 @@ InstBar: ast::Instruction<ast::ParsedArgParams<'input>> = {
 }
 
 // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#warp-shuffle-functions
-//
-// shfl.sync.mode.b32 d[|p], a, b, c, membermask;
-//   d = destination (optionally followed by |p, a predicate that is set when
-//       the computed source lane was in range)
-//   a = value to send
-//   b = source lane (or the delta for .up/.down/.bfly)
-//   c = packed value: clamp in bits [4:0] and segment mask in bits [12:8]
-//   membermask = 32-bit mask of the participating threads
+//   shfl.sync.mode.b32 d[|p], a, b, c, membermask;   (c: clamp [4:0], segment mask [12:8])
 // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#warp-level-matrix-instructions-ldmatrix
-//   ldmatrix.sync.aligned.m8n8.x1.b16 {d0}, [p];
-//   ldmatrix.sync.aligned.m8n8.x2.b16 {d0, d1}, [p];
-//   ldmatrix.sync.aligned.m8n8.x4.b16 {d0, d1, d2, d3}, [p];
-// with an optional ".trans" that distributes the transposed matrix.
+//   ldmatrix.sync.aligned.m8n8.x{1,2,4}.b16 {d...}, [p];  with optional ".trans"
 InstLdMatrix: ast::Instruction<ast::ParsedArgParams<'input>> = {
     "ldmatrix" ".sync" ".aligned" ".m8n8" <num:LdMatrixNum> <trans:".trans"?> ".b16" <dst:DstOperandVec> "," <src:MemoryOperand> => {
         ast::Instruction::LdMatrix(
@@ -1732,8 +1726,7 @@ InstMovMatrix: ast::Instruction<ast::ParsedArgParams<'input>> = {
 };
 
 // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-cp-async
-//   cp.async.cg.shared.global [dst], [src], 16;
-//   cp.async.ca.shared.global [dst], [src], 4{, src-size};
+//   cp.async.cg.shared.global [dst], [src], 16;  / .ca ... 4{, src-size};
 //   cp.async.commit_group; / cp.async.wait_group N; / cp.async.wait_all;
 // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-prmt
 InstPrmt: ast::Instruction<ast::ParsedArgParams<'input>> = {
@@ -1784,8 +1777,8 @@ InstBrxIdx: ast::Instruction<ast::ParsedArgParams<'input>> = {
 // "Video Instructions". Four bytes are operated on in parallel:
 //   vsub4.u32.u32.u32 d, a, b, c;    per byte: a - b, wrapped into the byte
 //   vset4.u32.u32.ne  d, a, b, c;    per byte: a != b, one or zero
-// The fourth operand is the secondary operand of the general form; the forms
-// the compiler emits carry no secondary operation, so it is unused.
+// The fourth operand is the secondary operand of the general form, unused
+// by the forms the compiler emits.
 InstVSub4: ast::Instruction<ast::ParsedArgParams<'input>> = {
     "vsub4" ".u32" ".u32" ".u32" <a:Arg4> => ast::Instruction::VSub4(ast::Arg3 {
         dst: a.dst,
@@ -1938,9 +1931,8 @@ InstShfl: ast::Instruction<ast::ParsedArgParams<'input>> = {
 }
 
 // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#warp-vote-functions
-//
-// vote.sync.mode.pred   d, a, membermask;   // d and a are predicate registers
-// vote.sync.ballot.b32 d, a, membermask;   // d is a bitmask, a is a predicate
+//   vote.sync.mode.pred   d, a, membermask;   // d and a are predicates
+//   vote.sync.ballot.b32 d, a, membermask;   // d is the bitmask
 // .mode = { .all, .any, .uni }
 InstVote: ast::Instruction<ast::ParsedArgParams<'input>> = {
     "vote" ".sync" ".all" ".pred" <dst:Operand> "," <src:Operand> "," <mask:Operand> =>
@@ -2230,7 +2222,7 @@ InstClz: ast::Instruction<ast::ParsedArgParams<'input>> = {
 }
 
 // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#integer-arithmetic-instructions-bfind
-// bfind: index of the most significant set bit (0 when the input is 0).
+// bfind: index of the most significant set bit (all ones when there is none).
 InstBfind: ast::Instruction<ast::ParsedArgParams<'input>> = {
     "bfind" ".u32" <arg:Arg2> => ast::Instruction::Bfind{ typ: ast::ScalarType::U32, arg },
     "bfind" ".s32" <arg:Arg2> => ast::Instruction::Bfind{ typ: ast::ScalarType::S32, arg },
@@ -2371,8 +2363,11 @@ ImmediateValue: ast::ImmediateValue = {
     <neg:"-"?> <x:NumToken> =>? {
         let (num, radix, is_unsigned) = x;
         if neg.is_some() {
-            match i64::from_str_radix(num, radix) {
-                Ok(x) => Ok(ast::ImmediateValue::S64(-x)),
+            // The magnitude is parsed unsigned because i64::MIN cannot be
+            // written as a signed magnitude: -9223372036854775808 overflows a
+            // signed parse while the value itself is representable.
+            match u64::from_str_radix(num, radix) {
+                Ok(x) => Ok(ast::ImmediateValue::S64((x as i64).wrapping_neg())),
                 Err(err) => Err(ParseError::User { error: ast::PtxError::from(err) })
             }
         } else if is_unsigned {

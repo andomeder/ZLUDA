@@ -360,6 +360,8 @@ pub enum Instruction<P: ArgParams> {
     CpAsyncWaitAll,
     Vote(VoteMode, ScalarType, ArgVote<P>),
     Atom(AtomDetails, Arg3<P>),
+    /// `red` - a reduction whose result is discarded.
+    Red(AtomDetails, Arg2St<P>),
     AtomCas(AtomCasDetails, Arg4<P>),
     Div(DivDetails, Arg3<P>),
     Sqrt(SqrtDetails, Arg2<P>),

@@ -184,6 +184,7 @@ match {
     "add",
     "and",
     "atom",
+    "red",
     "bar",
     "barrier",
     "bfe",
@@ -263,6 +264,7 @@ ExtendedID : &'input str = {
     "add",
     "and",
     "atom",
+    "red",
     "bar",
     "barrier",
     "bfe",
@@ -1980,6 +1982,43 @@ InstVote: ast::Instruction<ast::ParsedArgParams<'input>> = {
 // * Operation .dec requires .u32 type for instuction
 // Otherwise as documented
 InstAtom: ast::Instruction<ast::ParsedArgParams<'input>> = {
+    "red" <sema:AtomSemantics?> <scope:MemScope?> <space:AtomSpace?> <op:AtomBitOp> <typ:BitType> <src1:MemoryOperand> "," <src2:SrcOperandVec> => {
+        let details = ast::AtomDetails {
+            semantics: sema.unwrap_or(ast::AtomSemantics::Relaxed),
+            scope: scope.unwrap_or(ast::MemScope::Gpu),
+            space: space.unwrap_or(ast::StateSpace::Generic),
+            inner: ast::AtomInnerDetails::Bit { op, typ }
+        };
+        ast::Instruction::Red(details, ast::Arg2St { src1, src2 })
+    },
+    "red" <sema:AtomSemantics?> <scope:MemScope?> <space:AtomSpace?> ".add" <typ:FloatType> <src1:MemoryOperand> "," <src2:SrcOperandVec> => {
+        let op = ast::AtomFloatOp::Add;
+        let details = ast::AtomDetails {
+            semantics: sema.unwrap_or(ast::AtomSemantics::Relaxed),
+            scope: scope.unwrap_or(ast::MemScope::Gpu),
+            space: space.unwrap_or(ast::StateSpace::Generic),
+            inner: ast::AtomInnerDetails::Float { op, typ }
+        };
+        ast::Instruction::Red(details, ast::Arg2St { src1, src2 })
+    },
+    "red" <op: AtomUIntOp> <sema:AtomSemantics> <scope:MemScope?> <space:AtomSpace?> <typ:UIntType3264> <src1:MemoryOperand> "," <src2:SrcOperandVec> => {
+        let details = ast::AtomDetails {
+            semantics: sema,
+            scope: scope.unwrap_or(ast::MemScope::Gpu),
+            space: space.unwrap_or(ast::StateSpace::Generic),
+            inner: ast::AtomInnerDetails::Unsigned { op, typ }
+        };
+        ast::Instruction::Red(details, ast::Arg2St { src1, src2 })
+    },
+    "red" <sema:AtomSemantics?> <scope:MemScope?> <space:AtomSpace?> <op: AtomUIntOp> <typ:UIntType3264> <src1:MemoryOperand> "," <src2:SrcOperandVec> => {
+        let details = ast::AtomDetails {
+            semantics: sema.unwrap_or(ast::AtomSemantics::Relaxed),
+            scope: scope.unwrap_or(ast::MemScope::Gpu),
+            space: space.unwrap_or(ast::StateSpace::Generic),
+            inner: ast::AtomInnerDetails::Unsigned { op, typ }
+        };
+        ast::Instruction::Red(details, ast::Arg2St { src1, src2 })
+    },
     "atom" <sema:AtomSemantics?> <scope:MemScope?> <space:AtomSpace?> <op:AtomBitOp> <typ:BitType> <a:Arg3Atom> => {
         let details = ast::AtomDetails {
             semantics: sema.unwrap_or(ast::AtomSemantics::Relaxed),

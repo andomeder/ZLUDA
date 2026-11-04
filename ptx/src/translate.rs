@@ -3908,6 +3908,21 @@ fn emit_function_body_ops(
                 ast::Instruction::Atom(details, arg) => {
                     emit_atom(builder, map, details, arg)?;
                 }
+                // A reduction is an atomic whose result the caller discards, so
+                // it is emitted the same way with the result going nowhere.
+                ast::Instruction::Red(details, arg) => {
+                    let discard = builder.id();
+                    emit_atom(
+                        builder,
+                        map,
+                        details,
+                        &ast::Arg3 {
+                            dst: discard,
+                            src1: arg.src1,
+                            src2: arg.src2,
+                        },
+                    )?;
+                }
                 ast::Instruction::AtomCas(details, arg) => {
                     let result_type = map.get_or_add_scalar(builder, details.typ.into());
                     let memory_const = map.get_or_add_constant(
@@ -9646,6 +9661,9 @@ impl<T: ArgParamsEx> ast::Instruction<T> {
             ast::Instruction::Atom(d, a) => {
                 ast::Instruction::Atom(d, a.map_atom(visitor, d.inner.get_type(), d.space)?)
             }
+            ast::Instruction::Red(d, a) => {
+                ast::Instruction::Red(d, a.map_atom(visitor, d.inner.get_type(), d.space)?)
+            }
             ast::Instruction::AtomCas(d, a) => {
                 ast::Instruction::AtomCas(d, a.map_atom(visitor, d.typ, d.space)?)
             }
@@ -10025,6 +10043,7 @@ impl ast::Instruction<ExpandedArgParams> {
             ast::Instruction::Shfl(_, _, _) => None,
             ast::Instruction::Vote(_, _, _) => None,
             ast::Instruction::Atom(_, _) => None,
+            ast::Instruction::Red(_, _) => None,
             ast::Instruction::AtomCas(_, _) => None,
             ast::Instruction::Sub(ast::ArithDetails::Signed(_), _) => None,
             ast::Instruction::Sub(ast::ArithDetails::Unsigned(_), _) => None,
@@ -10337,6 +10356,38 @@ impl<T: ArgParamsEx> ast::Arg2St<T> {
                 non_default_implicit_conversion: Some(should_convert_relaxed_src_wrapper),
             },
             &details.typ.clone().into(),
+            ast::StateSpace::Reg,
+        )?;
+        Ok(ast::Arg2St { src1, src2 })
+    }
+}
+
+impl<T: ArgParamsEx> ast::Arg2St<T> {
+    fn map_atom<U: ArgParamsEx, V: ArgumentMapVisitor<T, U>>(
+        self,
+        visitor: &mut V,
+        t: ast::ScalarType,
+        state_space: ast::StateSpace,
+    ) -> Result<ast::Arg2St<U>, TranslateError> {
+        let scalar_type = ast::ScalarType::from(t);
+        let src1 = visitor.operand(
+            ArgumentDescriptor {
+                op: self.src1,
+                is_dst: false,
+                is_memory_access: true,
+                non_default_implicit_conversion: None,
+            },
+            &ast::Type::Scalar(scalar_type),
+            state_space,
+        )?;
+        let src2 = visitor.operand(
+            ArgumentDescriptor {
+                op: self.src2,
+                is_dst: false,
+                is_memory_access: false,
+                non_default_implicit_conversion: None,
+            },
+            &ast::Type::Scalar(scalar_type),
             ast::StateSpace::Reg,
         )?;
         Ok(ast::Arg2St { src1, src2 })

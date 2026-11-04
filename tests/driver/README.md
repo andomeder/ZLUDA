@@ -138,3 +138,74 @@ Notes:
 - Sync DtoD must synchronize the legacy stream (the enqueue itself is async).
 - Intel's L0 driver corrupts zeCommandListAppendMemoryCopyRegion output when
   dstPitch > width, so 2D/3D copies are decomposed into per-row 1D copies.
+
+## A fatbin that carries only SASS (2026-11-04)
+
+A fatbin built with `-gencode arch=compute_75,code=sm_75` holds NVIDIA SASS
+(kind=2 ELF records) and no PTX, and the translator reads PTX, so the loader
+refuses such an image with `CUDA_ERROR_NOT_SUPPORTED`. `zluda/src/impl/sass.rs`
+adds a way through it: the cubin is lifted back to PTX
+(cubin -> CuLifter -> LLVM IR -> `llc` -> PTX) and continues through the
+existing PTX -> SPIR-V -> IGC path. It is **off by default** (the lifter has no
+licence) and enabled per process:
+
+    ZLUDA_SASS_LIFT=1
+    ZLUDA_SASS_LIFTER=/tmp/opencode/sasslifter/CuLifter   # the checkout
+    ZLUDA_SASS_CUOBJDUMP=<cuda toolkit>/bin/cuobjdump     # or on PATH
+    ZLUDA_SASS_CACHE=~/.cache/zluda/sass                  # the default
+    ZLUDA_SASS_PYTHON=<venv>/bin/python                   # default: the venv
+                                                          # next to the checkout
+    ZLUDA_SASS_LLC=llc                                    # default: PATH
+
+A lifted kernel is cached per cubin (`<cache>/<sha256 of the cubin>/`), so a
+second load of the same image is a file read. An image that carries any PTX
+record is still served by its PTX and nothing is lifted.
+
+`sass_lift_test.c` is the hardware check. It loads a container whose only
+record is the real `torch.mul` elementwise kernel out of
+`libtorch_cuda.so` (the 4-wide `vectorized_elementwise_kernel` whose second
+argument is a by-value `std::array<char*, 3>`) through both
+`cuLibraryLoadData` + `cuLibraryGetKernel` and `cuModuleLoadFatBinary` +
+`cuModuleGetFunction`, launches it with the parameter block the kernel reads
+from the constant bank, and compares 4096 and 3000 (tail path) elements
+bit-exactly against the CPU.
+
+```sh
+CUDA_INC=.../nvidia/cuda_runtime/include
+ZLUDA_LIB=.../ZLUDA/target/release
+gcc -O2 -o sass_lift_test sass_lift_test.c -I"$CUDA_INC" -L"$ZLUDA_LIB" -lnvcuda
+
+# a container with one ELF record and no PTX, from a cubin
+python3 mkfatbin.py path/to/kernel.cubin sass_mul --elf
+
+LD_LIBRARY_PATH="$ZLUDA_LIB" ./sass_lift_test sass_mul.fatbin
+    -> cuLibraryLoadData: CUDA_ERROR_NOT_SUPPORTED
+       REFUSED WITHOUT THE LIFT   (the behaviour without the variable)
+
+ZLUDA_SASS_LIFT=1 ZLUDA_SASS_LIFTER=<checkout> ZLUDA_SASS_CUOBJDUMP=<cuobjdump> \
+LD_LIBRARY_PATH="$ZLUDA_LIB" ./sass_lift_test sass_mul.fatbin
+    -> cuLibraryLoadData: OK
+       cuLibraryGetKernel: OK (497 ms, includes lift + SPIR-V + IGC)
+       N=4096 grid=8: wrong 0/4096
+       N=3000 (tail path): wrong 0/3000
+       SASS FATBIN TEST PASSED
+```
+
+Measured on the B580: the first load of that kernel costs 475 ms in the lift
+(0.2 s disassembly, 0.3 s CuLifter, 0.05 s `llc`) plus 20 ms of translation and
+IGC; a later load is a 0.03 ms cache read plus the same 20 ms of IGC. A kernel
+the lifter cannot handle fails the load of that kernel with the stage that
+failed (lift, llc, translate, IGC) and the kernel's name; the module is never
+built with the kernel silently missing.
+
+A cubin whose header names no architecture the lifter implements fails with
+`the cubin does not name a known architecture (e_flags=...)`, and one whose
+architecture the lifter does not implement (`sm_90`, everything above
+`sm_86`) with `sm_90 is not a liftable architecture`.
+
+Regenerate the cubin from the library with NVIDIA's own tools:
+
+```sh
+cuobjdump -lelf libtorch_cuda.so | grep sm_75          # the ELF images
+cuobjdump -xelf libtorch_cuda.313.sm_75.cubin libtorch_cuda.so
+```

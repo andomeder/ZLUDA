@@ -1,12 +1,12 @@
-//! Parses CUDA fatbinary containers (fatbin) and extracts PTX source.
+//! Parses CUDA fatbinary containers (fatbin) and extracts what they carry.
 //!
-//! Modern CUDA apps embed kernels as fatbins produced by `fatbinary`. The
-//! container can be either a `FatbincWrapper` (magic `FbC\xB1`, CUDA >= 11.2)
-//! wrapping one or more `FatbinHeader` frames, or a bare `FatbinHeader`
-//! (magic `P\xEDU\xBA`, older CUDA). Each frame holds a sequence of file
-//! records; we only consume `PTX` records (kind 0x01), optionally
-//! LZ4-compressed, and feed the resulting source to the SPIR-V translator.
-//! CUBIN/ELF records (kind 0x02) are skipped.
+//! The image is either a `FatbincWrapper` (magic `FbC\xB1`) wrapping one or
+//! more `FatbinHeader` frames, a bare `FatbinHeader` (magic `P\xEDU\xBA`), or
+//! plain PTX text. PTX records are consumed as they are (optionally
+//! LZ4-compressed); CUBIN/ELF records are NVIDIA SASS, which the translator
+//! cannot read. An image that carries no PTX at all is refused unless the SASS
+//! lift is enabled (`super::sass`), in which case its cubins are handed to the
+//! loader and lifted to PTX when one of their kernels is first used.
 
 use std::{
     cmp,
@@ -52,36 +52,14 @@ struct FatbinHeader {
 
 /// Per-file record header of a fatbin frame.
 ///
-/// The header is variable-sized: `header_size` is 0x40 for plain records and
-/// 0x48/0x60 for records that carry a kernel name inline. Only the first
-/// 0x3c bytes have a fixed meaning:
+/// Fields are decoded at their byte offsets rather than cast to this struct:
+/// the header is variable-sized (`header_size` is 0x40 for plain records and
+/// 0x48/0x60 for records that carry a kernel name inline), so a struct cast
+/// would read past the end of a 0x40-byte header.
 ///
-/// ```text
-/// 0x00 u16 kind          (1 = PTX, 2 = ELF/cubin, 3 = host registration)
-/// 0x02 u16 version       (0x101)
-/// 0x04 u32 header_size   (0x40, 0x48 or 0x60)
-/// 0x08 u32 payload_size  (size of the record payload)
-/// 0x0c u32 unknown0
-/// 0x10 u32 compressed_size  (size of the compressed part of the payload)
-/// 0x14 u32 unknown1
-/// 0x18 u32 unknown2
-/// 0x1c u32 sm_version
-/// 0x20 u32 bit_width
-/// 0x24 u32 unknown3
-/// 0x28 u64 flags
-/// 0x30 u64 unknown5
-/// 0x38 u32 uncompressed_size   <-- u32, NOT u64
-/// 0x3c u32 unknown6
-/// 0x40 ... optional kernel name / options
-/// ```
-///
-/// The uncompressed size is a u32: reading it as a u64 picks up the
-/// following zero word and yields a nonsense size (0x24dd9e00000000),
-/// which makes the LZ4 decompression fail with "invalid PTX".
-///
-/// The fields are decoded explicitly instead of casting a byte slice to a
-/// `#[repr(C)]` struct, because the record header size varies and a struct
-/// cast would read past the end of a 0x40-byte header.
+/// `uncompressed_payload` at 0x38 is a u32, not a u64: reading it as u64 picks
+/// up the following zero word and yields a nonsense size, which makes the LZ4
+/// decompression fail.
 #[derive(Copy, Clone)]
 struct FatbinFileHeader {
     kind: c_ushort,
@@ -193,11 +171,10 @@ unsafe fn visit_submodules<'a>(
             visit(header)
         }
         BinaryKind::FatbincWrapper => {
-            // The image can be a single wrapper or an array of them: a
-            // program linked from many translation units has one wrapper per
-            // unit in the .nvFatBinSegment section, and the runtime hands the
-            // whole array to the driver. The kernels of the different units
-            // then all live in one module.
+            // The image can be a single wrapper or an array of them: a program
+            // linked from many translation units carries one wrapper per unit
+            // in the .nvFatBinSegment section, and the runtime hands the whole
+            // array to the driver.
             let mut offset = 0usize;
             loop {
                 let wrapper = unsafe { &*image.cast::<FatbincWrapper>().add(offset) };
@@ -286,21 +263,26 @@ fn decompress(file: &FatbinFileHeader, base: *const u8) -> Result<Vec<u8>, CUres
     }
 }
 
+/// One module of an image: PTX text, or the compiled code a fatbin carries
+/// when it was built for one architecture only.
+pub enum ModuleSource {
+    Ptx(Vec<u8>),
+    /// An ELF/cubin image (NVIDIA SASS), lifted to PTX when a kernel of it is
+    /// first used. Only produced when the SASS lift is enabled.
+    Cubin(Vec<u8>),
+}
+
 /// Extract PTX source from a fatbin (or pass through plain PTX text).
 pub unsafe fn extract_ptx(image: *const c_void) -> Result<Vec<u8>, CUresult> {
     match sniff(image)? {
         BinaryKind::Ptx => {
-            // Plain PTX text: read it as a NUL-terminated string.
             let text = unsafe { CStr::from_ptr(image as *const i8) };
             Ok(text.to_bytes().to_vec())
         }
         _ => {
             let mut best: Option<(i32, Vec<u8>)> = None;
-            // Track whether the fatbin carried any non-PTX image. A fatbin
-            // with only CUBIN/ELF records holds NVIDIA SASS, which cannot be
-            // translated to SPIR-V; report that distinctly so the user learns
-            // the image has to be rebuilt with PTX instead of getting a
-            // generic "invalid PTX".
+            // Whether the fatbin carried any non-PTX image: a SASS-only one is
+            // reported distinctly from broken PTX.
             let mut saw_non_ptx = false;
             unsafe {
                 visit_submodules(image, |header| {
@@ -340,9 +322,8 @@ pub unsafe fn extract_ptx(image: *const c_void) -> Result<Vec<u8>, CUresult> {
             match best {
                 Some((_, payload)) => Ok(payload),
                 None if saw_non_ptx => {
-                    // The fatbin only carried compiled NVIDIA code (cubin/ELF).
-                    // ZLUDA translates PTX only, so the image has to be rebuilt
-                    // with PTX embedded (for nvcc: -gencode arch=compute_XX,code=compute_XX).
+                    // SASS only: the image has to be rebuilt with PTX
+                    // embedded (nvcc: -gencode arch=compute_XX,code=compute_XX).
                     Err(CUresult::CUDA_ERROR_NOT_SUPPORTED)
                 }
                 None => Err(CUresult::CUDA_ERROR_INVALID_PTX),
@@ -351,21 +332,46 @@ pub unsafe fn extract_ptx(image: *const c_void) -> Result<Vec<u8>, CUresult> {
     }
 }
 
-/// Extract every PTX module the image carries.
+/// Extract every module the image carries, in image order.
 ///
-/// A fatbin can hold many PTX records - one per translation unit, each
-/// with its own kernels. The CUDA runtime JITs all of them into a single
-/// module, so a driver that wants to be a drop-in replacement has to do
-/// the same: every record is translated and the results are linked
-/// together (see `SpirvModule::compile`).
-pub unsafe fn extract_ptx_all(image: *const c_void) -> Result<Vec<Vec<u8>>, CUresult> {
-    match unsafe { sniff(image)? } {
+/// The newest architecture the lifter implements.
+const NEWEST_LIFTABLE_ARCH: u32 = 86;
+
+/// An image carries one ELF record per architecture, oldest first (torch starts
+/// at sm_50), so the records have to be narrowed to the one worth lifting.
+fn newest_liftable(cubins: Vec<ModuleSource>) -> Vec<ModuleSource> {
+    let arch_of = |source: &ModuleSource| match source {
+        ModuleSource::Cubin(image) => super::sass::cubin_arch(image).unwrap_or(0),
+        ModuleSource::Ptx(_) => 0,
+    };
+    let newest = cubins
+        .iter()
+        .map(arch_of)
+        .filter(|arch| *arch != 0 && *arch <= NEWEST_LIFTABLE_ARCH)
+        .max();
+    match newest {
+        Some(newest) => cubins
+            .into_iter()
+            .filter(|source| arch_of(source) == newest)
+            .collect(),
+        None => cubins,
+    }
+}
+
+/// A fatbin holds one record per translation unit (and one per architecture),
+/// each with its own kernels. A PTX record is returned as text; a compiled
+/// (ELF/cubin) record is returned only when the image carries no PTX at all
+/// and the SASS lift is enabled, so an image that can be served by its own PTX
+/// always is.
+pub unsafe fn extract_modules(image: *const c_void) -> Result<Vec<ModuleSource>, CUresult> {
+    match sniff(image)? {
         BinaryKind::Ptx => {
             let text = unsafe { CStr::from_ptr(image as *const i8) };
-            Ok(vec![text.to_bytes().to_vec()])
+            Ok(vec![ModuleSource::Ptx(text.to_bytes().to_vec())])
         }
         _ => {
-            let mut modules: Vec<Vec<u8>> = Vec::new();
+            let mut modules: Vec<ModuleSource> = Vec::new();
+            let mut cubins: Vec<ModuleSource> = Vec::new();
             let mut saw_non_ptx = false;
             unsafe {
                 visit_submodules(image, |header| {
@@ -381,6 +387,28 @@ pub unsafe fn extract_ptx_all(image: *const c_void) -> Result<Vec<Vec<u8>>, CUre
                         return Err(CUresult::CUDA_ERROR_INVALID_PTX);
                     }
                     for (file, base) in FatbinFileIter::new(header) {
+                        if file.kind == FATBIN_FILE_KIND_ELF {
+                            saw_non_ptx = true;
+                            if !super::sass::enabled() {
+                                continue;
+                            }
+                            // Zstd compression is not supported yet.
+                            if file.flags & FATBIN_FILE_FLAG_COMPRESSED_ZSTD != 0 {
+                                continue;
+                            }
+                            let cubin = decompress(&file, base)?;
+                            if cubin.len() < 0x40 || &cubin[0..4] != b"\x7fELF" {
+                                eprintln!(
+                                    "zluda: sass lift: an ELF record of the image is not an ELF \
+                                     image ({} bytes, magic {:02x?})",
+                                    cubin.len(),
+                                    &cubin[..cubin.len().min(4)]
+                                );
+                                continue;
+                            }
+                            cubins.push(ModuleSource::Cubin(cubin));
+                            continue;
+                        }
                         if file.kind != FATBIN_FILE_KIND_PTX {
                             saw_non_ptx = true;
                             continue;
@@ -393,17 +421,18 @@ pub unsafe fn extract_ptx_all(image: *const c_void) -> Result<Vec<Vec<u8>>, CUre
                         while payload.last() == Some(&0) {
                             payload.pop();
                         }
-                        modules.push(payload);
+                        modules.push(ModuleSource::Ptx(payload));
                     }
                     Ok(())
                 })?;
             }
             if modules.is_empty() {
+                if !cubins.is_empty() {
+                    return Ok(newest_liftable(cubins));
+                }
                 if saw_non_ptx {
-                    // The fatbin only carried compiled NVIDIA code
-                    // (cubin/ELF). ZLUDA translates PTX only, so the image
-                    // has to be rebuilt with PTX embedded (for nvcc:
-                    // -gencode arch=compute_XX,code=compute_XX).
+                    // SASS only: rebuild the image with PTX embedded, or
+                    // enable the lift (ZLUDA_SASS_LIFT=1) to translate it.
                     return Err(CUresult::CUDA_ERROR_NOT_SUPPORTED);
                 }
                 return Err(CUresult::CUDA_ERROR_INVALID_PTX);

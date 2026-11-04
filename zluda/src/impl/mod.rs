@@ -34,6 +34,7 @@ pub mod driver_proc_address;
 pub mod event;
 pub mod fatbin;
 pub mod pointer;
+pub mod sass;
 
 #[cfg(debug_assertions)]
 pub fn unimplemented() -> CUresult {

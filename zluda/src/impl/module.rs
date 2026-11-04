@@ -31,19 +31,24 @@ pub struct ModuleData {
     pub spirv: SpirvModule,
     /// The argument sizes of the kernels that have been translated so far.
     pub kernel_info: HashMap<String, ptx::KernelInfo>,
-    // This should be a Vec<>, but I'm feeling lazy
     pub device_binaries: HashMap<device::Index, CompiledModules>,
 }
 
 pub struct SpirvModule {
-    /// The PTX text of every record of the source image. A fatbin carries one
-    /// record per translation unit, and a record can define hundreds of
-    /// kernels: translating all of them costs minutes per record and a run
-    /// uses a handful, so the text is kept and one kernel at a time is
-    /// translated (see `ptx_split`).
-    pub ptx_sources: Vec<String>,
+    /// One entry per record of the source image. A record can define hundreds
+    /// of kernels, so the text is kept and one kernel at a time is translated
+    /// (see `ptx_split`); a record that carries only compiled code is lifted
+    /// when one of its kernels is first used.
+    pub units: Vec<UnitSource>,
     /// The record of the image that defines a kernel.
     pub kernel_units: HashMap<String, usize>,
+}
+
+/// The source of a record: PTX text, or a cubin that is lifted to PTX on
+/// first use (see `super::sass`).
+pub enum UnitSource {
+    Ptx(String),
+    Cubin(Vec<u8>),
 }
 
 /// One kernel, translated and ready to be compiled.
@@ -62,12 +67,9 @@ pub struct CompiledModule {
     pub kernels: HashMap<CString, Box<Function>>,
 }
 
-/// The modules of a fatbin, one per translation unit. They are built
-/// separately: linking all of them into one needs a lot of memory, and the
-/// kernels of a translation unit do not call into the other ones.
-/// The modules of a fatbin, one per translation unit. They are built when
-/// one of their kernels is used: building all of them takes hours on a
-/// program with a hundred units, and most of them are never used.
+/// The modules of a fatbin, one per translation unit, built on first use:
+/// building all of them costs minutes on a program with a hundred units and
+/// the kernels of one unit do not call into another.
 pub struct CompiledModules {
     pub kernels: HashMap<String, CompiledModule>,
 }
@@ -100,12 +102,11 @@ impl SpirvModule {
 
     /// Translate one or more PTX modules into a single SPIR-V module.
     ///
-    /// A fatbin usually holds one PTX record per translation unit. The CUDA
-    /// runtime JITs all of them and links the result, so the kernels of every
-    /// record end up in one module. We do the same: each record is
-    /// translated and the SPIR-V modules are linked together at compile time.
+    /// A fatbin holds one PTX record per translation unit and the CUDA runtime
+    /// links them into one module; the record of each kernel is remembered
+    /// here, so the link happens per kernel at build time.
     pub fn new_many<'a>(ptx_modules: &[&str]) -> Result<Self, CUresult> {
-        let mut ptx_sources = Vec::with_capacity(ptx_modules.len());
+        let mut units = Vec::with_capacity(ptx_modules.len());
         let mut kernel_units = HashMap::new();
         for (index, ptx_text) in ptx_modules.iter().enumerate() {
             // Only the entry point names are needed here: the kernels are
@@ -113,19 +114,81 @@ impl SpirvModule {
             for name in super::ptx_split::entry_names(ptx_text) {
                 kernel_units.entry(name).or_insert(index);
             }
-            ptx_sources.push(ptx_text.to_string());
+            units.push(UnitSource::Ptx(ptx_text.to_string()));
+        }
+        Ok(SpirvModule {
+            units,
+            kernel_units,
+        })
+    }
+
+    /// The records of a fatbin, in image order.
+    ///
+    /// A record is either PTX text or compiled code; a compiled record has to
+    /// be lifted, which is why its kernels are taken from the cubin's own
+    /// symbol table here rather than from a disassembly.
+    pub fn new_sources(sources: &[super::fatbin::ModuleSource]) -> Result<Self, CUresult> {
+        let mut units = Vec::with_capacity(sources.len());
+        let mut kernel_units = HashMap::new();
+        for (index, source) in sources.iter().enumerate() {
+            match source {
+                super::fatbin::ModuleSource::Ptx(bytes) => {
+                    let text = std::str::from_utf8(bytes).map_err(|_| {
+                        if std::env::var_os("ZLUDA_TRACE_LIBRARY").is_some() {
+                            eprintln!(
+                                "PTX module {} is not valid UTF-8 ({} bytes): {:02x?}",
+                                index,
+                                bytes.len(),
+                                &bytes[..bytes.len().min(32)]
+                            );
+                        }
+                        CUresult::CUDA_ERROR_INVALID_PTX
+                    })?;
+                    for name in super::ptx_split::entry_names(text) {
+                        kernel_units.entry(name).or_insert(index);
+                    }
+                    units.push(UnitSource::Ptx(text.to_string()));
+                }
+                super::fatbin::ModuleSource::Cubin(cubin) => {
+                    match super::sass::kernel_names(cubin) {
+                        Ok(names) => {
+                            for name in names {
+                                kernel_units.entry(name).or_insert(index);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "zluda: sass lift: record {} is a cubin whose symbol table could \
+                                 not be read ({:?})",
+                                index, e
+                            );
+                            return Err(e);
+                        }
+                    }
+                    units.push(UnitSource::Cubin(cubin.clone()));
+                }
+            }
         }
         if std::env::var_os("ZLUDA_TRACE_LIBRARY").is_some() {
             eprintln!(
-                "new_many: {} records, {} kernels",
-                ptx_sources.len(),
+                "new_sources: {} records ({} lifted), {} kernels",
+                units.len(),
+                units
+                    .iter()
+                    .filter(|unit| matches!(unit, UnitSource::Cubin(_)))
+                    .count(),
                 kernel_units.len()
             );
         }
         Ok(SpirvModule {
-            ptx_sources,
+            units,
             kernel_units,
         })
+    }
+
+    /// Whether a record carries compiled code instead of PTX.
+    pub fn is_lifted(&self, unit: usize) -> bool {
+        matches!(self.units.get(unit), Some(UnitSource::Cubin(_)))
     }
 
     /// Translate one kernel of the image: its entry point and the functions it
@@ -135,13 +198,44 @@ impl SpirvModule {
         unit: usize,
         kernel: &str,
     ) -> Result<TranslatedKernel, CUresult> {
-        let text = self
-            .ptx_sources
+        let lifted;
+        let text: &str = match self
+            .units
             .get(unit)
-            .ok_or(CUresult::CUDA_ERROR_INVALID_PTX)?;
-        // ZLUDA_PTX_NO_SPLIT translates the whole record, the way it was done
-        // before the split existed. It is the reference for bisecting a
-        // difference between the two, and it is slow.
+            .ok_or(CUresult::CUDA_ERROR_INVALID_PTX)?
+        {
+            UnitSource::Ptx(text) => text,
+            UnitSource::Cubin(cubin) => {
+                // Off by default (the lifter has no licence): the loader only
+                // hands a cubin over when the image carries no PTX at all and
+                // ZLUDA_SASS_LIFT is set.
+                lifted = super::sass::lift_kernel(cubin, kernel)?;
+                if !super::sass::has_entry(&lifted, kernel) {
+                    eprintln!(
+                        "zluda: sass lift: the PTX lifted for kernel {:?} does not define it, \
+                         so it is not loaded",
+                        kernel
+                    );
+                    return Err(CUresult::CUDA_ERROR_NOT_SUPPORTED);
+                }
+                &lifted
+            }
+        };
+        let text: &str = text;
+        let lifted_unit = self.is_lifted(unit);
+        // A lifted kernel names its stage when it fails: the PTX is generated
+        // here, so a rejection is a statement about the lift as much as about
+        // the translator.
+        let stage = |name: &str, detail: String| {
+            if lifted_unit {
+                eprintln!(
+                    "zluda: sass lift: {} stage failed for kernel {:?}: {}",
+                    name, kernel, detail
+                );
+            }
+        };
+        // ZLUDA_PTX_NO_SPLIT translates the whole record instead of the
+        // kernel's part; it is the reference for bisecting a difference.
         let split = if std::env::var_os("ZLUDA_PTX_NO_SPLIT").is_some() {
             text.to_string()
         } else {
@@ -149,9 +243,8 @@ impl SpirvModule {
                 Some(split) => split,
                 None => {
                     // Either the record does not have that kernel, or the
-                    // split would have left a call without its definition.
-                    // Translating the whole record is correct in both cases
-                    // (and slow), so it is the fallback rather than a guess.
+                    // split would have left a call without its definition;
+                    // the whole record is correct in both cases.
                     if std::env::var_os("ZLUDA_TRACE_LIBRARY").is_some() {
                         eprintln!(
                             "kernel {:?} is translated as a whole record (it is not in the \
@@ -171,11 +264,11 @@ impl SpirvModule {
                 if trace {
                     eprintln!("kernel {:?} failed to parse: {:?}", kernel, e);
                 }
+                stage("translate", format!("the parse failed: {:?}", e));
                 CUresult::from(e)
             })?;
-        // The parser recovers from what it cannot read by dropping it, which
-        // would silently compute the wrong thing, so a kernel with parse
-        // errors is not loaded at all.
+        // The parser drops what it cannot read, which would silently compute
+        // the wrong thing, so a kernel with parse errors is not loaded at all.
         if !errors.is_empty() {
             if trace || std::env::var_os("ZLUDA_PTX_ALLOW_UNPARSED").is_some() {
                 eprintln!(
@@ -186,6 +279,14 @@ impl SpirvModule {
                 );
             }
             if std::env::var_os("ZLUDA_PTX_ALLOW_UNPARSED").is_none() {
+                stage(
+                    "translate",
+                    format!(
+                        "{} unparsed constructs, first: {:?}",
+                        errors.len(),
+                        errors.first()
+                    ),
+                );
                 return Err(CUresult::CUDA_ERROR_NOT_SUPPORTED);
             }
         }
@@ -193,6 +294,7 @@ impl SpirvModule {
             if trace {
                 eprintln!("kernel {:?} failed to translate: {:?}", kernel, e);
             }
+            stage("translate", format!("{:?}", e));
             CUresult::from(e)
         })?;
         let binary = spirv_module.assemble();
@@ -316,6 +418,13 @@ pub fn get_function(
                     if trace {
                         eprintln!("build of {:?} failed: {:?}", kernel_name, e);
                     }
+                    if module.spirv.is_lifted(unit) {
+                        eprintln!(
+                            "zluda: sass lift: IGC stage failed for kernel {:?}: {:?} \
+                             (the PTX it was lifted to was accepted by the translator)",
+                            kernel_name, e
+                        );
+                    }
                     return Err(e);
                 }
             };
@@ -338,10 +447,9 @@ pub fn get_function(
             .get_mut(&device.index)
             .and_then(|modules| modules.kernels.get_mut(&kernel_name))
             .ok_or(CUresult::CUDA_ERROR_NOT_FOUND)?;
-        // A function handle stays valid for the life of the module: building a
-        // second one under the same name would free the box the application
-        // already holds, and the heap reusing that address turns the stale
-        // handle into a different kernel.
+        // A function handle stays valid for the life of the module: rebuilding
+        // one under the same name frees the box the application holds, and the
+        // heap reusing that address turns the stale handle into another kernel.
         if let Some(existing) = compiled.kernels.get(&name) {
             return Ok::<_, CUresult>(existing.as_ref() as *const Function as *mut Function);
         }
@@ -378,32 +486,13 @@ pub fn get_function(
 
 pub(crate) fn load_data(pmod: *mut *mut Module, image: *const c_void) -> Result<(), CUresult> {
     // The image may be plain PTX text, a fatbinary container (bare header
-    // magic 0xBA55ED50) or a fatbinc wrapper (0x466243B1). extract_ptx sniffs
-    // all three and passes plain PTX through unchanged, so runtime-API apps
-    // whose libcudart lazily calls cuModuleLoadData(Ex) with an embedded
-    // fatbin get their PTX compiled instead of failing INVALID_PTX.
+    // magic 0xBA55ED50) or a fatbinc wrapper (0x466243B1); extract_modules
+    // sniffs all three.
     if pmod == ptr::null_mut() || image == ptr::null() {
         return Err(CUresult::CUDA_ERROR_INVALID_VALUE);
     }
-    let ptx_modules = unsafe { super::fatbin::extract_ptx_all(image) }?;
-    let ptx_texts: Vec<&str> = ptx_modules
-        .iter()
-        .enumerate()
-        .map(|(index, bytes)| {
-            std::str::from_utf8(bytes).map_err(|_| {
-                if std::env::var_os("ZLUDA_TRACE_LIBRARY").is_some() {
-                    eprintln!(
-                        "PTX module {} is not valid UTF-8 ({} bytes): {:02x?}",
-                        index,
-                        bytes.len(),
-                        &bytes[..bytes.len().min(32)]
-                    );
-                }
-                CUresult::CUDA_ERROR_INVALID_PTX
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let spirv_data = SpirvModule::new_many(&ptx_texts)?;
+    let sources = unsafe { super::fatbin::extract_modules(image) }?;
+    let spirv_data = SpirvModule::new_sources(&sources)?;
     load_data_impl(pmod, spirv_data)
 }
 
@@ -411,39 +500,21 @@ pub(crate) fn load_fatbin(pmod: *mut *mut Module, image: *const c_void) -> Resul
     if pmod == ptr::null_mut() || image == ptr::null() {
         return Err(CUresult::CUDA_ERROR_INVALID_VALUE);
     }
-    let ptx_modules = unsafe { super::fatbin::extract_ptx_all(image) }?;
+    let mut sources = unsafe { super::fatbin::extract_modules(image) }?;
     if std::env::var_os("ZLUDA_TRACE_LIBRARY").is_some() {
-        let names: Vec<String> = ptx_modules
+        let ptx = sources
             .iter()
-            .map(|m| {
-                let text = String::from_utf8_lossy(m);
-                text.lines()
-                    .find(|l| l.trim_start().starts_with(".visible .entry") || l.trim_start().starts_with(".entry"))
-                    .map(|l| l.split_whitespace().nth(2).unwrap_or("?").to_string())
-                    .unwrap_or_else(|| "?".to_string())
-            })
-            .collect();
-        eprintln!("load_fatbin: {} PTX modules: {:?}", ptx_modules.len(), names);
+            .filter(|source| matches!(source, super::fatbin::ModuleSource::Ptx(_)))
+            .count();
+        eprintln!(
+            "load_fatbin: {} records ({} PTX, {} to lift)",
+            sources.len(),
+            ptx,
+            sources.len() - ptx
+        );
     }
-        let mut ptx_modules = ptx_modules;
-    rename_duplicate_kernels(&mut ptx_modules);
-    let ptx_texts: Vec<&str> = ptx_modules
-        .iter()
-        .enumerate()     .map(|(index, bytes)| {
-            std::str::from_utf8(bytes).map_err(|_| {
-                if std::env::var_os("ZLUDA_TRACE_LIBRARY").is_some() {
-                    eprintln!(
-                        "PTX module {} is not valid UTF-8 ({} bytes): {:02x?}",
-                        index,
-                        bytes.len(),
-                        &bytes[..bytes.len().min(32)]
-                    );
-                }
-                CUresult::CUDA_ERROR_INVALID_PTX
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let spirv_data = match SpirvModule::new_many(&ptx_texts) {
+    rename_duplicate_kernels(&mut sources);
+    let spirv_data = match SpirvModule::new_sources(&sources) {
         Ok(m) => m,
         Err(e) => {
             if std::env::var_os("ZLUDA_TRACE_LIBRARY").is_some() {
@@ -452,14 +523,20 @@ pub(crate) fn load_fatbin(pmod: *mut *mut Module, image: *const c_void) -> Resul
             return Err(e);
         }
     };
-    // The parser recovers from statements it cannot read by dropping them; a
-    // kernel whose body does not parse would then be missing from the module
-    // and only fail at launch with "named symbol not found". Check that every
-    // entry point of the PTX made it into the translated module and fail the
-    // load otherwise: CUDA fails the JIT of a module it cannot compile too.
+    // The parser drops statements it cannot read, so a kernel whose body does
+    // not parse would be missing from the module and only fail at launch with
+    // "named symbol not found". Every entry point has to be present, the way
+    // CUDA fails the JIT of a module it cannot compile. A record that carries
+    // compiled code is not checked here: its PTX does not exist yet, so the
+    // same check runs on the lifted text (see translate_kernel).
     let mut missing: Vec<String> = Vec::new();
-    for text in &ptx_texts {
-        let mut rest: &str = text;
+    for source in &sources {
+        let bytes = match source {
+            super::fatbin::ModuleSource::Ptx(bytes) => bytes,
+            super::fatbin::ModuleSource::Cubin(_) => continue,
+        };
+        let text = String::from_utf8_lossy(bytes);
+        let mut rest: &str = &text;
         while let Some(pos) = rest.find(".entry ") {
             let after = &rest[pos + ".entry ".len()..];
             let name_end = after
@@ -489,15 +566,21 @@ pub(crate) fn load_fatbin(pmod: *mut *mut Module, image: *const c_void) -> Resul
     }
 }
 
-/// The same kernel can be defined in several translation units: a template
-/// in a header (CUB's empty kernel, for example) is instantiated in every
-/// unit that includes it. CUDA's device linker keeps one copy of such a
-/// kernel; the OpenCL runtime's linker rejects the duplicate names, so the
-/// copies after the first are renamed.
-fn rename_duplicate_kernels(ptx_modules: &mut [Vec<u8>]) {
+/// The same kernel can be defined in several translation units (a template in
+/// a header, e.g. CUB's empty kernel). CUDA's device linker keeps one copy;
+/// the OpenCL linker rejects the duplicate names, so later copies are renamed.
+///
+/// A record that carries compiled code needs no rename: its kernels are lifted
+/// one at a time into a module of their own, and a kernel that several records
+/// define is served by the first of them.
+fn rename_duplicate_kernels(sources: &mut [super::fatbin::ModuleSource]) {
     let mut seen: Vec<String> = Vec::new();
     let mut count = 0usize;
-    for module in ptx_modules.iter_mut() {
+    for source in sources.iter_mut() {
+        let module = match source {
+            super::fatbin::ModuleSource::Ptx(bytes) => bytes,
+            super::fatbin::ModuleSource::Cubin(_) => continue,
+        };
         let text = match std::str::from_utf8(module) {
             Ok(text) => text,
             Err(_) => continue,
@@ -532,8 +615,7 @@ fn rename_duplicate_kernels(ptx_modules: &mut [Vec<u8>]) {
 pub fn load_data_impl(pmod: *mut *mut Module, spirv_data: SpirvModule) -> Result<(), CUresult> {
     let module = GlobalState::lock_current_context(|ctx| {
         let device = unsafe { &mut *ctx.device };
-        // Kernels are translated and built when they are first used; see
-        // get_function.
+        // Kernels are translated and built on first use; see get_function.
         let mut device_binaries = HashMap::new();
         device_binaries.insert(
             device.index,

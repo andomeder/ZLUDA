@@ -1,0 +1,71 @@
+// bigarg_test.ptx - a kernel whose by-value argument list exceeds the 2048
+// byte total that IGC accepts.
+//
+// The second parameter is a 3000 byte by-value block, the shape a kernel
+// takes when it carries a large struct (torch's cat metadata array, a big
+// per-launch descriptor set). CUDA has no limit worth mentioning here, so
+// applications build kernels of this shape; IGC rejects the signature with
+// "Total size of kernel arguments exceeds limit!  at 3012, limit 2048".
+//
+// The block is read so the test proves the *contents* arrive, not only that
+// the launch succeeds: out[tid] = word(tid % 8), where word(i) is the u32 at
+// byte offset 8 + i*4 of the block.
+.version 8.0
+.target sm_75
+.address_size 64
+
+.visible .entry bigarg_kernel(
+    .param .u64 out,
+    .param .align 4 .b8 blob[3000],
+    .param .u32 n
+)
+{
+    .reg .pred %p<3>;
+    .reg .u32 %r<24>;
+    .reg .u64 %rd<8>;
+
+    ld.param.u32 %r1, [n];
+    mov.u32 %r2, %tid.x;
+
+    // A thread past n parks a zero in the output instead of the word.
+    setp.lt.u32 %p1, %r2, %r1;
+
+    // The eight words of the block's first 32 bytes.
+    ld.param.u32 %r10, [blob+8];
+    ld.param.u32 %r11, [blob+12];
+    ld.param.u32 %r12, [blob+16];
+    ld.param.u32 %r13, [blob+20];
+    ld.param.u32 %r14, [blob+24];
+    ld.param.u32 %r15, [blob+28];
+    ld.param.u32 %r16, [blob+32];
+    ld.param.u32 %r17, [blob+36];
+
+    // Select the word a thread asks for, so a shifted block layout or a
+    // wrong parameter offset shows up as a wrong output value.
+    and.b32 %r3, %r2, 7;
+    mov.u32 %r4, %r10;
+    setp.eq.u32 %p2, %r3, 1;
+    selp.u32 %r4, %r11, %r4, %p2;
+    setp.eq.u32 %p2, %r3, 2;
+    selp.u32 %r4, %r12, %r4, %p2;
+    setp.eq.u32 %p2, %r3, 3;
+    selp.u32 %r4, %r13, %r4, %p2;
+    setp.eq.u32 %p2, %r3, 4;
+    selp.u32 %r4, %r14, %r4, %p2;
+    setp.eq.u32 %p2, %r3, 5;
+    selp.u32 %r4, %r15, %r4, %p2;
+    setp.eq.u32 %p2, %r3, 6;
+    selp.u32 %r4, %r16, %r4, %p2;
+    setp.eq.u32 %p2, %r3, 7;
+    selp.u32 %r4, %r17, %r4, %p2;
+
+    @!%p1 mov.u32 %r4, 0;
+
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mul.wide.u32 %rd3, %r2, 4;
+    add.s64 %rd4, %rd2, %rd3;
+    st.global.u32 [%rd4], %r4;
+
+    ret;
+}

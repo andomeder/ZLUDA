@@ -1399,6 +1399,13 @@ fn emit_capabilities(builder: &mut dr::Builder) {
     builder.capability(spirv::Capability::SubgroupShuffleINTEL);
     builder.capability(spirv::Capability::GroupNonUniformVote);
     builder.capability(spirv::Capability::GroupNonUniformBallot);
+    // bfe / bfi are lowered to the bit field operations, which formally need the
+    // BitInstructions capability. The bundled SPIR-V headers predate it and a
+    // capability cannot be named by number (the builder rejects the value), so a
+    // module that uses one omits the declaration. IGC and libigc accept such a
+    // module and the kernels execute, so this is a validator note rather than a
+    // missing feature; declaring Shader to satisfy the validator instead would
+    // make it require structured control flow, which these kernels do not have.
     // TODO: re-enable when Intel float control extension works
     //builder.capability(spirv::Capability::FunctionFloatControlINTEL);
 }
@@ -4114,10 +4121,20 @@ fn emit_function_body_ops(
                         &vec_repr(bits),
                     )?;
                     let u64_type = map.get_or_add_scalar(builder, ast::ScalarType::U64);
-                    let clz = builder.u_convert(u64_type, None, clz)?;
+                    // clz is computed in the result type, which is already u64 for
+                    // the b64 form; a conversion to the same width is invalid.
+                    let clz = if bits == 64 {
+                        clz
+                    } else {
+                        builder.u_convert(u64_type, None, clz)?
+                    };
                     let wide_result = if bits == 64 { u64_type } else { result_type };
                     let diff = builder.i_sub(wide_result, None, last, clz)?;
-                    let diff = builder.u_convert(result_type, None, diff)?;
+                    let diff = if bits == 64 {
+                        diff
+                    } else {
+                        builder.u_convert(result_type, None, diff)?
+                    };
                     let none_set = builder.i_equal(pred_type, None, clz, width)?;
                     let all_ones = map.get_or_add_constant(
                         builder,
@@ -4201,20 +4218,21 @@ fn emit_function_body_ops(
                         let all_ones = c(builder, map, u64::MAX)?;
                         let zero = c(builder, map, 0)?;
                         let bool_type = map.get_or_add_scalar(builder, ast::ScalarType::Pred);
-                        // The width of the field, clamped to 64.
-                        let len = arg.src3;
-                        let len_wide = builder.u_convert(u64_type, None, len)?;
+                        // The width of the field, clamped to 64. The operands are
+                        // already 64-bit here: the implicit conversions widened a
+                        // narrower one, and a conversion to its own width is not a
+                        // valid SPIR-V instruction.
+                        let len_wide = arg.src3;
                         let over = builder.u_greater_than_equal(bool_type, None, len_wide, c64)?;
                         let len_wide = builder.select(u64_type, None, over, c64, len_wide)?;
                         let len_low = builder.bitwise_and(u64_type, None, len_wide, c63)?;
                         let one_shifted = builder.shift_left_logical(u64_type, None, c1, len_low)?;
                         let mask = builder.i_sub(u64_type, None, one_shifted, c1)?;
                         let mask = builder.select(u64_type, None, over, all_ones, mask)?;
-                        let pos = arg.src2;
-                        let pos_wide = builder.u_convert(u64_type, None, pos)?;
+                        let pos_wide = arg.src2;
                         let pos_low = builder.bitwise_and(u64_type, None, pos_wide, c63)?;
-                        let base = builder.u_convert(u64_type, None, arg.src1)?;
-                        let shifted = builder.shift_right_logical(u64_type, None, base, pos_low)?;
+                        let shifted =
+                            builder.shift_right_logical(u64_type, None, arg.src1, pos_low)?;
                         let pos_over =
                             builder.u_greater_than_equal(bool_type, None, pos_wide, c64)?;
                         let shifted = builder.select(u64_type, None, pos_over, zero, shifted)?;

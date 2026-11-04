@@ -33,12 +33,8 @@ pub enum PtxError {
     NonExternPointer,
 }
 
-// For some weird reson this is illegal:
-//   .param .f16x2 foobar;
-// but this is legal:
-//   .param .f16x2 foobar[1];
-// even more interestingly this is legal, but only in .func (not in .entry):
-//   .param .b32 foobar[]
+// .param .f16x2 needs an array size to parse (".param .f16x2 foobar[1]"),
+// and ".param .b32 foobar[]" is only legal in a .func, not in an .entry.
 
 #[derive(Copy, Clone, Eq, PartialEq)]
 pub enum BarDetails {
@@ -149,8 +145,8 @@ pub enum Type {
     // -> OpTypeArray
     Array(ScalarType, Vec<u32>),
     // A by-value struct that arrives as ".param .b8 name[N]" with N larger
-    // than a vector holds: an OpTypeStruct of 32-bit members, which the
-    // backend accepts as a kernel argument where an array is rejected.
+    // than a vector holds: the backend accepts a struct as a kernel argument
+    // where an array is rejected.
     // -> OpTypeStruct
     Struct(Vec<ScalarType>),
     /*
@@ -243,8 +239,7 @@ impl Default for ScalarType {
 pub enum Statement<P: ArgParams> {
     Label(P::Id),
     /// `$L: .branchtargets $L0, $L1, ...;` - the jump table of an indirect
-    /// branch. Produces no code of its own; the labels it names are its
-    /// meaning.
+    /// branch. Produces no code; the labels it names are its meaning.
     BranchTargets(P::Id, Vec<P::Id>),
     Variable(MultiVariable<P::Id>),
     Instruction(Option<PredAt<P::Id>>, Instruction<P>),
@@ -350,9 +345,8 @@ pub enum Instruction<P: ArgParams> {
     /// `vset4.u32.u32.ne d, a, b, c;` - four bytes compared in parallel, each
     /// result one or zero.
     VSet4(CompareOp, Arg3<P>),
-    /// `brx.idx %r, $L;` - jump to the n-th label of the table `$L`. The
-    /// table label and its target labels are resolved together when the
-    /// identifiers of the function are.
+    /// `brx.idx %r, $L;` - jump to the n-th label of the table `$L`. The table
+    /// and its targets are resolved together with the function's ids.
     BrxIdx(P::Operand, Option<P::Operand>, Vec<u32>),
     /// `cvt.rn.f16x2.f32 d, a, b;` - two floats converted to a packed pair,
     /// the first one in the low half. The type is F16x2 for the half precision
@@ -429,19 +423,12 @@ pub struct Arg1Bar<P: ArgParams> {
     pub src: P::Operand,
 }
 
-/// `shfl.sync.<mode>.<type> d[|p], a, b, c, membermask;`
-///
-/// `d` receives the value, `a` is the value to send, `b` is the source lane
-/// (or the delta for up/down/bfly), `c` packs the segment mask and the clamp
-/// value, and the last operand is the member mask. The optional `|p` after
-/// the destination is a predicate that is set when the computed source lane
-/// was in range.
 /// `ldmatrix.sync.aligned.m8n8.x{num}.b16 [.trans] {d...}, [p];`
 ///
 /// Loads 8x8 matrices of 16-bit elements from shared memory into the
-/// registers of all threads of the warp: the rows of matrix i come from the
-/// addresses of threads 8i..8i+7, and thread t receives the two elements at
-/// row t/4, columns 2*(t%4) and 2*(t%4)+1 of every matrix.
+/// registers of the warp: the rows of matrix i come from the addresses of
+/// threads 8i..8i+7, and thread t receives row t/4, columns 2*(t%4) and
+/// 2*(t%4)+1.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct LdMatrixDetails {
     /// The number of 8x8 matrices: 1, 2 or 4.
@@ -453,11 +440,8 @@ pub struct LdMatrixDetails {
 /// `cp.async.cg.shared.global [dst], [src], 16;`
 ///
 /// Asynchronously copies `size` bytes of global memory into shared memory.
-/// The copy is lowered to a plain copy (the point of the instruction is to
-/// overlap it with the arithmetic, which a synchronous copy does not, but
-/// the result is the same).
-/// The shape and the types of a `mma.sync` instruction.
-/// The comparison of the byte-wise `vset4` family.
+/// Lowered to a plain copy: the point of the instruction is overlapping the
+/// copy with the arithmetic, the result is the same.
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub enum CompareOp {
     Eq,

@@ -559,12 +559,9 @@ fn emit_denorm_build_string<'input>(
                 .unwrap_or(&0);
         }
     }
-    // The backend compiler optimizes by default. It used to be turned off
-    // because a store whose address was computed into a register went missing
-    // (2026-08-21); that no longer reproduces, and without the optimizer a big
-    // kernel spills so much that it exceeds the scratch space limit
-    // ("total scratch space exceeds HW supported limit: 332288 bytes"), which
-    // fails the whole unit. ZLUDA_PTX_NO_OPT=1 brings the old behaviour back.
+    // The optimizer stays on: without it a big kernel spills past the
+    // scratch space limit and its whole unit fails to build.
+    // ZLUDA_PTX_NO_OPT=1 turns it off.
     let optimize = std::env::var_os("ZLUDA_PTX_NO_OPT").is_none();
     let opt_flag = if optimize { "" } else { " -cl-opt-disable" };
     let denorm_flag = if flush_over_preserve > 0 {
@@ -594,11 +591,7 @@ fn collect_called_functions(body: &[ExpandedStatement]) -> HashSet<spirv::Word> 
 }
 
 /// Emit an OpFunction declaration (no body) for a function that is only
-/// declared in the PTX (`.extern .func`).
-///
-/// The 2021 baseline skipped such functions entirely, which left every call
-/// to them pointing at an undefined id ("forward referenced IDs have not been
-/// defined" from spirv-val). Declaring them here gives the calls a target.
+/// declared (`.extern .func`): a call to it still needs a target id.
 fn emit_function_declaration<'input>(
     builder: &mut dr::Builder,
     map: &mut TypeWordMap,
@@ -627,10 +620,9 @@ fn emit_function_declaration<'input>(
         builder.function_parameter(Some(name), result_type)?;
     }
     if f.import_as.is_some() {
-        // A function that is provided by another module (the zluda PTX
-        // implementation library): it must carry the Import linkage,
-        // otherwise spirv-val rejects it ("Function declaration must have a
-        // LinkageAttributes decoration with the Import Linkage type").
+        // A function provided by another module (the zluda PTX implementation
+        // library) must carry the Import linkage, or spirv-val rejects the
+        // declaration.
         builder.end_function()?;
         let linkage_name = f.import_as.as_ref().unwrap().clone();
         builder.decorate(
@@ -645,12 +637,9 @@ fn emit_function_declaration<'input>(
         );
         return Ok(());
     }
-    // A function that is called but never defined in this module. CUDA
-    // resolves it against the other modules of the program at device-link
-    // time; each module is loaded on its own here, so the call is given a
-    // stub body. Such calls are usually in a branch that is never taken
-    // (CUDA's own "no_device_code" helper is one), so the stub is never
-    // reached.
+    // Called but never defined in this module: CUDA resolves those at device
+    // link time, but each module is loaded on its own here, so the call gets a
+    // stub body (the call usually sits in a branch that is never taken).
     builder.begin_block(None)?;
     if func_decl.return_arguments.is_empty() {
         builder.ret()?;
@@ -684,9 +673,7 @@ fn emit_directives<'input>(
     kernel_info: &mut HashMap<String, KernelInfo>,
 ) -> Result<(), TranslateError> {
     let empty_body = Vec::new();
-    // The ids of the functions that are defined (have a body) in this module.
-    // A function that is only declared elsewhere in the same module does not
-    // need a separate declaration.
+    // The functions defined (with a body) in this module.
     let defined_functions: HashSet<spirv::Word> = directives
         .iter()
         .filter_map(|d| match d {
@@ -697,10 +684,9 @@ fn emit_directives<'input>(
             _ => None,
         })
         .collect();
-    // The ids of the functions that are actually called. A function that is
-    // only declared (`.extern .func`) but never called needs no declaration
-    // at all - and emitting one would make the module unlinkable, because the
-    // declaration carries an Import linkage that nothing provides.
+    // The functions that are actually called. A declaration that is never
+    // called must not be emitted: its Import linkage would make the module
+    // unlinkable.
     let called_functions: HashSet<spirv::Word> = directives
         .iter()
         .filter_map(|d| match d {
@@ -721,17 +707,10 @@ fn emit_directives<'input>(
                         if f.import_as.is_some() {
                             &empty_body
                         } else {
-                            // A bodyless function (`.extern .func`) is only
-                            // declared, not defined. A call to it still needs a
-                            // target id, so emit an OpFunction without a
-                            // body: the module then has a declaration the
-                            // call can refer to. (The 2021 baseline never
-                            // saw such PTX.)
-                            //
-                            // A module may declare a function and define it
-                            // later (`.func f; ... .func f { }`), in which
-                            // case the definition provides the id and no
-                            // declaration is needed.
+                            // A bodyless function is only declared, and a call
+                            // still needs a target id, so emit an OpFunction
+                            // without a body. A function that is declared and
+                            // defined later in the module needs no declaration.
                             let fn_id = match (*f.func_decl).borrow().name {
                                 ast::MethodName::Func(name) => Some(name),
                                 ast::MethodName::Kernel(_) => None,
@@ -767,11 +746,9 @@ fn emit_directives<'input>(
                     for t in f.tuning.iter() {
                         match *t {
                             ast::TuningDirective::MaxNtid(nx, ny, nz) => {
-                                // CUDA .maxntid caps the TOTAL thread count
-                                // (x*y*z, cf. upstream amdgpu-flat-work-group-size
-                                // 1..x*y*z); a 2D block within the cap must stay
-                                // launchable. SPIR-V's MaxWorkgroupSizeINTEL is
-                                // per-dimension, so allow up to the total in each.
+                                // .maxntid caps the TOTAL thread count (x*y*z);
+                                // MaxWorkgroupSizeINTEL is per dimension, so
+                                // allow up to the total in each.
                                 let total = (nx * ny * nz).clamp(1, 256);
                                 builder.execution_mode(
                                     fn_id,
@@ -795,20 +772,18 @@ fn emit_directives<'input>(
                         }
                     }
                     if !emitted_execution_mode {
-                        // No tuning directive: don't force a specific LocalSize
-                        // (that would cap the launch block size). Allow up to 256
-                        // threads per workgroup dimension instead.
+                        // No tuning directive: don't force a LocalSize (that
+                        // would cap the launch block). Allow up to 256 per
+                        // dimension instead.
                         builder.execution_mode(
                             fn_id,
                             spirv_headers::ExecutionMode::MaxWorkgroupSizeINTEL,
                             [256, 256, 256],
                         );
                     }
-                    // A PTX warp is 32 lanes, but a kernel compiled for this
-                    // GPU gets a 16 lane subgroup by default: a shuffle that
-                    // asks for a lane past 15 then reads outside the subgroup
-                    // and returns zero. The kernels that exchange data across
-                    // the warp therefore ask for the full 32 lanes.
+                    // A PTX warp is 32 lanes but this GPU's default subgroup is
+                    // 16, and a shuffle past lane 15 reads outside it and
+                    // returns zero.
                     if statements_need_full_warp(&f_body)
                         || special_registers_need_full_warp(&id_defs.special_registers)
                     {
@@ -908,8 +883,8 @@ fn get_kernels_call_map<'input>(
     result
 }
 
-// Build a map from function id -> its effective input argument SPIR-V types,
-// so call sites can normalize pointer argument types to match the callee.
+// Map from a function id to its effective input argument types, so call
+// sites can match the callee's pointer types.
 fn get_callee_param_types<'input>(
     module: &[Directive<'input>],
 ) -> HashMap<spirv::Word, Vec<SpirvType>> {
@@ -1212,12 +1187,8 @@ fn denorm_count_map_update_impl<T: Eq + Hash>(
     }
 }
 
-// HACK ALERT!
-// This function is a "good enough" heuristic of whetever to mark f16/f32 operations
-// in the kernel as flushing denorms to zero or preserving them
-// PTX support per-instruction ftz information. Unfortunately SPIR-V has no
-// such capability, so instead we guesstimate which use is more common in the kernel
-// and emit suitable execution mode
+// PTX carries per-instruction .ftz; SPIR-V only has a kernel-wide mode, so
+// the mode is guessed from which the kernel's float operations use more.
 fn compute_denorm_information<'input>(
     module: &[Directive<'input>],
 ) -> HashMap<ast::MethodName<'input, spirv::Word>, HashMap<u8, (spirv::FPDenormMode, isize)>> {
@@ -1422,10 +1393,9 @@ fn emit_capabilities(builder: &mut dr::Builder) {
     builder.capability(spirv::Capability::Float16);
     builder.capability(spirv::Capability::Float64);
     builder.capability(spirv::Capability::KernelAttributesINTEL);
-    // Warp-level primitives (shfl / vote) are lowered to subgroup
-    // operations. The shuffle uses the Intel subgroup extension (the whole
-    // subgroup participates), the vote uses the core SPIR-V 1.3
-    // group operations (no extension needed).
+    // Warp-level primitives (shfl / vote) are lowered to subgroup operations:
+    // the shuffle through the Intel subgroup extension, the vote through the
+    // core SPIR-V 1.3 group operations.
     builder.capability(spirv::Capability::SubgroupShuffleINTEL);
     builder.capability(spirv::Capability::GroupNonUniformVote);
     builder.capability(spirv::Capability::GroupNonUniformBallot);
@@ -1530,8 +1500,6 @@ fn to_ssa<'input, 'b>(
     f_body: Option<Vec<ast::Statement<ast::ParsedArgParams<'input>>>>,
     tuning: Vec<ast::TuningDirective>,
 ) -> Result<Function<'input>, TranslateError> {
-    //deparamize_function_decl(&func_decl)?;
-    //deparamize_function_decl(&func_decl)?;
     let f_body = match f_body {
         Some(vec) => vec,
         None => {
@@ -1767,11 +1735,6 @@ fn fix_special_registers(
                     value: ast::ImmediateValue::U64(0),
                 }));
             }
-            // %lanemask_lt and friends are a bit mask of the warp's lanes
-            // relative to this one, which is a shifted one:
-            //   lt: (1 << lane) - 1        le: (1 << (lane + 1)) - 1
-            //   eq:  1 << lane             ge: ~((1 << lane) - 1)
-            //   gt: ~((1 << (lane + 1)) - 1)
             Statement::LoadVar(ref details)
                 if details.member_index.is_none()
                     && matches!(
@@ -2165,17 +2128,11 @@ impl<'a, 'b> VectorRepackVisitor<'a, 'b> {
         state_space: ast::StateSpace,
         idx: Vec<spirv::Word>,
     ) -> Result<spirv::Word, TranslateError> {
-        // mov.u32 foobar, {a,b};
-        //
-        // A vector pack can also name a 64-bit value that PTX spells as a
-        // pair of 32-bit registers: `mov.b64 {%r0,%r1}, %rd2;`. The pack
-        // then has to be assembled into a 64-bit value, not a vector.
-        // A pack operand either names a vector, or the pieces of a wider
-        // scalar: "mov.b64 {%r0,%r1}, %rd2;" splits a 64-bit value into two
-        // 32-bit halves, "mov.b32 {low,high}, %r1" splits a 32-bit value into
-        // two 16-bit halves (the inline assembly idiom CUDA uses for the
-        // half conversions). The element type comes from the registers
-        // themselves.
+        // A pack operand either names a vector ("mov.u32 foobar, {a,b}") or
+        // the pieces of a wider scalar: "mov.b64 {%r0,%r1}, %rd2" splits 64
+        // bits into two 32-bit halves, "mov.b32 {low,high}, %r1" splits 32
+        // bits into two 16-bit halves (CUDA's inline assembly for the half
+        // conversions). The element type comes from the registers themselves.
         let (scalar_t, width, packed_scalar) = match typ {
             ast::Type::Vector(scalar_t, width) => (*scalar_t, *width, None),
             ast::Type::Scalar(packed) => {
@@ -2503,18 +2460,15 @@ fn insert_mem_ssa_statements<'a, 'b>(
     for arg in fn_decl.input_arguments.iter_mut() {
         // IGC rejects array-typed by-value kernel arguments. A by-value
         // struct (e.g. dim3) arrives as `.param .b8 name[12]`, i.e.
-        // Array(B8, [12]). Represent it as a vector of u32 instead - same
-        // byte layout, IGC accepts it. The kernel body only ever takes its
-        // address and reads bytes, which works through a pointer bitcast.
+        // Array(B8, [12]), and is represented as a vector of u32 with the
+        // same byte layout.
         if fn_decl.name.is_kernel() {
             if let ast::Type::Array(ast::ScalarType::B8, dims) = &arg.v_type {
                 let bytes: u32 = dims.iter().product();
-                // A SPIR-V vector holds two, three or four components, so a
-                // larger struct becomes an OpTypeStruct of 32-bit words (the
-                // backend accepts a struct as a kernel argument, an array it
-                // does not). The members are all 32-bit and there is no
-                // padding, so the byte layout is unchanged and the body can
-                // still read the bytes through a pointer bitcast.
+                // A SPIR-V vector holds at most four components, so a larger
+                // struct becomes an OpTypeStruct of 32-bit words. All members
+                // are 32-bit with no padding, so the byte layout holds and the
+                // body can still read bytes through a pointer bitcast.
                 if bytes % 4 == 0 && bytes / 4 <= 4 {
                     arg.v_type = ast::Type::Vector(ast::ScalarType::U32, (bytes / 4) as u8);
                 } else if bytes % 4 == 0 {
@@ -3126,8 +3080,6 @@ fn insert_implicit_conversions_impl(
     Ok(())
 }
 
-/// Whether a function body contains an ldmatrix, which needs the lane id
-/// builtin even if no instruction reads it.
 /// The width of a PTX warp, in lanes.
 const WARP_LANES: u32 = 32;
 
@@ -3169,8 +3121,7 @@ fn special_registers_need_full_warp(special_registers: &SpecialRegistersMap) -> 
 }
 
 /// Whether the code needs the lane id: the matrix instructions pick the
-/// thread that holds a fragment by it, and a shuffle computes its source lane
-/// from it.
+/// thread that holds a fragment by it and a shuffle computes its source lane.
 fn statements_use_laneid(statements: &[ExpandedStatement]) -> bool {
     statements.iter().any(|statement| match statement {
         Statement::Instruction(ast::Instruction::Shfl(..))
@@ -3183,8 +3134,6 @@ fn statements_use_laneid(statements: &[ExpandedStatement]) -> bool {
 
 fn statements_use_ldmatrix(statements: &[ExpandedStatement]) -> bool {
     statements.iter().any(|statement| match statement {
-        // Both the matrix load and the matrix multiply pick the thread that
-        // holds a fragment by its lane id.
         Statement::Instruction(ast::Instruction::LdMatrix(..))
         | Statement::Instruction(ast::Instruction::Mma(..))
         | Statement::Instruction(ast::Instruction::MovMatrix(..)) => true,
@@ -3205,10 +3154,9 @@ fn contains_958(s: &ExpandedStatement) -> bool {
     }
 }
 
-// Reorder a function's blocks so every block appears after its dominators.
-// rspirv emits blocks in statement order; PTX loops can place a loop body
-// before its dominator header, which spirv-val rejects. Reverse post-order of
-// the CFG satisfies dominance for reducible control flow.
+// Reorder the blocks so every one appears after its dominators: rspirv emits
+// them in statement order and PTX can put a loop body before its header, which
+// spirv-val rejects. Reverse post-order of the CFG satisfies dominance.
 fn reorder_blocks_rpo(module: &mut dr::Module, fn_idx: usize) {
     let function = &module.functions[fn_idx];
     if function.blocks.is_empty() {
@@ -3380,9 +3328,8 @@ fn emit_function_body_ops(
                         builder.constant_u32(typ_id, Some(cnst.dst), value as u16 as u32);
                     }
                     // Signed narrow types keep the value truncated to their
-                    // width: the constant lives in a 16-bit type, and the
-                    // signed comparison op (OpSGreaterThan) reinterprets the
-                    // 16-bit pattern as signed.
+                    // width: OpSGreaterThan reinterprets the 16-bit pattern as
+                    // signed.
                     (ast::ScalarType::S8, ast::ImmediateValue::S64(value)) => {
                         builder.constant_u32(typ_id, Some(cnst.dst), value as u8 as u32);
                     }
@@ -3496,9 +3443,8 @@ fn emit_function_body_ops(
                 ast::Instruction::Redux(op, typ, arg) => {
                     emit_redux(builder, map, op, typ, arg)?
                 }
-                // brx.idx: an indirect branch. The index selects the label;
-                // anything out of range falls through to the instruction after
-                // the branch, which is what a guarded switch means.
+                // brx.idx: an indirect branch; an index out of range falls
+                // through to the instruction after the branch.
                 ast::Instruction::BrxIdx(index, _table, targets) => {
                     let index = *index;
                     let u32_type = map.get_or_add_scalar(builder, ast::ScalarType::U32);
@@ -3547,22 +3493,17 @@ fn emit_function_body_ops(
                     let result_type =
                         map.get_or_add(builder, SpirvType::new(ast::Type::from(data.typ.clone())));
                     // The memory qualifiers map onto SPIR-V's memory access
-                    // flags: .volatile is the Volatile flag, .nc (a read-only
-                    // cache) is the NonPrivatePointer flag. The ordering
-                    // qualifiers (.acquire, .relaxed) are ordering hints that
-                    // the memory barrier of the surrounding code provides.
+                    // flags: .volatile is the Volatile flag. The ordering
+                    // qualifiers (.acquire, .relaxed) are hints that the
+                    // surrounding barrier provides.
                     let mut flags = spirv::MemoryAccess::ALIGNED;
                     match data.qualifier {
                         ast::LdStQualifier::Volatile => flags |= spirv::MemoryAccess::VOLATILE,
                         ast::LdStQualifier::Relaxed(_) | ast::LdStQualifier::Acquire(_) => {}
                         ast::LdStQualifier::Weak => {
-                            // A non-coherent load ("ld.global.nc") is a hint
-                            // that the data does not change while the kernel
-                            // runs. SPIR-V would spell that with the
-                            // NonPrivatePointer flag, but that flag requires
-                            // the Vulkan memory model, which a compute
-                            // kernel must not declare; the load keeps the
-                            // plain semantics instead.
+                            // .nc needs the NonPrivatePointer flag, which
+                            // requires the Vulkan memory model a compute kernel
+                            // must not declare, so the load stays plain.
                         }
                     }
                     builder.load(
@@ -3600,10 +3541,9 @@ fn emit_function_body_ops(
                 ast::Instruction::Mov(d, arg) => {
                     let result_type =
                         map.get_or_add(builder, SpirvType::new(ast::Type::from(d.typ.clone())));
-                    // copy_object requires matching types; OpBitcast cannot
-                    // target predicates. Only address-sourced movs (pointer
-                    // <-> integer) need the bitcast; everything else moves
-                    // between identically-typed values.
+                    // copy_object needs matching types and OpBitcast cannot
+                    // target a predicate, so only pointer<->integer movs are
+                    // bitcast.
                     if d.typ == ast::Type::Scalar(ast::ScalarType::Pred) || !d.src_is_address {
                         builder.copy_object(result_type, Some(arg.dst), arg.src)?;
                     } else {
@@ -3665,10 +3605,9 @@ fn emit_function_body_ops(
                     let result_type = map.get_or_add_scalar(builder, full_type);
                     let offset_src = insert_shift_hack(builder, map, a.src2, size_of as usize)?;
                     if t.kind() == ast::ScalarKind::Signed {
-                        // PTX clamps an over-wide shift to the register width,
-                        // which for an arithmetic right shift replicates the
-                        // sign. Clamping the amount to width-1 gives exactly
-                        // that (the backend would otherwise produce zero).
+                        // PTX clamps an over-wide shift to the width, which for
+                        // an arithmetic right shift replicates the sign:
+                        // clamping the amount to width-1 gives exactly that.
                         let limit = match size_of {
                             8 => map.get_or_add_constant(
                                 builder,
@@ -3711,9 +3650,8 @@ fn emit_function_body_ops(
                     emit_cvt(builder, map, opencl, dets, arg)?;
                 }
                 ast::Instruction::Cvta(_, arg) => {
-                    // This would be only meaningful if const/slm/global pointers
-                    // had a different format than generic pointers, but they don't pretty much by ptx definition
-                    // Honestly, I have no idea why this instruction exists and is emitted by the compiler
+                    // const/slm/global pointers have the same format as generic
+                    // ones, so this is a no-op.
                     let result_type = map.get_or_add_scalar(builder, ast::ScalarType::B64);
                     builder.copy_object(result_type, Some(arg.dst), arg.src)?;
                 }
@@ -3813,9 +3751,8 @@ fn emit_function_body_ops(
                 // TODO: implement named barriers
                 ast::Instruction::Bar(d, _) => {
                     let scope = match d {
-                        // bar.warp.sync only synchronizes the warp, so it must
-                        // not use the workgroup scope (that would be a full
-                        // barrier).
+                        // bar.warp.sync synchronizes only the warp, so the
+                        // scope must not be Workgroup.
                         ast::BarDetails::WarpSync => spirv::Scope::Subgroup as u32,
                         ast::BarDetails::SyncAligned | ast::BarDetails::RedPopc => {
                             spirv::Scope::Workgroup as u32
@@ -3843,26 +3780,12 @@ fn emit_function_body_ops(
                 // disjunction (or conjunction) of a predicate across the
                 // workgroup.
                 //
-                // SPIR-V has no workgroup wide group operation, so the votes are
-                // collected in one word of workgroup memory:
-                //
-                //    clear the word                   (it starts undefined)
-                //    barrier
-                //    if (voting) atomic_add(word, 1)  one vote per lane
-                //    barrier
-                //    result = word != 0               (word == 0 for .and)
-                //    barrier
-                //    if (voting) atomic_and(word, 0)  take the own vote back out
-                //    barrier
-                //
-                // A lane votes when its predicate holds (.or) or when it does
-                // not (.and); the vote itself sits in a branch, so the atomic's
-                // operand is the same for every lane. Clearing the word at the
-                // end means a loop can run the instruction any number of times.
-                //
-                // Verified on hardware for the predicate holding for none, for
-                // some and for all of the lanes, at 4, 8, 16 and 32 threads
-                // (tmp/mma_test/barpred*.ptx).
+                // SPIR-V has no workgroup wide group operation, so the votes
+                // are counted in one word of workgroup memory: clear it,
+                // barrier, add one vote per lane inside a branch, barrier, read
+                // whether the word is non-zero, barrier, and let the voting
+                // lanes take their vote back out so a loop can re-run the
+                // instruction.
                 ast::Instruction::BarRedPred(and, dst, _bar_id, pred) => {
                     let and = *and;
                     let dst = *dst;
@@ -3884,7 +3807,6 @@ fn emit_function_body_ops(
                     };
                     emit_bar_red(builder, map, voting, |builder, collected| {
                         if and {
-                            // Nobody voted against, so every predicate held.
                             builder.i_equal(pred_type, Some(dst), collected, zero)?;
                         } else {
                             builder.i_not_equal(pred_type, Some(dst), collected, zero)?;
@@ -3905,28 +3827,18 @@ fn emit_function_body_ops(
                 }
                 // shfl.sync.<mode>.<type> d[|p], a, b, c, membermask
                 //
-                // PTX's shuffle is a warp-level exchange. The Intel subgroup
+                // PTX's shuffle is a warp-level exchange; the Intel subgroup
                 // extensions map onto it directly:
-                //   .idx  -> OpSubgroupShuffleINTEL     (lane from operand)
-                //   .up   -> OpSubgroupShuffleUpINTEL   (lane - delta)
-                //   .down -> OpSubgroupShuffleDownINTEL (lane + delta)
-                //   .bfly -> OpSubgroupShuffleXorINTEL  (lane ^ delta)
-                // The Intel ops use the whole subgroup, which matches the
-                // common case of a full-warp member mask.
-                //
-                // The optional destination predicate ("the computed source
-                // lane was in range") is not modelled by the Intel ops; we
-                // emit a constant true, which matches the common case where
-                // the source lane is in range.
+                //   .idx  -> OpSubgroupShuffleINTEL
+                //   .up   -> OpSubgroupShuffleUpINTEL
+                //   .down -> OpSubgroupShuffleDownINTEL
+                //   .bfly -> OpSubgroupShuffleXorINTEL
+                // The member mask is ignored: the Intel ops cover the subgroup.
                 ast::Instruction::Shfl(mode, typ, arg) => {
                     emit_shfl(builder, map, laneid, *mode, *typ, arg)?
                 }
-                // vote.sync.mode.pred   d, a, membermask
+                // vote.sync.mode.pred d, a, membermask   (a is a predicate)
                 // vote.sync.ballot.b32 d, a, membermask
-                //
-                // The source operand `a` is a predicate register. The mode
-                // forms reduce the predicate across the subgroup, the ballot
-                // form collects the votes into a bitmask.
                 ast::Instruction::Vote(mode, typ, arg) => {
                     let result_type = map.get_or_add_scalar(builder, (*typ).into());
                     let subgroup_scope = map.get_or_add_constant(
@@ -3934,8 +3846,6 @@ fn emit_function_body_ops(
                         &ast::Type::Scalar(ast::ScalarType::U32),
                         &vec_repr(spirv::Scope::Subgroup as u32),
                     )?;
-                    // The source operand is a predicate register, which is
-                    // exactly what the group operations expect.
                     let pred = arg.src;
                     match mode {
                         ast::VoteMode::All => {
@@ -3955,9 +3865,8 @@ fn emit_function_body_ops(
                             )?;
                         }
                         ast::VoteMode::Uni => {
-                            // True when the predicate has the same value in
-                            // every active lane, so it holds when they agree
-                            // either all-true or all-false.
+                            // True when the predicate agrees in every active
+                            // lane, all-true or all-false.
                             let all = builder.group_non_uniform_all(
                                 result_type,
                                 None,
@@ -3974,9 +3883,8 @@ fn emit_function_body_ops(
                             builder.logical_or(result_type, Some(arg.dst), all, none)?;
                         }
                         ast::VoteMode::Ballot => {
-                            // The ballot result is a vector of four 32-bit
-                            // words covering up to 128 lanes; a warp has 32
-                            // lanes, so the mask is the first word.
+                            // The ballot is a vector of four words covering up
+                            // to 128 lanes; a warp has 32, so take the first.
                             let ballot_type = map.get_or_add(
                                 builder,
                                 SpirvType::Vector(SpirvScalarKey::B32, 4),
@@ -4053,8 +3961,7 @@ fn emit_function_body_ops(
                 }
                 ast::Instruction::Neg(details, arg) => {
                     // A packed pair of halves is a vector of two halves, so the
-                    // result type has to come from the type rather than from the
-                    // scalar key, and it negates both lanes at once.
+                    // result type comes from the type and both lanes negate.
                     let result_type = map.get_or_add(builder, SpirvType::from(details.typ));
                     let negate_func = if matches!(
                         details.typ.kind(),
@@ -4118,8 +4025,7 @@ fn emit_function_body_ops(
                 }
                 // bfind: index of the most significant set bit. A negative
                 // signed input is searched as its complement, so the answer is
-                // the position of its most significant zero bit, and an input
-                // with no such bit reports all ones.
+                // its most significant zero bit; no such bit reports all ones.
                 ast::Instruction::Bfind { typ, arg } => {
                     let result_type = map.get_or_add_scalar(builder, (*typ).into());
                     let pred_type = map.get_or_add_scalar(builder, ast::ScalarType::Pred);
@@ -4195,19 +4101,16 @@ fn emit_function_body_ops(
                     builder_fn(builder, result_type, Some(arg.dst), arg.src1, arg.src2)?;
                 }
                 // bfe: extract a bit field, sign or zero extended to the
-                // register width.
+                // register width. The backend only implements the 32-bit
+                // OpBitField*Extract (the 64-bit ones call a builtin it does
+                // not define), so 64-bit bfe is done with shifts:
                 //
-                // SPIR-V has OpBitFieldUExtract and OpBitFieldSExtract, but the
-                // backend only implements the 32-bit forms (the 64-bit ones
-                // come out as a call to a builtin it does not define), so the
-                // 64-bit case is done with shifts:
-                //
-                //   shifted = base >> pos                    (0 if pos >= width)
-                //   masked  = shifted & mask(len)             (len clamped)
+                //   shifted = base >> pos               (0 if pos >= width)
+                //   masked  = shifted & mask(len)       (len clamped)
                 //   signed  = (masked << (width - len)) >> (width - len)
                 //
-                // Every shift amount is masked to the register width first, so
-                // none of them is ever out of range (which would be undefined).
+                // Every shift amount is masked to the width first, so none is
+                // out of range (which would be undefined).
                 ast::Instruction::Bfe { typ, arg } => {
                     let result_type = map.get_or_add_scalar(builder, ast::ScalarType::from(*typ));
                     let signed = typ.kind() == ast::ScalarKind::Signed;
@@ -4251,13 +4154,10 @@ fn emit_function_body_ops(
                         let len_wide = builder.u_convert(u64_type, None, len)?;
                         let over = builder.u_greater_than_equal(bool_type, None, len_wide, c64)?;
                         let len_wide = builder.select(u64_type, None, over, c64, len_wide)?;
-                        // mask = (1 << (len & 63)) - 1, and all ones when len
-                        // is the whole register.
                         let len_low = builder.bitwise_and(u64_type, None, len_wide, c63)?;
                         let one_shifted = builder.shift_left_logical(u64_type, None, c1, len_low)?;
                         let mask = builder.i_sub(u64_type, None, one_shifted, c1)?;
                         let mask = builder.select(u64_type, None, over, all_ones, mask)?;
-                        // shifted = base >> pos, zero when pos is out of range.
                         let pos = arg.src2;
                         let pos_wide = builder.u_convert(u64_type, None, pos)?;
                         let pos_low = builder.bitwise_and(u64_type, None, pos_wide, c63)?;
@@ -4268,8 +4168,6 @@ fn emit_function_body_ops(
                         let shifted = builder.select(u64_type, None, pos_over, zero, shifted)?;
                         let masked = builder.bitwise_and(u64_type, None, shifted, mask)?;
                         if signed {
-                            // Push the sign bit of the field to the top and
-                            // shift it back down arithmetically.
                             let back = builder.i_sub(u64_type, None, c64, len_wide)?;
                             let top = builder.shift_left_logical(u64_type, None, masked, back)?;
                             let top = builder.bitcast(s64_type, None, top)?;
@@ -4282,14 +4180,13 @@ fn emit_function_body_ops(
                     }
                 }
                 ast::Instruction::Bfi { .. } => {
-                    // Should have beeen replaced with a funciton call earlier
                     return Err(error_unreachable());
                 }
                 ast::Instruction::Rem { typ, arg } => {
-                    // PTX "rem" is C's remainder: the quotient truncates towards
-                    // zero, so the result takes the sign of the dividend. OpSMod
-                    // floors instead, which differs for mixed signs (and stops
-                    // matching the OpSDiv that "div" lowers to).
+                    // PTX "rem" is C's remainder (the quotient truncates
+                    // towards zero), so the result takes the sign of the
+                    // dividend; OpSMod floors instead, which differs for mixed
+                    // signs.
                     let builder_fn = if typ.kind() == ast::ScalarKind::Signed {
                         dr::Builder::s_rem
                     } else {
@@ -4358,17 +4255,10 @@ fn emit_function_body_ops(
             }
             Statement::RepackVector(repack) => {
                 if let Some(packed_scalar) = repack.packed_scalar {
-                    // The pack names the pieces of a wider scalar value:
-                    // "mov.b64 {%r0,%r1}, %rd2;" splits a 64-bit value into
-                    // two 32-bit halves, "mov.b32 {low,high}, %r1" splits a
-                    // 32-bit value into two 16-bit halves. The lowest piece
-                    // is the first element of the pack.
+                    // The pack names the pieces of a wider scalar; the lowest
+                    // piece comes first.
                     let elem_bits = repack.typ.size_of() as u32 * 8;
                     let elem_type = map.get_or_add_scalar(builder, repack.typ);
-                    // The pieces are extracted as integers of the element's
-                    // width: a pack of two 16-bit halves is split out of a
-                    // 32-bit value, a pack of two 32-bit halves out of a
-                    // 64-bit one.
                     let int_elem_type = map.get_or_add_scalar(
                         builder,
                         match repack.typ.size_of() {
@@ -4376,10 +4266,6 @@ fn emit_function_body_ops(
                             _ => ast::ScalarType::U32,
                         },
                     );
-                    // The pieces are put together in the width of the packed
-                    // value: a pack of two 16-bit halves is assembled into a
-                    // 32-bit value, a pack of two 32-bit halves into a
-                    // 64-bit one.
                     let int_packed_scalar = match packed_scalar.size_of() {
                         2 => ast::ScalarType::U16,
                         4 => ast::ScalarType::U32,
@@ -4392,21 +4278,13 @@ fn emit_function_body_ops(
                         &vec_repr((1u64 << elem_bits) - 1),
                     )?;
                     if repack.is_extract {
-                        // The pack is the destination: split the value.
-                        // A packed value that is already 64 bits wide must not
-                        // be converted: SPIR-V has no conversion between a
-                        // value and its own type.
-                        // The packed value already has the width the pieces
-                        // are cut out of: converting it would be a no-op,
-                        // and SPIR-V has no conversion between a value and
-                        // its own type.
-                        // Each piece is taken out of the packed value by its
-                        // own shift, rather than by shifting a running value
-                        // down: a pack whose pieces are written back through
-                        // memory is emitted per destination, and a running
-                        // value left the second piece reading the same low
-                        // word as the first (which made the sum of squares of
-                        // ggml's norm kernel come out equal to the sum).
+                        // The pack is the destination: split the value. It
+                        // already has the width the pieces are cut out of, and
+                        // SPIR-V has no conversion to a value's own type.
+                        // Each piece is cut out of the original by its own
+                        // shift: with a running value the second piece read the
+                        // same low word as the first (the pieces are emitted
+                        // per destination, not per pack).
                         let original =
                             builder.copy_object(int_packed_type, None, repack.packed)?;
                         for (index, dst_id) in repack.unpacked.iter().enumerate() {
@@ -4562,9 +4440,6 @@ fn emit_logical_xor_spirv(
     builder.logical_and(result_type, result_id, temp_or, temp_neg)
 }
 
-// copysign.f32 d, a, b;
-//
-// The magnitude of a with the sign of b: a bit operation on the two values.
 fn emit_copysign(
     builder: &mut dr::Builder,
     map: &mut TypeWordMap,
@@ -4584,8 +4459,7 @@ fn emit_copysign(
         &vec_repr(0x8000_0000u32),
     )?;
     // "Copy sign bit of a into value of b": the magnitude comes from the
-    // second operand and the sign from the first, which is the opposite of
-    // what the name suggests and of SPIR-V's OpCopySign.
+    // second operand and the sign from the first, the opposite of OpCopySign.
     let sign_source = builder.bitcast(bits_type, None, arg.src1)?;
     let value_source = builder.bitcast(bits_type, None, arg.src2)?;
     let magnitude = builder.bitwise_and(bits_type, None, value_source, magnitude_mask)?;
@@ -4597,9 +4471,8 @@ fn emit_copysign(
 
 // dp4a.s32.s32 d, a, b, c;   dp4a.u32.u32 d, a, b, c;
 //
-// Four byte products, accumulated into c: the four bytes of a are multiplied
-// with the four bytes of b and the products are summed with c. The signed
-// form sign-extends the bytes, the unsigned one zero-extends them.
+// Four byte products summed with c. The signed form sign-extends the bytes,
+// the unsigned one zero-extends them.
 fn emit_dp4a(
     builder: &mut dr::Builder,
     map: &mut TypeWordMap,
@@ -4698,43 +4571,35 @@ fn half_of_pack(
 // mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
 //     {d0,d1,d2,d3}, {a0,a1,a2,a3}, {b0,b1}, {c0,c1,c2,c3};
 //
-// The tensor-core matrix multiply, D = A * B + C, with the fragments spread
-// over the 32 lanes of the warp. With g = lane/4 and j = lane%4, and for the
-// half precision form:
+// The tensor-core matrix multiply D = A * B + C, with the fragments spread
+// over the 32 lanes of the warp. With g = lane/4 and j = lane%4:
 //
 //   A (m x k, row major), 4 x b32 = 8 halves
-//     a0 = A[g][2j], A[g][2j+1]        a1 = A[g+8][2j], A[g+8][2j+1]
-//     a2 = A[g][2j+8], A[g][2j+9]      a3 = A[g+8][2j+8], A[g+8][2j+9]
+//     a0 = A[g][2j..2j+1]     a1 = A[g+8][2j..2j+1]
+//     a2 = A[g][2j+8..2j+9]   a3 = A[g+8][2j+8..2j+9]
 //   B (k x n, column major), 2 x b32 = 4 halves
-//     b0 = B[2j][g], B[2j+1][g]        b1 = B[2j+8][g], B[2j+9][g]
+//     b0 = B[2j..2j+1][g]     b1 = B[2j+8..2j+9][g]
 //   C, D (m x n), 4 x f32
-//     c0 = C[g][2j]   c1 = C[g][2j+1]  c2 = C[g+8][2j]  c3 = C[g+8][2j+1]
+//     c0 = C[g][2j]  c1 = C[g][2j+1]  c2 = C[g+8][2j]  c3 = C[g+8][2j+1]
 //
-// Every thread therefore knows four elements of D and needs the whole row of A
-// and the whole column of B for them, which live in other lanes: they are
-// fetched with a subgroup shuffle.
+// A thread therefore needs the whole row of A and the whole column of B,
+// which live in other lanes: they are fetched with a subgroup shuffle. The
+// other element widths follow the same shape with 32 / element_bits elements
+// to a register.
 //
-// The same shape holds for the other element widths, with the number of
-// elements a register carries being 32 bits / element bits: the k range splits
-// into two halves (eight columns for the half precision form, four for the
-// 32-bit tf32 form), the first element of a pair sits in the lane g*4 + j and
-// the rest follow.
 // shfl.sync.mode.b32  d[|p], a, b, c, membermask;
 //
-// The thread reads `a` from a source lane, and p says whether that lane was
-// in range. The source lane comes from the lane id, the operand b and the two
-// fields of c (c[4:0] is the clamp, c[12:8] the segment mask):
+// p says whether the computed source lane was in range. With c[4:0] the
+// clamp and c[12:8] the segment mask:
 //
-//   maxLane = (lane & segmask) | (clamp & ~segmask)
-//   minLane =  lane & segmask
-//   .up    j = lane - b                p = j >= maxLane (below lane 0 is out)
-//   .down  j = lane + b                p = j <= maxLane
-//   .bfly  j = lane ^ b                p = j <= maxLane
-//   .idx   j = minLane | (b & ~segmask) p = j <= maxLane
+//   maxLane = (lane & segmask) | (clamp & ~segmask)  minLane = lane & segmask
+//   .up    j = lane - b                  p = j >= maxLane
+//   .down  j = lane + b                  p = j <= maxLane
+//   .bfly  j = lane ^ b                  p = j <= maxLane
+//   .idx   j = minLane | (b & ~segmask)  p = j <= maxLane
 //
-// A thread whose source lane is out of range reads its own register, so the
-// lane that is asked for is always one that exists and the backend's shuffle
-// by lane index is exactly that.
+// An out-of-range thread reads its own register, so the lane index handed to
+// the backend's shuffle always exists.
 fn emit_shfl(
     builder: &mut dr::Builder,
     map: &mut TypeWordMap,
@@ -4743,8 +4608,6 @@ fn emit_shfl(
     typ: ast::ScalarType,
     arg: &ast::ArgShfl<ExpandedArgParams>,
 ) -> Result<(), TranslateError> {
-    // The lane id is only needed to compute the source lane, and a kernel that
-    // shuffles gets the builtin emitted for it.
     let laneid = laneid.ok_or(TranslateError::Todo)?;
     let result_type = map.get_or_add_scalar(builder, typ.into());
     let u32_type = map.get_or_add_scalar(builder, ast::ScalarType::U32);
@@ -4833,7 +4696,7 @@ fn emit_mma(
         _ => return Err(TranslateError::Todo),
     };
     let integer = element_bits == 8;
-    // A register holds 32 bits of elements. The four lanes of a row group
+    // A register holds 32 bits of elements: the four lanes of a row group
     // cover k values 0..(4 * per_register), and every further group of that
     // many k values is one more set of registers.
     let per_register = 32 / element_bits;
@@ -4878,12 +4741,10 @@ fn emit_mma(
     let in_group = builder.bitwise_and(u32_type, None, lane, three)?;
     let col0 = builder.shift_left_logical(u32_type, None, in_group, one)?;
     let col1 = builder.i_add(u32_type, None, col0, one)?;
-    // The A fragment as plain registers, with every element converted to a
-    // float up front: fetching one pack and converting both of its halves
-    // afterwards is folded by the backend compiler into half precision
-    // arithmetic whose two lanes are then reduced with an integer add.
-    // A set of fragments covers k_per_set k values and two rows; B's sets each
-    // cover k_per_set k values for one column group.
+    // Every element of the A fragment is converted to a float up front:
+    // fetching a pack and converting its halves afterwards is folded by the
+    // backend into half precision arithmetic. A set covers k_per_set k values
+    // and two rows; B's sets each cover k_per_set values for one column group.
     let sets = k / k_per_set;
     let a_registers = sets * 2;
     let b_registers = sets;
@@ -4938,10 +4799,9 @@ fn emit_mma(
     .enumerate()
     {
         let column: spirv::Word = *column;
-        // The accumulator of a half precision multiply is packed two values to
-        // a register; a float one has a register per value. Both are converted
-        // to floats, because the accumulation is done in single precision and
-        // rounded back afterwards.
+        // A half precision accumulator packs two values to a register, a float
+        // one has a register per value; both are converted, since the
+        // accumulation is done in single precision and rounded back.
         let mut sum = if integer {
             let register = fragment_register(
                 builder,
@@ -5140,9 +5000,8 @@ fn fragment_element(
 // shf.l.wrap.b32 d, a, b, c;   d = (b << c) | (a >> (32 - c))
 // shf.r.wrap.b32 d, a, b, c;   d = (a >> c) | (b << (32 - c))
 //
-// The two operands form one 64-bit value; the result is the low 32 bits of
-// it shifted by c. A shift by zero keeps the low word, which is what the
-// select at the end takes care of (a shift by 32 is undefined).
+// The two operands form one 64-bit value; the result is its low 32 bits
+// shifted by c (a shift by 32 is undefined, hence the select at the end).
 fn emit_shf(
     builder: &mut dr::Builder,
     map: &mut TypeWordMap,
@@ -5172,7 +5031,6 @@ fn emit_shf(
     // {b, a} is one 64-bit value with b in the high word, so:
     //   shf.l: d = (b << c) | (a >> (32 - c))
     //   shf.r: d = (a >> c) | (b << (32 - c))
-    // The right form used to apply each amount to the opposite operand.
     let combined = if details.left {
         let moved_high = builder.shift_left_logical(u32_type, None, arg.src2, count)?;
         let moved_low = builder.shift_right_logical(u32_type, None, arg.src1, lowered_shift)?;
@@ -5189,10 +5047,9 @@ fn emit_shf(
         let survivor = if details.left { arg.src2 } else { arg.src1 };
         builder.select(u32_type, Some(arg.dst), is_zero, survivor, combined)?;
     } else {
-        // A clamp past the width returns the word that survives the shift:
-        // the low word for a left shift, the high word for a right shift. A
-        // clamp of zero is the same as a wrap of zero, so the low word of the
-        // pair is the result and the combination above does not apply.
+        // A clamp past the width returns the word that survives the shift; a
+        // clamp of zero is the wrap-of-zero case, so the low word is the
+        // result.
         let wide = builder.u_greater_than_equal(bool_type, None, arg.src3, thirty_two)?;
         let survivor = if details.left { arg.src1 } else { arg.src2 };
         let clamped = builder.select(u32_type, None, wide, survivor, combined)?;
@@ -5205,16 +5062,14 @@ fn emit_shf(
 
 // prmt.b32 d, a, b, c;
 //
-// The eight bytes of a and b form one pool (a holds bytes 0-3, b bytes 4-7).
-// Each of the four nibbles of c selects one byte of the pool for the result,
-// the low nibble for the lowest byte. A nibble whose top bit is set does not
-// select a byte at all: the sign bit of the selected byte is replicated over
-// the whole output byte, which is the sign extension the instruction documents.
+// The eight bytes of a and b are one pool (a holds bytes 0-3, b bytes 4-7);
+// each nibble of c selects one, the low nibble for the lowest byte. A nibble
+// with its top bit set does not select a byte: it replicates the sign bit of
+// the selected byte over the whole output byte.
 /// bar.red reduces a predicate (or counts the lanes that hold it) across the
-/// whole workgroup. SPIR-V has no workgroup wide group operation, so the votes
-/// are counted in workgroup memory: the word is cleared, every lane whose vote
-/// counts adds one, the total is handed to `finish`, and the word is cleared
-/// again so that a loop can run the same instruction once more.
+/// whole workgroup: the votes are counted in workgroup memory, the total is
+/// handed to `finish`, and the word is cleared again so that a loop can run
+/// the same instruction once more.
 fn emit_bar_red(
     builder: &mut dr::Builder,
     map: &mut TypeWordMap,
@@ -5278,10 +5133,8 @@ fn emit_bar_red(
         Ok(())
     };
     // One guarded atomic, in a block of its own. Deliberately not an
-    // OpSelectionMerge: a structured selection is predicated by the backend
-    // compiler, and a predicated atomic only lands for a single lane. The
-    // unstructured branch that the predicated instructions of the PTX lower to
-    // is compiled per lane.
+    // OpSelectionMerge: the backend predicates a structured selection, and a
+    // predicated atomic only lands for a single lane.
     let guarded =
         |builder: &mut dr::Builder, add: bool| -> Result<(), TranslateError> {
             let then_id = builder.id();
@@ -5365,9 +5218,8 @@ fn emit_prmt(
     let all_ones = constant(builder, map, 0xff)?;
     let mut result: Option<spirv::Word> = None;
     // Each output byte comes from one of the eight input bytes: the selector's
-    // low three bits pick the byte, and its fourth bit asks for the byte's sign
-    // to be replicated instead of the byte itself. The source word and the
-    // shift are both 32 bits wide, which keeps the whole thing in one width.
+    // low three bits pick the byte, its fourth bit asks for that byte's sign to
+    // be replicated instead.
     for index in 0..4u32 {
         let selector_shift = constant(builder, map, index * 4)?;
         let selector = builder.shift_right_logical(u32_type, None, arg.src3, selector_shift)?;
@@ -5405,11 +5257,9 @@ fn emit_prmt(
 
 // cp.async.cg.shared.global [dst], [src], 16;
 //
-// Copies global memory into shared memory. The point of the instruction is
-// to overlap the copy with the arithmetic; a plain copy produces the same
-// result, so that is what is emitted. The destination is a 32-bit offset in
-// the shared window, which is what a pointer into the Workgroup storage
-// class means in SPIR-V.
+// A plain copy produces the same result (the point of the instruction is
+// overlapping it with the arithmetic). The destination is a 32-bit offset
+// into the shared window, which is what a Workgroup pointer means in SPIR-V.
 fn emit_cp_async(
     builder: &mut dr::Builder,
     map: &mut TypeWordMap,
@@ -5500,20 +5350,15 @@ fn emit_cp_async(
 
 // ldmatrix.sync.aligned.m8n8.x{1,2,4}.b16 [.trans] {d...}, [p];
 //
-// The rows of matrix i are the addresses held by the threads 8i..8i+7, and
-// thread t receives the two 16-bit elements at row t/4, columns 2*(t%4) and
-// 2*(t%4)+1 of every matrix. The row address therefore has to be fetched
-// from the thread that holds it (a subgroup shuffle), and the elements are
-// then read from shared memory.
-//
-// ".trans" distributes the transposed matrix: thread t receives the elements
-// at rows 2*(t%4) and 2*(t%4)+1, column t/4.
-/// `vsub4.u32.u32.u32 d, a, b, c;` - four independent byte subtractions.
-///
-/// Each result byte is the low eight bits of the difference, so the bytes do
-/// not borrow into each other. CUDA's documentation of the intrinsic says the
-/// same thing ("performs per-byte subtraction ... partial results are
-/// recombined"); the saturating variant is a different instruction.
+// The rows of matrix i are the addresses held by threads 8i..8i+7, and thread
+// t receives the two 16-bit elements at row t/4, columns 2*(t%4) and
+// 2*(t%4)+1 of every matrix, so a row address has to be fetched from its
+// owner first. ".trans" distributes the transposed matrix: rows 2*(t%4) and
+// 2*(t%4)+1 at column t/4.
+/// `vsub4.u32.u32.u32 d, a, b, c;` - four independent byte subtractions, each
+/// result byte holding the low eight bits of the difference, so the bytes do
+/// not borrow into each other. The saturating variant is a different
+/// instruction.
 fn emit_vsub4(
     builder: &mut dr::Builder,
     map: &mut TypeWordMap,
@@ -5535,9 +5380,9 @@ fn emit_vsub4(
         if byte == 0 {
             let low = builder.bitwise_and(u32_type, None, arg.src1, mask)?;
             let low_b = builder.bitwise_and(u32_type, None, arg.src2, mask)?;
-            // The difference of two bytes is negative in the low byte as often
-            // as not, and in a 32-bit register that sets every upper bit: the
-            // byte has to be cut out again.
+            // A byte difference is negative as often as not and sets every
+            // upper bit of a 32-bit register, so the byte has to be cut out
+            // again.
             let low = builder.i_sub(u32_type, None, low, low_b)?;
             result = Some(builder.bitwise_and(u32_type, None, low, mask)?);
             continue;
@@ -5555,9 +5400,8 @@ fn emit_vsub4(
     Ok(())
 }
 
-/// `vset4.u32.u32.ne d, a, b, c;` - four independent byte comparisons, each
-/// result being one or zero (CUDA documents the `set` intrinsics that way; the
-/// `cmp` ones return 0xff and are different instructions).
+/// `vset4.u32.u32.ne d, a, b, c;` - four byte comparisons, each result one or
+/// zero (the `cmp` intrinsics return 0xff and are different instructions).
 fn emit_vset4(
     builder: &mut dr::Builder,
     map: &mut TypeWordMap,
@@ -5612,10 +5456,8 @@ fn emit_vset4(
 }
 
 /// `redux.sync.add.s32 d, a, mask;` - the value `a` reduced across the warp.
-///
-/// The member mask is a promise about which lanes take part; the group
-/// operation reduces over the whole subgroup, which is what a kernel running
-/// with every lane active means by it.
+/// The member mask is a promise about which lanes take part; the operation
+/// covers the whole subgroup.
 fn emit_redux(
     builder: &mut dr::Builder,
     map: &mut TypeWordMap,
@@ -5706,13 +5548,9 @@ fn emit_cvt_packed(
         let half = builder.bitcast(u16_type, None, half)?;
         Ok(builder.u_convert(u32_type, None, half)?)
     };
-    // "cvt.rn.f16x2.f32 d, a, b" puts a in the HIGH half and b in the LOW half,
-    // which is the opposite of the order the operands are written in. NVIDIA's
-    // own header spells it out: the sm_80 form feeds the asm as "%2, %1" so
-    // that the first argument ends up low, and the fallback builds
-    // {low = a, high = b} by hand. Getting this backwards exchanges every
-    // adjacent pair of k values in whatever the caller stages, which is how
-    // ggml's f16 matmul ended up pairing A's element k with B's element k^1.
+    // "cvt.rn.f16x2.f32 d, a, b" puts a in the HIGH half and b in the LOW
+    // half. Getting it backwards silently exchanges every adjacent pair of
+    // elements in whatever the caller stages.
     let high = convert(builder, map, arg.src1)?;
     let low = convert(builder, map, arg.src2)?;
     let high = builder.shift_left_logical(u32_type, None, high, sixteen)?;
@@ -5724,11 +5562,10 @@ fn emit_cvt_packed(
 
 // movmatrix.sync.aligned.m8n8.trans.b16 d, a;
 //
-// The warp holds an 8 x 8 matrix of 16-bit values in one register per thread:
-// thread t holds the two values of row t/4, columns 2*(t%4) and 2*(t%4)+1. The
-// transposed matrix has the same distribution, so thread t's result is the
-// value at row 2*(t%4) and column t/4, followed by the one at row 2*(t%4)+1 and
-// the same column. Both are fetched from their owner with a subgroup shuffle.
+// The warp holds an 8x8 matrix of 16-bit values, one register per thread:
+// thread t holds row t/4, columns 2*(t%4) and 2*(t%4)+1. The transposed matrix
+// has the same distribution, so t's result is row 2*(t%4) column t/4, followed
+// by row 2*(t%4)+1 at the same column.
 fn emit_movmatrix(
     builder: &mut dr::Builder,
     map: &mut TypeWordMap,
@@ -6505,8 +6342,8 @@ fn emit_cvt(
                     &vec_repr(0x7fffu32),
                 )?;
                 // Round to nearest even: the bias is half of the part that is
-                // dropped, plus the low bit of the kept part (so that a tie
-                // goes to the even value).
+                // dropped plus the low bit of the kept part, so a tie goes to
+                // the even value.
                 let shift = map.get_or_add_constant(
                     builder,
                     &ast::Type::Scalar(ast::ScalarType::U32),
@@ -6690,7 +6527,6 @@ fn emit_cvt(
         ast::CvtDetails::IntFromInt(desc) => {
             let dest_t: ast::ScalarType = desc.dst.into();
             let src_t: ast::ScalarType = desc.src.into();
-            // first do shortening/widening
             let src = if desc.dst.size_of() != desc.src.size_of() {
                 let new_dst = if dest_t.kind() == src_t.kind() {
                     arg.dst
@@ -6717,7 +6553,6 @@ fn emit_cvt(
             if dest_t.kind() == src_t.kind() {
                 return Ok(());
             }
-            // now do actual conversion
             let result_type = map.get_or_add(builder, SpirvType::from(dest_t));
             if desc.saturate {
                 if desc.dst.kind() == ast::ScalarKind::Signed {
@@ -6745,17 +6580,13 @@ enum RoundedFloatOp {
 /// Whether a floating-point operation has to be evaluated in double precision
 /// to honour its rounding mode.
 ///
-/// SPIR-V has no rounding-mode operand on the arithmetic instructions, only
-/// the FPRoundingMode decoration on a result, and the backend honours that
-/// decoration on conversions but ignores it everywhere else: an `add.rz`
-/// comes out rounded to nearest, which is silent corruption of anything that
-/// depends on the direction. Double precision has enough bits for the product
-/// of two floats to be exact and for the sum of a product and an addend to be
-/// exact whenever their exponents are no more than twenty-nine apart, so the
-/// operation is evaluated there and only the conversion back needs the mode.
-///
-/// A double precision operation with a rounding mode of its own has no wider
-/// type to go to, so those keep the nearest-even behaviour; nothing emits one.
+/// SPIR-V has no rounding-mode operand on the arithmetic instructions, only the
+/// FPRoundingMode decoration on a result, and the backend honours that on
+/// conversions but ignores it elsewhere: an `add.rz` would come out rounded to
+/// nearest. Double precision is exact for the product of two floats and for a
+/// product plus addend whose exponents are within twenty-nine, so only the
+/// conversion back needs the mode. A double operation with a mode of its own
+/// has no wider type to go to and keeps nearest-even; nothing emits one.
 fn needs_wide_rounding(typ: ast::Type, rounding: Option<ast::RoundingMode>) -> bool {
     match rounding {
         None | Some(ast::RoundingMode::NearestEven) => false,
@@ -6813,10 +6644,10 @@ fn emit_saturating_decoration(builder: &mut dr::Builder, dst: u32, saturate: boo
     }
 }
 
-// SPIR-V only allows the FPRoundingMode decoration on a conversion
-// instruction, so it is applied to the temporary that the conversion
-// defines. A PTX register can be written by several instructions, so the
-// register itself is not always defined by the conversion.
+// SPIR-V only allows the FPRoundingMode decoration on a conversion, so it goes
+// on the temporary the conversion defines: a PTX register can be written by
+// several instructions, so the register itself is not always defined by the
+// conversion.
 fn emit_rounding_decoration(
     builder: &mut dr::Builder,
     dst: spirv::Word,
@@ -6944,12 +6775,9 @@ fn emit_setp(
     Ok(())
 }
 
-// HACK ALERT
-// Temporary workaround until IGC gets its shit together
-// Currently IGC carries two copies of SPIRV-LLVM translator
-// a new one in /llvm-spirv/ and old one in /IGC/AdaptorOCL/SPIRV/.
-// Obviously, old and buggy one is used for compiling L0 SPIRV
-// https://github.com/intel/intel-graphics-compiler/issues/148
+// IGC carries two copies of the SPIR-V translator and compiles L0 SPIR-V with
+// the old one (intel/intel-graphics-compiler#148), which needs this spelled as
+// a select.
 fn logical_not(
     builder: &mut dr::Builder,
     result_type: spirv::Word,
@@ -7158,15 +6986,13 @@ fn emit_implicit_conversion(
                 SpirvType::pointer_to(cv.to_type.clone(), cv.to_space.to_spirv()),
             );
             // BitToPtr in 64-bit PTX converts a pointer-sized value (int or
-            // pointer) to a pointer. OpConvertUToPtr requires an int operand;
-            // when the source is already a pointer (e.g. after byte-pointer
-            // arithmetic rewrites) OpBitcast across storage classes is the only
-            // legal form.
+            // pointer) to a pointer. OpConvertUToPtr requires an int operand, so
+            // a source that is already a pointer (e.g. after byte-pointer
+            // arithmetic) is bitcast across storage classes instead.
             if from_parts.kind == TypeKind::Scalar {
-                // PTX treats the address of a symbol as a generic one, and
-                // arithmetic on it keeps it generic, so a number that names a
-                // shared or a local address arrives here as a generic address
-                // and has to be cast into the space the access names.
+                // PTX treats the address of a symbol as generic, and arithmetic
+                // on it keeps it generic, so a number that names a shared or a
+                // local address has to be cast into the space the access names.
                 let space = cv.to_space.to_spirv();
                 if space == spirv::StorageClass::Generic
                     || space == spirv::StorageClass::CrossWorkgroup
@@ -7188,8 +7014,7 @@ fn emit_implicit_conversion(
             if from_parts.width == to_parts.width {
                 let dst_type = map.get_or_add(builder, SpirvType::new(cv.to_type.clone()));
                 // A packed pair of halves lives in a 32-bit register: only its
-                // bit pattern matters, so it is reinterpreted and not
-                // converted.
+                // bit pattern matters, so it is reinterpreted, not converted.
                 let float_kind = |kind: ast::ScalarKind| {
                     kind == ast::ScalarKind::Float || kind == ast::ScalarKind::Float2
                 };
@@ -7205,7 +7030,6 @@ fn emit_implicit_conversion(
                         from_parts.width, to_parts.width
                     );
                 }
-                // This block is safe because it's illegal to implictly convert between floating point values
                 let same_width_bit_type = map.get_or_add(
                     builder,
                     SpirvType::new(ast::Type::from_parts(TypeParts {
@@ -7259,8 +7083,8 @@ fn emit_implicit_conversion(
                 );
             }
             // The instruction wants a narrower value than the register holds:
-            // keep the low bits. An 8-bit value lives in the low byte of a
-            // 16-bit register in PTX.
+            // keep the low bits (an 8-bit value lives in the low byte of a
+            // 16-bit register in PTX).
             let result_type = map.get_or_add(builder, SpirvType::new(cv.to_type.clone()));
             builder.u_convert(result_type, Some(cv.dst), cv.src)?;
         }
@@ -7320,8 +7144,6 @@ fn emit_implicit_conversion(
             );
             let low = builder.composite_extract(scalar_type, None, cv.src, [0].iter().copied())?;
             let high = builder.composite_extract(scalar_type, None, cv.src, [1].iter().copied())?;
-            // A half precision piece is an integer in the register; only its
-            // bit pattern matters.
             let low = if scalar_type == int_elem_type {
                 low
             } else {
@@ -7358,10 +7180,8 @@ fn emit_implicit_conversion(
                 builder,
                 SpirvType::Vector(SpirvScalarKey::from(elem_type), 2),
             );
-            // The source is a wider value; work in its width and cut the
-            // halves out of it. The halves are integers of the element's
-            // width: a packed pair of half precision values is cut into two
-            // 16-bit pieces, a pair of 32-bit values into two 32-bit ones.
+            // The source is a wider value; work in its width and cut the halves
+            // out of it, as integers of the element's width.
             let wide_type = map.get_or_add(builder, SpirvType::new(cv.from_type.clone()));
             let elem_bits = match cv.to_type {
                 ast::Type::Vector(scalar_t, _) => scalar_t.size_of() as u32 * 8,
@@ -7388,8 +7208,6 @@ fn emit_implicit_conversion(
             let high64 = builder.shift_right_logical(wide_type, None, cv.src, shift)?;
             let low = builder.u_convert(int_elem_type, None, low64)?;
             let high = builder.u_convert(int_elem_type, None, high64)?;
-            // A half precision piece is an integer in the register; only its
-            // bit pattern matters.
             let low = if scalar_type == int_elem_type {
                 low
             } else {
@@ -7423,10 +7241,9 @@ fn emit_implicit_conversion(
 
 /// The address of a pointer as a number a generic operation can use.
 ///
-/// A pointer in the shared or the local space converts to its offset inside
-/// that space, which is not an address a generic load may use: PTX treats the
-/// address of a symbol as a generic one, so the pointer is cast to the generic
-/// space first.
+/// A shared or local pointer converts to its offset inside that space, which is
+/// not an address a generic load may use; PTX treats the address of a symbol as
+/// generic, so the pointer is cast to the generic space first.
 fn generic_address(
     builder: &mut dr::Builder,
     map: &mut TypeWordMap,
@@ -7755,9 +7572,9 @@ fn convert_to_stateful_memory_access<'a, 'input>(
         drop(method_decl);
         return Ok((func_args, func_body));
     }
-    // Registers whose base is a .shared symbol must be typed as Shared
-    // (Workgroup) pointers, not Global (CrossWorkgroup), or the shared-memory
-    // accesses they feed will roundtrip through the wrong address space.
+    // Registers whose base is a .shared symbol must be Shared (Workgroup)
+    // pointers, not Global (CrossWorkgroup), or the shared accesses they feed
+    // roundtrip through the wrong address space.
     let mut shared_ptr_dsts = HashSet::new();
     for statement in func_body.iter() {
         if let Statement::Instruction(ast::Instruction::Mov(_, arg)) = statement {
@@ -8811,10 +8628,8 @@ struct LoadVarDetails {
     typ: ast::Type,
     state_space: ast::StateSpace,
     // (index, vector_width)
-    // HACK ALERT
-    // For some reason IGC explodes when you try to load from builtin vectors
-    // using OpInBoundsAccessChain, the one true way to do it is to
-    // OpLoad+OpCompositeExtract
+    // IGC explodes when a builtin vector is loaded through
+    // OpInBoundsAccessChain; it has to be OpLoad + OpCompositeExtract.
     member_index: Option<(u8, Option<u8>)>,
 }
 
@@ -8829,13 +8644,12 @@ struct RepackVectorDetails {
     typ: ast::ScalarType,
     packed: spirv::Word,
     unpacked: Vec<spirv::Word>,
-    /// Number of elements in the pack. A pack of two 32-bit registers can
-    /// also spell a single 64-bit value (`mov.b64 {%r0,%r1}, %rd2;`), in which
-    /// case the pack is assembled into a 64-bit value instead of a vector.
+    /// Number of elements in the pack. A pack of two 32-bit registers can also
+    /// spell a single 64-bit value (`mov.b64 {%r0,%r1}, %rd2;`), which is then
+    /// assembled into a 64-bit value instead of a vector.
     pack_width: u8,
-    /// The type of the packed value when it is a scalar that the pack
-    /// splits into pieces ("mov.b64 {%r0,%r1}, %rd2;" splits a 64-bit value
-    /// into two 32-bit halves). None when the packed value is a vector.
+    /// The type of the packed value when it is a scalar the pack splits into
+    /// pieces. None when the packed value is a vector.
     packed_scalar: Option<ast::ScalarType>,
     non_default_implicit_conversion: Option<
         fn(
@@ -8846,8 +8660,8 @@ struct RepackVectorDetails {
 }
 
 impl RepackVectorDetails {
-    /// The type of the packed value: a vector for a real vector pack, a
-    /// scalar for the "the pack names the pieces of a wider value" form.
+    /// The type of the packed value: a vector for a real vector pack, a scalar
+    /// for the "the pack names the pieces of a wider value" form.
     fn packed_type(&self) -> ast::Type {
         match self.packed_scalar {
             Some(scalar) => ast::Type::Scalar(scalar),
@@ -9208,7 +9022,7 @@ where
                     .collect::<Result<Vec<_>, _>>()?,
             ),
             // A vector literal of constants: "st.global.v2.b32 [addr], {99, 0};"
-            // The elements carry no identifiers, so nothing to resolve here.
+            // Nothing to resolve here.
             ast::Operand::ImmPack(values) => ast::Operand::ImmPack(values),
         })
     }
@@ -9467,13 +9281,9 @@ impl<T: ArgParamsEx> ast::Instruction<T> {
                 ast::Instruction::MovMatrix(ast::Arg2 { dst, src })
             }
             ast::Instruction::Mma(d, a) => {
-                // Every thread owns four elements of D (and of C), one 32-bit
-                // register each for a float accumulation. A half precision
-                // accumulation packs two elements per register, and the
-                // register keeps its 32 bits, so the fragment is two registers
-                // holding 32-bit values rather than two halves.
-                // The accumulator fragment is four floats, four integers or
-                // two packed pairs of halves.
+                // Every thread owns four elements of D (and of C): four floats,
+                // four integers, or two packed pairs of halves - a half
+                // precision accumulation keeps two elements per register.
                 let result_bits: u32 = match d.dst {
                     ast::ScalarType::F32 | ast::ScalarType::S32 | ast::ScalarType::U32 => 32,
                     ast::ScalarType::F16 | ast::ScalarType::S16 | ast::ScalarType::U16 => 16,
@@ -9481,16 +9291,14 @@ impl<T: ArgParamsEx> ast::Instruction<T> {
                 };
                 let result_registers =
                     ((d.m as u32 * d.n as u32 / 32) * result_bits / 32) as u8;
-                // Only the float form keeps its values as floats; a packed
-                // pair of halves and an integer both live in a 32-bit register.
                 let result_type = if d.dst == ast::ScalarType::F32 {
                     ast::ScalarType::F32
                 } else {
                     ast::ScalarType::B32
                 };
                 // The fragment sizes follow from the shape and the element
-                // width: every thread holds m*k/32 elements of A, k*n/32 of B
-                // and m*n/32 of D, and a register holds 32 bits of them.
+                // width: a thread holds m*k/32 elements of A, k*n/32 of B and
+                // m*n/32 of D, and a register holds 32 bits of them.
                 let element_bits: u8 = match d.a {
                     ast::ScalarType::F16 | ast::ScalarType::B16 => 16,
                     ast::ScalarType::B32 => 32,
@@ -9752,10 +9560,9 @@ impl<T: ArgParamsEx> ast::Instruction<T> {
             ast::Instruction::Vote(m, t, a) => {
                 let typ = ast::Type::Scalar(t);
                 let pred_typ = ast::Type::Scalar(ast::ScalarType::Pred);
-                // The destination keeps the instruction type (b32 for the
-                // ballot form, pred for the reduction forms), the source is
-                // always a predicate register and the member mask is a 32-bit
-                // integer.
+                // The destination keeps the instruction type (b32 for the ballot
+                // form, pred for the reduction forms), the source is always a
+                // predicate and the member mask a 32-bit integer.
                 let dst = visitor.operand(
                     ArgumentDescriptor {
                         op: a.dst,
@@ -10327,7 +10134,6 @@ struct ImplicitConversion {
 #[derive(PartialEq, Clone)]
 enum ConversionKind {
     Default,
-    // zero-extend/chop/bitcast depending on types
     SignExtend,
     // The value is wider than the instruction wants: keep the low bits.
     Truncate,
@@ -10885,8 +10691,8 @@ impl<T: ArgParamsEx> ast::Arg4<T> {
             ast::StateSpace::Reg,
         )?;
         // The second operand is compared against the first, so it has the
-        // comparison's type. Typing it as u32 made a `.s16` comparison
-        // against -1 emit an out-of-range 16-bit constant.
+        // comparison's type: typing it as u32 made a `.s16` comparison against
+        // -1 emit an out-of-range 16-bit constant.
         let src2 = visitor.operand(
             ArgumentDescriptor {
                 op: self.src2,
@@ -10897,9 +10703,9 @@ impl<T: ArgParamsEx> ast::Arg4<T> {
             typ,
             ast::StateSpace::Reg,
         )?;
-        // The offset and the width are operands of the bit field extraction,
-        // which requires them to have the width of the result: a 64-bit bfe
-        // with a 32-bit width is rejected by the backend.
+        // The offset and the width are operands of the extraction, which wants
+        // them at the width of the result: a 64-bit bfe with a 32-bit width is
+        // rejected by the backend.
         let src3 = visitor.operand(
             ArgumentDescriptor {
                 op: self.src3,
@@ -11512,13 +11318,9 @@ fn implicit_conversion_mov(
                 return Ok(Some(ConversionKind::Default));
             }
         }
-    // TODO: verify .params addressability:
-    // * kernel arg
-    // * func arg
-    // * variable
-    // Clang-emitted PTX materializes by-value struct params (.param
-    // vectors/arrays) through mov.b64 address-of; the 2021 baseline never
-    // saw such PTX, so Param joins the addressable set here only.
+    // Param is addressable only because clang-emitted PTX materializes
+    // by-value struct params (.param vectors/arrays) through mov.b64
+    // address-of. TODO: verify the kernel-arg, func-arg and variable cases.
     } else if operand_space.is_addressable() || operand_space == ast::StateSpace::Param {
         return Ok(Some(ConversionKind::AddressOf));
     }

@@ -79,6 +79,7 @@ match {
     ".geu",
     ".global",
     ".gpu",
+    ".gl",
     ".gt",
     ".gtu",
     ".hi",
@@ -179,6 +180,7 @@ match {
 } else {
     // IF YOU ARE ADDING A NEW TOKEN HERE ALSO ADD IT BELOW TO ExtendedID
     "abs",
+    "activemask",
     "add",
     "and",
     "atom",
@@ -991,6 +993,8 @@ LdStQualifier: ast::LdStQualifier = {
 MemScope: ast::MemScope = {
     ".cta" => ast::MemScope::Cta,
     ".gpu" => ast::MemScope::Gpu,
+    // ".gl" is the older name for the same device-wide scope.
+    ".gl" => ast::MemScope::Gpu,
     ".sys" => ast::MemScope::Sys
 };
 
@@ -1678,7 +1682,21 @@ SelpType: ast::ScalarType = {
 
 // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#memory-consistency-model-membar
 InstMembar: ast::Instruction<ast::ParsedArgParams<'input>> = {
-    "membar" <scope:MemScope> => ast::Instruction::Membar(scope)
+    "membar" <scope:MemScope> => ast::Instruction::Membar(scope),
+    // The instruction reports which lanes are active. A ballot over the
+    // subgroup would be exact, but a group operation needs a register predicate
+    // and this has none, and the value is used as a shuffle or barrier mask
+    // where every lane is active. So it expands to the all-active mask.
+    "activemask" ".b32" <dst:ExtendedID> => {
+        let details = ast::MovDetails::new(ast::Type::Scalar(ast::ScalarType::B32));
+        ast::Instruction::Mov(
+            details,
+            ast::Arg2Mov {
+                dst: ast::Operand::Reg(dst),
+                src: ast::Operand::Imm(ast::ImmediateValue::U64(u32::MAX as u64)),
+            },
+        )
+    }
 }
 
 // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-bar

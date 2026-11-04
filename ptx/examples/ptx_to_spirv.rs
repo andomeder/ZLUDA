@@ -20,6 +20,14 @@ fn main() {
             std::process::exit(1);
         }
     };
+    // Recovery errors do not stop the parse, but the loader refuses a module
+    // that has any, so a translator debug run needs to see all of them.
+    if !errors.is_empty() {
+        eprintln!("{} recovery error(s):", errors.len());
+        for error in &errors {
+            eprintln!("  {:?}", error);
+        }
+    }
     match ptx::to_spirv_module(ast) {
         Ok(module) => {
             let words = module.assemble();

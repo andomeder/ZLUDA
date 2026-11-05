@@ -5694,8 +5694,42 @@ fn emit_redux(
             value,
             None,
         )?,
-        // The float minimum and maximum, and the bitwise reductions, have no
-        // group operation of their own.
+        // The bitwise reductions and the 64-bit float minimum and maximum have
+        // group operations of their own in SPIR-V 1.3; only the 16-bit and
+        // packed float forms are left unimplemented.
+        (ast::ReduxOp::And, _) => builder.group_non_uniform_bitwise_and(
+            result_type,
+            None,
+            subgroup,
+            reduce,
+            value,
+            None,
+        )?,
+        (ast::ReduxOp::Or, _) => builder.group_non_uniform_bitwise_or(
+            result_type,
+            None,
+            subgroup,
+            reduce,
+            value,
+            None,
+        )?,
+        (ast::ReduxOp::Xor, _) => builder.group_non_uniform_bitwise_xor(
+            result_type,
+            None,
+            subgroup,
+            reduce,
+            value,
+            None,
+        )?,
+        (ast::ReduxOp::Min, ast::ScalarType::F64) => {
+            builder.group_non_uniform_f_min(result_type, None, subgroup, reduce, value, None)?
+        }
+        (ast::ReduxOp::Max, ast::ScalarType::F64) => {
+            builder.group_non_uniform_f_max(result_type, None, subgroup, reduce, value, None)?
+        }
+        (ast::ReduxOp::Add, ast::ScalarType::F64) => {
+            builder.group_non_uniform_f_add(result_type, None, subgroup, reduce, value, None)?
+        }
         _ => return Err(error_todo()),
     };
     builder.copy_object(result_type, Some(arg.dst), result)?;

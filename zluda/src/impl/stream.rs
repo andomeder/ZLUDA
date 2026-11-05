@@ -131,21 +131,40 @@ impl StreamData {
         })
     }
 
-    pub fn try_reuse_finished_events(&mut self) -> l0::Result<()> {
-        loop {
-            match self.busy_events.get(0) {
-                None => return Ok(()),
-                Some((ev, _)) => {
-                    if ev.is_ready()? {
-                        let (ev, marker) = self.busy_events.pop_front().unwrap();
-                        ev.host_reset()?;
-                        self.free_events.push_back((ev, marker));
-                    } else {
-                        return Ok(());
-                    }
-                }
-            }
+    /// Recycle the oldest event, if it is safe to.
+    ///
+    /// An event is not safe to reuse the moment it signals. Each launch appends
+    /// a barrier that waits on the *previous* launch's event, and that barrier
+    /// stays pending until it is processed. Reusing the event before its
+    /// successor's barrier has retired hands the newer launch a wait that can
+    /// never be satisfied in order: the successor waits for the event, the
+    /// event now belongs to a later launch, and the queue stops for good. That
+    /// is what hung torch at 527 queued launches - the merge in `merge_adapter`
+    /// launches one kernel per parameter - and why a 200 launch loop sometimes
+    /// stalled and sometimes did not.
+    ///
+    /// So: recycle only when this event is ready AND the one after it is ready
+    /// too (its barrier has been processed), or when it is the newest event and
+    /// nothing waits on it yet.
+    fn recycle_ready_front(&mut self) -> l0::Result<bool> {
+        if self.busy_events.is_empty() {
+            return Ok(false);
         }
+        if !self.busy_events.front().unwrap().0.is_ready()? {
+            return Ok(false);
+        }
+        if self.busy_events.len() > 1 && !self.busy_events.get(1).unwrap().0.is_ready()? {
+            return Ok(false);
+        }
+        let (event, marker) = self.busy_events.pop_front().unwrap();
+        event.host_reset()?;
+        self.free_events.push_back((event, marker));
+        Ok(true)
+    }
+
+    pub fn try_reuse_finished_events(&mut self) -> l0::Result<()> {
+        while self.recycle_ready_front()? {}
+        Ok(())
     }
 
     pub fn reuse_all_finished_events(&mut self) -> l0::Result<()> {
@@ -165,16 +184,17 @@ impl StreamData {
     /// the queue is that short the buffer is free.
     pub fn wait_for_pending(&mut self, keep: usize) -> l0::Result<()> {
         while self.busy_events.len() > keep {
-            let (event, ready) = match self.busy_events.get(0) {
-                None => return Ok(()),
-                Some((event, _)) => (event, event.is_ready()?),
-            };
-            if !ready {
-                event.host_synchronize(60_000_000_000)?;
+            if self.recycle_ready_front()? {
+                continue;
             }
-            let (event, marker) = self.busy_events.pop_front().unwrap();
-            event.host_reset()?;
-            self.free_events.push_back((event, marker));
+            // Nothing can be recycled yet. Wait for the second event rather than
+            // the first: the first is the one a pending barrier may still be
+            // holding, and the second retiring implies its barrier was processed.
+            let index = if self.busy_events.len() > 1 { 1 } else { 0 };
+            match self.busy_events.get(index) {
+                None => return Ok(()),
+                Some((event, _)) => event.host_synchronize(60_000_000_000)?,
+            }
         }
         Ok(())
     }

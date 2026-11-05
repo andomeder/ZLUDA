@@ -2323,7 +2323,10 @@ pub extern "system" fn cuDeviceGetAttribute(
     attrib: CUdevice_attribute,
     dev: CUdevice,
 ) -> CUresult {
-    r#impl::device::get_attribute(pi, attrib, dev.decuda()).encuda()
+    let started = std::time::Instant::now();
+    let code = r#impl::device::get_attribute(pi, attrib, dev.decuda()).encuda();
+    trace_call("cuDeviceGetAttribute", started, code);
+    code
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -2471,6 +2474,13 @@ pub extern "system" fn cuCtxGetFlags(flags: *mut ::std::os::raw::c_uint) -> CUre
 
 #[cfg_attr(not(test), no_mangle)]
 pub extern "system" fn cuCtxSynchronize() -> CUresult {
+    let started = std::time::Instant::now();
+    let code = cuCtxSynchronize_inner();
+    trace_call("cuCtxSynchronize", started, code);
+    code
+}
+
+fn cuCtxSynchronize_inner() -> CUresult {
     r#impl::context::synchronize().encuda()
 }
 
@@ -2514,6 +2524,15 @@ pub extern "system" fn cuCtxGetApiVersion(
 
 #[cfg_attr(not(test), no_mangle)]
 pub extern "system" fn cuCtxGetStreamPriorityRange(
+    leastPriority: *mut ::std::os::raw::c_int,
+    greatestPriority: *mut ::std::os::raw::c_int,
+) -> CUresult {    let started = std::time::Instant::now();
+    let code = cuCtxGetStreamPriorityRange_inner(leastPriority, greatestPriority);
+    trace_call("cuCtxGetStreamPriorityRange", started, code);
+    code
+}
+
+fn cuCtxGetStreamPriorityRange_inner(
     leastPriority: *mut ::std::os::raw::c_int,
     greatestPriority: *mut ::std::os::raw::c_int,
 ) -> CUresult {
@@ -2656,6 +2675,7 @@ pub extern "system" fn cuLibraryGetKernel(
     library: CUlibrary,
     name: *const ::std::os::raw::c_char,
 ) -> CUresult {
+    let started = std::time::Instant::now();
     r#impl::library::get_kernel(
         pKernel.decuda() as *mut *mut ::std::os::raw::c_void,
         library.decuda(),
@@ -2672,6 +2692,7 @@ pub extern "system" fn cuKernelGetFunction(
     function: *mut CUfunction,
     kernel: CUkernel,
 ) -> CUresult {
+    let started = std::time::Instant::now();
     if function.is_null() {
         return CUresult::CUDA_ERROR_INVALID_VALUE;
     }
@@ -2744,6 +2765,7 @@ pub extern "system" fn cuModuleGetFunction(
     hmod: CUmodule,
     name: *const ::std::os::raw::c_char,
 ) -> CUresult {
+    let started = std::time::Instant::now();
     let name_str = unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy().into_owned();
     let rc = r#impl::module::get_function(hfunc.decuda(), hmod.decuda(), name).encuda();
     if std::env::var_os("ZLUDA_TRACE_LIBRARY").is_some() {
@@ -2831,7 +2853,13 @@ pub extern "system" fn cuLinkDestroy(state: CUlinkState) -> CUresult {
 }
 
 #[cfg_attr(not(test), no_mangle)]
-pub extern "system" fn cuMemGetInfo_v2(free: *mut usize, total: *mut usize) -> CUresult {
+pub extern "system" fn cuMemGetInfo_v2(free: *mut usize, total: *mut usize) -> CUresult {    let started = std::time::Instant::now();
+    let code = cuMemGetInfo_v2_inner(free, total);
+    trace_call("cuMemGetInfo_v2", started, code);
+    code
+}
+
+fn cuMemGetInfo_v2_inner(free: *mut usize, total: *mut usize) -> CUresult {
     r#impl::memory::get_info_v2(free, total).encuda()
 }
 
@@ -2841,7 +2869,13 @@ pub extern "system" fn cuMemGetInfo(free: *mut usize, total: *mut usize) -> CUre
 }
 
 #[cfg_attr(not(test), no_mangle)]
-pub extern "system" fn cuMemAlloc_v2(dptr: *mut CUdeviceptr, bytesize: usize) -> CUresult {
+pub extern "system" fn cuMemAlloc_v2(dptr: *mut CUdeviceptr, bytesize: usize) -> CUresult {    let started = std::time::Instant::now();
+    let code = cuMemAlloc_v2_inner(dptr, bytesize);
+    trace_call("cuMemAlloc_v2", started, code);
+    code
+}
+
+fn cuMemAlloc_v2_inner(dptr: *mut CUdeviceptr, bytesize: usize) -> CUresult {
     r#impl::memory::alloc_v2(dptr.decuda(), bytesize).encuda()
 }
 
@@ -3777,6 +3811,16 @@ pub extern "system" fn cuPointerGetAttribute(
     data: *mut ::std::os::raw::c_void,
     attribute: CUpointer_attribute,
     ptr: CUdeviceptr,
+) -> CUresult {    let started = std::time::Instant::now();
+    let code = cuPointerGetAttribute_inner(data, attribute, ptr);
+    trace_call("cuPointerGetAttribute", started, code);
+    code
+}
+
+fn cuPointerGetAttribute_inner(
+    data: *mut ::std::os::raw::c_void,
+    attribute: CUpointer_attribute,
+    ptr: CUdeviceptr,
 ) -> CUresult {
     r#impl::pointer::get_attribute(data, attribute.0, ptr.0 as *mut _).encuda()
 }
@@ -3839,6 +3883,17 @@ pub extern "system" fn cuPointerGetAttributes(
     attributes: *mut CUpointer_attribute,
     data: *mut *mut ::std::os::raw::c_void,
     ptr: CUdeviceptr,
+) -> CUresult {    let started = std::time::Instant::now();
+    let code = cuPointerGetAttributes_inner(numAttributes, attributes, data, ptr);
+    trace_call("cuPointerGetAttributes", started, code);
+    code
+}
+
+fn cuPointerGetAttributes_inner(
+    numAttributes: ::std::os::raw::c_uint,
+    attributes: *mut CUpointer_attribute,
+    data: *mut *mut ::std::os::raw::c_void,
+    ptr: CUdeviceptr,
 ) -> CUresult {
     r#impl::pointer::get_attributes(
         numAttributes,
@@ -3871,6 +3926,15 @@ pub extern "system" fn cuStreamCreateWithPriority(
 pub extern "system" fn cuStreamGetPriority(
     hStream: CUstream,
     priority: *mut ::std::os::raw::c_int,
+) -> CUresult {    let started = std::time::Instant::now();
+    let code = cuStreamGetPriority_inner(hStream, priority);
+    trace_call("cuStreamGetPriority", started, code);
+    code
+}
+
+fn cuStreamGetPriority_inner(
+    hStream: CUstream,
+    priority: *mut ::std::os::raw::c_int,
 ) -> CUresult {
     if priority == ::std::ptr::null_mut() {
         return CUresult::CUDA_ERROR_INVALID_VALUE;
@@ -3881,6 +3945,15 @@ pub extern "system" fn cuStreamGetPriority(
 
 #[cfg_attr(not(test), no_mangle)]
 pub extern "system" fn cuStreamGetFlags(
+    hStream: CUstream,
+    flags: *mut ::std::os::raw::c_uint,
+) -> CUresult {    let started = std::time::Instant::now();
+    let code = cuStreamGetFlags_inner(hStream, flags);
+    trace_call("cuStreamGetFlags", started, code);
+    code
+}
+
+fn cuStreamGetFlags_inner(
     hStream: CUstream,
     flags: *mut ::std::os::raw::c_uint,
 ) -> CUresult {
@@ -3937,11 +4010,26 @@ pub extern "system" fn cuStreamEndCapture(hStream: CUstream, phGraph: *mut CUgra
     r#impl::unimplemented()
 }
 
+/// Per-launch host cost hunting: counts and times the entry points the runtime
+/// calls around a launch, so a fixed per-call cost can be attributed to one of
+/// them. ZLUDA_TRACE_CALLS=1 prints a line per call.
+fn trace_call(name: &str, started: std::time::Instant, code: CUresult) {
+    if std::env::var_os("ZLUDA_TRACE_CALLS").is_some() {
+        eprintln!(
+            "call {} -> {:?} in {:.3} ms",
+            name,
+            code,
+            started.elapsed().as_secs_f64() * 1e3
+        );
+    }
+}
+
 #[cfg_attr(not(test), no_mangle)]
 pub extern "system" fn cuStreamIsCapturing(
     hStream: CUstream,
     captureStatus: *mut CUstreamCaptureStatus,
 ) -> CUresult {
+    let started = std::time::Instant::now();
     // The out-pointer is optional.
     if !captureStatus.is_null() {
         unsafe {
@@ -3949,10 +4037,21 @@ pub extern "system" fn cuStreamIsCapturing(
         }
     }
     // ZLUDA never captures streams; report NONE so callers proceed.
+    trace_call("cuStreamIsCapturing", started, CUresult::CUDA_SUCCESS);
     CUresult::CUDA_SUCCESS
 }
 #[cfg_attr(not(test), no_mangle)]
 pub extern "system" fn cuStreamGetCaptureInfo(
+    hStream: CUstream,
+    captureStatus: *mut CUstreamCaptureStatus,
+    id: *mut cuuint64_t,
+) -> CUresult {    let started = std::time::Instant::now();
+    let code = cuStreamGetCaptureInfo_inner(hStream, captureStatus, id);
+    trace_call("cuStreamGetCaptureInfo", started, code);
+    code
+}
+
+fn cuStreamGetCaptureInfo_inner(
     hStream: CUstream,
     captureStatus: *mut CUstreamCaptureStatus,
     id: *mut cuuint64_t,
@@ -3972,11 +4071,25 @@ pub extern "system" fn cuStreamAttachMemAsync(
 
 #[cfg_attr(not(test), no_mangle)]
 pub extern "system" fn cuStreamQuery(hStream: CUstream) -> CUresult {
+    let started = std::time::Instant::now();
+    let code = cuStreamQuery_inner(hStream);
+    trace_call("cuStreamQuery", started, code);
+    code
+}
+
+fn cuStreamQuery_inner(hStream: CUstream) -> CUresult {
     r#impl::stream::query(hStream.decuda()).encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
 pub extern "system" fn cuStreamSynchronize(hStream: CUstream) -> CUresult {
+    let started = std::time::Instant::now();
+    let code = cuStreamSynchronize_inner(hStream);
+    trace_call("cuStreamSynchronize", started, code);
+    code
+}
+
+fn cuStreamSynchronize_inner(hStream: CUstream) -> CUresult {
     r#impl::stream::synchronize(hStream.decuda()).encuda()
 }
 
@@ -4022,22 +4135,49 @@ pub extern "system" fn cuStreamSetAttribute(
 pub extern "system" fn cuEventCreate(
     phEvent: *mut CUevent,
     Flags: ::std::os::raw::c_uint,
+) -> CUresult {    let started = std::time::Instant::now();
+    let code = cuEventCreate_inner(phEvent, Flags);
+    trace_call("cuEventCreate", started, code);
+    code
+}
+
+fn cuEventCreate_inner(
+    phEvent: *mut CUevent,
+    Flags: ::std::os::raw::c_uint,
 ) -> CUresult {
     r#impl::event::create(phEvent.decuda(), Flags).encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
-pub extern "system" fn cuEventRecord(hEvent: CUevent, hStream: CUstream) -> CUresult {
+pub extern "system" fn cuEventRecord(hEvent: CUevent, hStream: CUstream) -> CUresult {    let started = std::time::Instant::now();
+    let code = cuEventRecord_inner(hEvent, hStream);
+    trace_call("cuEventRecord", started, code);
+    code
+}
+
+fn cuEventRecord_inner(hEvent: CUevent, hStream: CUstream) -> CUresult {
     r#impl::event::record(hEvent.decuda(), hStream.decuda()).encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
-pub extern "system" fn cuEventQuery(hEvent: CUevent) -> CUresult {
+pub extern "system" fn cuEventQuery(hEvent: CUevent) -> CUresult {    let started = std::time::Instant::now();
+    let code = cuEventQuery_inner(hEvent);
+    trace_call("cuEventQuery", started, code);
+    code
+}
+
+fn cuEventQuery_inner(hEvent: CUevent) -> CUresult {
     r#impl::event::query(hEvent.decuda()).encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
-pub extern "system" fn cuEventSynchronize(hEvent: CUevent) -> CUresult {
+pub extern "system" fn cuEventSynchronize(hEvent: CUevent) -> CUresult {    let started = std::time::Instant::now();
+    let code = cuEventSynchronize_inner(hEvent);
+    trace_call("cuEventSynchronize", started, code);
+    code
+}
+
+fn cuEventSynchronize_inner(hEvent: CUevent) -> CUresult {
     r#impl::event::synchronize(hEvent.decuda()).encuda()
 }
 
@@ -4216,7 +4356,9 @@ pub extern "system" fn cuFuncGetAttribute(
     attrib: CUfunction_attribute,
     hfunc: CUfunction,
 ) -> CUresult {
+    let started = std::time::Instant::now();
     let rc = r#impl::function::get_attribute(pi, attrib, hfunc.decuda()).encuda();
+    trace_call("cuFuncGetAttribute", started, rc);
     rc
 }
 

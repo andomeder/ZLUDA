@@ -95,9 +95,14 @@ pub fn max_active_blocks_per_multiprocessor(
     if func.is_null() {
         return Err(CUresult::CUDA_ERROR_INVALID_HANDLE);
     }
+    let traced = std::env::var_os("ZLUDA_TRACE_GEOM").is_some();
+    let t0 = std::time::Instant::now();
     let dev_idx = current_device()?;
     let limits = limits(dev_idx)?;
     let (static_smem, kernel_max_threads) = function_resources(func)?;
+    if traced {
+        eprintln!("occupancy: called, {:.3} ms", t0.elapsed().as_secs_f64() * 1e3);
+    }
     if block_size > kernel_max_threads || block_size <= 0 {
         // A block that is bigger than the kernel allows cannot be resident.
         unsafe { *num_blocks = 0 };
@@ -133,9 +138,14 @@ pub fn max_potential_block_size(
     if min_grid_size.is_null() || block_size_out.is_null() || func.is_null() {
         return Err(CUresult::CUDA_ERROR_INVALID_VALUE);
     }
+    let traced = std::env::var_os("ZLUDA_TRACE_GEOM").is_some();
+    let t0 = std::time::Instant::now();
     let dev_idx = current_device()?;
     let limits = limits(dev_idx)?;
     let (static_smem, kernel_max_threads) = function_resources(func)?;
+    if traced {
+        eprintln!("occupancy: called, {:.3} ms", t0.elapsed().as_secs_f64() * 1e3);
+    }
     let multiprocessors = device_attribute(
         CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
         dev_idx,

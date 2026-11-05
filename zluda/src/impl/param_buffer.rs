@@ -624,6 +624,16 @@ struct Pool {
 /// A slot is a few kilobytes, so this costs under a megabyte per function.
 pub const SLOTS: usize = 128;
 
+/// The ring size in use, so it can be swept without a rebuild: the bound and the
+/// throttle are the same number, and which one matters is a measurement.
+pub fn slots() -> usize {
+    std::env::var("ZLUDA_PARAM_SLOTS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value >= 2)
+        .unwrap_or(SLOTS)
+}
+
 fn pools() -> &'static std::sync::Mutex<std::collections::HashMap<(usize, usize), Pool>> {
     static POOLS: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<(usize, usize), Pool>>,
@@ -640,7 +650,8 @@ pub fn reserve(layout: &ParamBuffer, function: usize) -> Result<(), CUresult> {
     let pool = pools
         .entry((function, layout.total))
         .or_insert_with(|| Pool { slots: Vec::new(), next: 0 });
-    while pool.slots.len() < SLOTS {
+    let slots = slots();
+    while pool.slots.len() < slots {
         let host = super::memory::alloc_host_pinned(layout.total)? as usize;
         let device = super::memory::alloc_v2_raw(layout.total)? as usize;
         pool.slots.push(Slot { host, device, size: layout.total });

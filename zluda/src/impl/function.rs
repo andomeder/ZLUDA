@@ -139,7 +139,7 @@ pub fn launch_kernel(
                     // Room first, then fill: a slot is only overwritten once the
                     // launch that read it retired. The copy goes on the launch's
                     // own stream, ahead of the kernel, so it is ordered.
-                    GlobalState::wait_stream_pending(hstream, super::param_buffer::SLOTS)?;
+                    GlobalState::wait_stream_pending(hstream, super::param_buffer::slots())?;
                     let (device, host) =
                         super::param_buffer::take_slot(&layout, &bytes, function_key)?;
                     super::memory::copy_htod_async(
@@ -157,7 +157,7 @@ pub fn launch_kernel(
     }
     // A launch with no parameter buffer has nothing to wait for.
     let keep_pending = if param_bytes.is_some() {
-        super::param_buffer::SLOTS
+        super::param_buffer::slots()
     } else {
         usize::MAX
     };
@@ -317,11 +317,24 @@ pub fn launch_kernel(
         }
         func.legacy_args.reset();
         unsafe {
+            // Launching without this wait is tempting and wrong: the list is in
+            // order, but a decode step's launches stop completing altogether
+            // without it, so something in the chain is load bearing. What it
+            // costs is measured though - a step's 2167 launches take 212 ms
+            // queued against 40 ms when each is run alone, so ~80 us per launch
+            // goes on the event round trip. Narrowing which launches need the
+            // wait is the open item.
+            let no_wait: &[&l0::Event<'static>] = &[];
+            let launch_wait = if std::env::var_os("ZLUDA_NO_LAUNCH_WAIT").is_some() {
+                no_wait
+            } else {
+                wait
+            };
             if let Err(e) = cmd_list.append_launch_kernel(
                 &mut func.base,
                 &[grid_dim_x, grid_dim_y, grid_dim_z],
                 Some(signal),
-                wait,
+                launch_wait,
             ) {
                 if trace {
                     eprintln!(
@@ -331,6 +344,14 @@ pub fn launch_kernel(
                 }
                 return Err(e.into());
             }
+        }
+        if timing {
+            eprintln!(
+                "launch ms: total {:.3} (lock {:.3}) {}",
+                t_enter.elapsed().as_secs_f64() * 1e3,
+                t_locked.as_secs_f64() * 1e3,
+                func.name.to_string_lossy()
+            );
         }
         Ok::<_, CUresult>(())
     })

@@ -130,11 +130,28 @@ pub fn launch_kernel(
             if blocking {
                 param_block = Some(super::param_buffer::publish(&layout, kernel_params, extra)?);
             } else {
-                super::param_buffer::reserve(&layout, function_key)?;
-                param_bytes = Some((
-                    layout.clone(),
-                    super::param_buffer::collect(&layout, kernel_params, extra)?,
-                ));
+                super::param_buffer::reserve(&layout, function_key).map_err(|error| {
+                    eprintln!("launch_kernel: reserve failed {:?}", error);
+                    error
+                })?;
+                let bytes = super::param_buffer::collect(&layout, kernel_params, extra)?;
+                if super::param_buffer::in_device() {
+                    // Room first, then fill: a slot is only overwritten once the
+                    // launch that read it retired. The copy goes on the launch's
+                    // own stream, ahead of the kernel, so it is ordered.
+                    GlobalState::wait_stream_pending(hstream, super::param_buffer::SLOTS)?;
+                    let (device, host) =
+                        super::param_buffer::take_slot(&layout, &bytes, function_key)?;
+                    super::memory::copy_htod_async(
+                        device as *mut std::ffi::c_void,
+                        host as *const std::ffi::c_void,
+                        layout.total,
+                        hstream,
+                    )?;
+                    param_block = Some(device as *mut std::ffi::c_void);
+                } else {
+                    param_bytes = Some((layout.clone(), bytes));
+                }
             }
         }
     }
@@ -316,6 +333,20 @@ pub fn launch_kernel(
             }
         }
         Ok::<_, CUresult>(())
+    })
+    .map_err(|error| {
+        // A launch that fails has to say so: the runtime reports the sticky
+        // error much later, at a sync, with no idea which kernel caused it.
+        if let Ok(func) = unsafe { &mut *f }.as_result_mut() {
+            eprintln!(
+                "launch_kernel: {} failed {:?}",
+                func.name.to_string_lossy(),
+                error
+            );
+        } else {
+            eprintln!("launch_kernel: failed {:?}", error);
+        }
+        error
     })?;
     // ZLUDA_SYNC_LAUNCH makes every launch block until it retires, a
     // diagnostic: a difference with it on separates a missing ordering from a

@@ -599,8 +599,15 @@ struct Slot {
 /// Whether the kernel reads its arguments from device memory or from pinned host
 /// memory. Host memory costs nothing to fill but every read crosses the
 /// interconnect; device memory needs one DMA per launch but the reads are local.
-fn in_device() -> bool {
-    std::env::var_os("ZLUDA_PARAM_IN_DEVICE").is_some()
+pub fn in_device() -> bool {
+    // Device memory is the default. A kernel that reads its arguments out of
+    // pinned host memory pays the interconnect on every read, and the lifted
+    // cat kernel reads its 3.4 KB block many times over: measured 1 ms of
+    // device time per launch that way, against 0.35 ms with a device copy.
+    // The copy is one command on the launch's own list, so it is ordered with
+    // the kernel and costs nothing else. ZLUDA_PARAM_HOST=1 keeps the old
+    // no-copy variant for comparison.
+    std::env::var_os("ZLUDA_PARAM_HOST").is_none()
 }
 
 struct Pool {
@@ -610,7 +617,12 @@ struct Pool {
 
 /// How many buffers a function rotates through, and therefore how many of its
 /// launches may be in flight before the oldest slot has to be waited for.
-pub const SLOTS: usize = 8;
+///
+/// The size is a throughput knob as well as a bound: a launch that has to wait
+/// for its slot cannot run ahead of the device, and the kernels here take about
+/// a millisecond each, so a small ring turns the whole decode into a lockstep.
+/// A slot is a few kilobytes, so this costs under a megabyte per function.
+pub const SLOTS: usize = 128;
 
 fn pools() -> &'static std::sync::Mutex<std::collections::HashMap<(usize, usize), Pool>> {
     static POOLS: std::sync::OnceLock<
@@ -634,6 +646,31 @@ pub fn reserve(layout: &ParamBuffer, function: usize) -> Result<(), CUresult> {
         pool.slots.push(Slot { host, device, size: layout.total });
     }
     Ok(())
+}
+
+/// Put one launch's arguments in a slot and hand back the addresses.
+///
+/// The caller enqueues the copy to `device` on the launch's stream, which keeps
+/// it in order with the kernel, so the kernel reads its arguments from device
+/// memory and no host traffic is involved.
+pub fn take_slot(
+    layout: &ParamBuffer,
+    block: &[u8],
+    function: usize,
+) -> Result<(usize, usize), CUresult> {
+    let mut pools = pools().lock().unwrap();
+    let pool = match pools.get_mut(&(function, layout.total)) {
+        Some(pool) => pool,
+        None => return Err(CUresult::CUDA_ERROR_INVALID_VALUE),
+    };
+    let index = pool.next % pool.slots.len();
+    pool.next = pool.next.wrapping_add(1);
+    let slot = &mut pool.slots[index];
+    if block.len() > slot.size {
+        return Err(CUresult::CUDA_ERROR_INVALID_VALUE);
+    }
+    unsafe { std::ptr::copy_nonoverlapping(block.as_ptr(), slot.host as *mut u8, block.len()) };
+    Ok((slot.device, slot.host))
 }
 
 /// Put one launch's arguments in a slot and enqueue the copy that fills it.

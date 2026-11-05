@@ -355,6 +355,13 @@ impl GlobalState {
     /// earlier launch read, and the stream's own markers are what say that
     /// launch has retired. The wait happens here, before the previous marker is
     /// borrowed, because retiring markers mutates the queue.
+    /// Wait until at most `keep` launches are still in flight on a stream.
+    fn wait_stream_pending(stream: *mut stream::Stream, keep: usize) -> Result<(), CUresult> {
+        Self::lock_stream(stream, |stream_data| {
+            stream_data.wait_for_pending(keep).map_err(CUresult::from)
+        })?
+    }
+
     fn lock_enqueue_staged(
         stream: *mut stream::Stream,
         keep_pending: usize,

@@ -24,6 +24,10 @@ quick_error! {
             display("untyped symbol: {}", name)
         }
         MismatchedType {}
+        /// The same, carrying the source location that produced it.
+        MismatchedTypeAt(location: String) {
+            display("type mismatch at {}", location)
+        }
         /// A type mismatch, with the instruction that caused it.
         MismatchedTypeIn(op: String) {
             display("type mismatch in {}", op)
@@ -39,7 +43,25 @@ quick_error! {
             display("unreachable at {}", location)
         }
         Todo {}
+        /// The same, carrying the source location of the unimplemented path.
+        TodoAt(location: String) {
+            display("unimplemented at {}", location)
+        }
     }
+}
+
+/// A type mismatch, with the place it was detected.
+#[track_caller]
+fn error_mismatched_type() -> TranslateError {
+    let location = std::panic::Location::caller();
+    TranslateError::MismatchedTypeAt(format!("{}:{}", location.file(), location.line()))
+}
+
+/// A path that is not implemented, with the place it was reached from.
+#[track_caller]
+fn error_todo() -> TranslateError {
+    let location = std::panic::Location::caller();
+    TranslateError::TodoAt(format!("{}:{}", location.file(), location.line()))
 }
 
 #[cfg(debug_assertions)]
@@ -284,7 +306,7 @@ impl TypeWordMap {
     ) -> Result<spirv::Word, TranslateError> {
         Ok(match typ {
             // A parameter struct never has a literal initialiser.
-            ast::Type::Struct(_) => return Err(TranslateError::Todo),
+            ast::Type::Struct(_) => return Err(error_todo()),
             ast::Type::Scalar(t) => match t {
                 ast::ScalarType::B8 | ast::ScalarType::U8 | ast::ScalarType::S8 => self
                     .get_or_add_constant_single::<u8, _, _>(
@@ -339,7 +361,7 @@ impl TypeWordMap {
                     |v| unsafe { mem::transmute::<_, u64>(v) },
                     |b, result_type, v| b.constant_f64(result_type, None, v),
                 ),
-                ast::ScalarType::F16x2 => return Err(TranslateError::Todo),
+                ast::ScalarType::F16x2 => return Err(error_todo()),
                 ast::ScalarType::Pred => self.get_or_add_constant_single::<u8, _, _>(
                     b,
                     *t,
@@ -2174,20 +2196,20 @@ impl<'a, 'b> VectorRepackVisitor<'a, 'b> {
                 // hole ("_") has no register, so look at the first real one.
                 let first = match idx.iter().find(|id| **id != 0) {
                     Some(id) => *id,
-                    None => return Err(TranslateError::MismatchedType),
+                    None => return Err(error_mismatched_type()),
                 };
                 let elem_type = match self.id_def.get_typed(first)?.0 {
                     ast::Type::Scalar(s) => s,
-                    _ => return Err(TranslateError::MismatchedType),
+                    _ => return Err(error_mismatched_type()),
                 };
                 let elem_bits = elem_type.size_of() as usize * 8;
                 let packed_bits = packed.size_of() as usize * 8;
                 if elem_bits * idx.len() != packed_bits {
-                    return Err(TranslateError::MismatchedType);
+                    return Err(error_mismatched_type());
                 }
                 (elem_type, idx.len() as u8, Some(*packed))
             }
-            _ => return Err(TranslateError::MismatchedType),
+            _ => return Err(error_mismatched_type()),
         };
         let temp_vec = self
             .id_def
@@ -2243,7 +2265,7 @@ impl<'a, 'b> ArgumentMapVisitor<NormalizedArgParams, TypedArgParams>
             ast::Operand::ImmPack(values) => {
                 let (scalar_t, width) = match typ {
                     ast::Type::Vector(scalar_t, width) => (*scalar_t, *width),
-                    _ => return Err(TranslateError::MismatchedType),
+                    _ => return Err(error_mismatched_type()),
                 };
                 let mut ids = Vec::with_capacity(values.len());
                 for value in values {
@@ -2274,7 +2296,7 @@ impl<'a, 'b> ArgumentMapVisitor<NormalizedArgParams, TypedArgParams>
             ast::Operand::MixedPack(elements) => {
                 let (scalar_t, width) = match typ {
                     ast::Type::Vector(scalar_t, width) => (*scalar_t, *width),
-                    _ => return Err(TranslateError::MismatchedType),
+                    _ => return Err(error_mismatched_type()),
                 };
                 let mut ids = Vec::with_capacity(elements.len());
                 for element in elements {
@@ -2728,7 +2750,7 @@ impl<'a, 'input> InsertMemSSAVisitor<'a, 'input> {
                         var_type = ast::Type::Scalar(scalar_t);
                         width
                     }
-                    _ => return Err(TranslateError::MismatchedType),
+                    _ => return Err(error_mismatched_type()),
                 };
                 Some((
                     idx,
@@ -2925,11 +2947,11 @@ impl<'a, 'b> FlattenArguments<'a, 'b> {
         if !desc.is_memory_access {
             let (reg_type, reg_space) = self.id_def.get_typed(reg)?;
             if !reg_space.is_compatible(ast::StateSpace::Reg) {
-                return Err(TranslateError::MismatchedType);
+                return Err(error_mismatched_type());
             }
             let reg_scalar_type = match reg_type {
                 ast::Type::Scalar(underlying_type) => underlying_type,
-                _ => return Err(TranslateError::MismatchedType),
+                _ => return Err(error_mismatched_type()),
             };
             let id_constant_stmt = self
                 .id_def
@@ -3416,6 +3438,12 @@ fn emit_function_body_ops(
                     | (ast::ScalarType::U32, ast::ImmediateValue::F32(value)) => {
                         builder.constant_u32(typ_id, Some(cnst.dst), value.to_bits());
                     }
+                    // A bit register holding a floating point constant keeps the
+                    // bit pattern, the same way the 32-bit form above does.
+                    (ast::ScalarType::B64, ast::ImmediateValue::F64(value))
+                    | (ast::ScalarType::U64, ast::ImmediateValue::F64(value)) => {
+                        builder.constant_u64(typ_id, Some(cnst.dst), value.to_bits());
+                    }
                     (ast::ScalarType::B64, ast::ImmediateValue::S64(value))
                     | (ast::ScalarType::U64, ast::ImmediateValue::S64(value)) => {
                         builder.constant_u64(typ_id, Some(cnst.dst), value as u64);
@@ -3466,7 +3494,19 @@ fn emit_function_body_ops(
                             builder.constant_true(bool_type, Some(cnst.dst));
                         }
                     }
-                    _ => return Err(TranslateError::MismatchedType),
+                    _ => {
+                        let kind = match cnst.value {
+                            ast::ImmediateValue::U64(_) => "u64",
+                            ast::ImmediateValue::S64(_) => "s64",
+                            ast::ImmediateValue::F32(_) => "f32",
+                            ast::ImmediateValue::F64(_) => "f64",
+                        };
+                        return Err(TranslateError::MismatchedTypeIn(format!(
+                            "constant {} in a {}-byte register",
+                            kind,
+                            cnst.typ.size_of()
+                        )));
+                    }
                 }
             }
             Statement::Conversion(cv) => {
@@ -4706,7 +4746,7 @@ fn emit_shfl(
     typ: ast::ScalarType,
     arg: &ast::ArgShfl<ExpandedArgParams>,
 ) -> Result<(), TranslateError> {
-    let laneid = laneid.ok_or(TranslateError::Todo)?;
+    let laneid = laneid.ok_or(error_todo())?;
     let result_type = map.get_or_add_scalar(builder, typ.into());
     let u32_type = map.get_or_add_scalar(builder, ast::ScalarType::U32);
     let pred_type = map.get_or_add_scalar(builder, ast::ScalarType::Pred);
@@ -4770,9 +4810,9 @@ fn emit_mma(
     details: &ast::MmaDetails,
     arg: &ast::ArgMma<ExpandedArgParams>,
 ) -> Result<(), TranslateError> {
-    let laneid = laneid.ok_or(TranslateError::Todo)?;
+    let laneid = laneid.ok_or(error_todo())?;
     if details.m != 16 || details.n != 8 {
-        return Err(TranslateError::Todo);
+        return Err(error_todo());
     }
     let element_bits: u32 = match details.a {
         ast::ScalarType::F16 | ast::ScalarType::B16 => 16,
@@ -4780,10 +4820,10 @@ fn emit_mma(
         // plain 32-bit value.
         ast::ScalarType::B32 => 32,
         ast::ScalarType::S8 | ast::ScalarType::U8 => 8,
-        _ => return Err(TranslateError::Todo),
+        _ => return Err(error_todo()),
     };
     if details.b != details.a {
-        return Err(TranslateError::Todo);
+        return Err(error_todo());
     }
     let k = details.k as u32;
     let half_accumulator = match (details.dst, details.c) {
@@ -4791,7 +4831,7 @@ fn emit_mma(
         (ast::ScalarType::F16, ast::ScalarType::F16) => true,
         (ast::ScalarType::S32, ast::ScalarType::S32) => false,
         (ast::ScalarType::U32, ast::ScalarType::U32) => false,
-        _ => return Err(TranslateError::Todo),
+        _ => return Err(error_todo()),
     };
     let integer = element_bits == 8;
     // A register holds 32 bits of elements: the four lanes of a row group
@@ -4800,7 +4840,7 @@ fn emit_mma(
     let per_register = 32 / element_bits;
     let k_per_set = per_register * 4;
     if k % k_per_set != 0 {
-        return Err(TranslateError::Todo);
+        return Err(error_todo());
     }
     let bfloat16 = details.a == ast::ScalarType::B16;
     let u32_type = map.get_or_add_scalar(builder, ast::ScalarType::U32);
@@ -4970,7 +5010,7 @@ fn emit_mma(
                 builder.ext_inst(
                     f32_type,
                     None,
-                    opencl.ok_or(TranslateError::Todo)?,
+                    opencl.ok_or(error_todo())?,
                     spirv::CLOp::fma as u32,
                     [
                         dr::Operand::IdRef(a_value),
@@ -5348,7 +5388,7 @@ fn emit_prmt(
         });
     }
     let _ = one;
-    let result = result.ok_or(TranslateError::Todo)?;
+    let result = result.ok_or(error_todo())?;
     builder.copy_object(result_type, Some(arg.dst), result)?;
     Ok(())
 }
@@ -5366,13 +5406,10 @@ fn emit_cp_async(
 ) -> Result<(), TranslateError> {
     let size = details.size as u32;
     if size == 0 || size % 4 != 0 || size > 16 {
-        return Err(TranslateError::Todo);
+        return Err(error_todo());
     }
-    if arg.src_size.is_some() {
-        // A partial copy zero-fills the rest; that form is not used by the
-        // kernels we run.
-        return Err(TranslateError::Todo);
-    }
+    // The four operand form carries a source size: that many bytes are copied
+    // and the rest is zeroed, one 32-bit word at a time below.
     let u32_type = map.get_or_add_scalar(builder, ast::ScalarType::U32);
     let u8_ptr = map.get_or_add(
         builder,
@@ -5429,6 +5466,21 @@ fn emit_cp_async(
             Some(spirv::MemoryAccess::ALIGNED),
             [dr::Operand::LiteralInt32(4)].iter().cloned(),
         )?;
+        // A word beyond the source size is not copied but cleared.
+        let word = match arg.src_size {
+            Some(src_size) => {
+                let bool_type = map.get_or_add_scalar(builder, ast::ScalarType::Pred);
+                let zero = map.get_or_add_constant(
+                    builder,
+                    &ast::Type::Scalar(ast::ScalarType::U32),
+                    &vec_repr(0u32),
+                )?;
+                let enough =
+                    builder.u_greater_than(bool_type, None, src_size, offset_const)?;
+                builder.select(u32_type, None, enough, word, zero)?
+            }
+            None => word,
+        };
         let target = if offset == 0 {
             builder.bitcast(shared_u32_ptr, None, dst_ptr)?
         } else {
@@ -5592,7 +5644,7 @@ fn emit_redux(
         )?,
         // The float minimum and maximum, and the bitwise reductions, have no
         // group operation of their own.
-        _ => return Err(TranslateError::Todo),
+        _ => return Err(error_todo()),
     };
     builder.copy_object(result_type, Some(arg.dst), result)?;
     Ok(())
@@ -5670,7 +5722,7 @@ fn emit_movmatrix(
     laneid: Option<spirv::Word>,
     arg: &ast::Arg2<ExpandedArgParams>,
 ) -> Result<(), TranslateError> {
-    let laneid = laneid.ok_or(TranslateError::Todo)?;
+    let laneid = laneid.ok_or(error_todo())?;
     let u32_type = map.get_or_add_scalar(builder, ast::ScalarType::U32);
     let b32_type = map.get_or_add_scalar(builder, ast::ScalarType::B32);
     let two = map.get_or_add_constant(
@@ -5740,10 +5792,10 @@ fn emit_ldmatrix(
     details: &ast::LdMatrixDetails,
     arg: &ast::Arg2LdMatrix<ExpandedArgParams>,
 ) -> Result<(), TranslateError> {
-    let laneid = laneid.ok_or(TranslateError::Todo)?;
+    let laneid = laneid.ok_or(error_todo())?;
     let num = details.num as usize;
     if num == 0 || num > 4 {
-        return Err(TranslateError::Todo);
+        return Err(error_todo());
     }
     let u32_type = map.get_or_add_scalar(builder, ast::ScalarType::U32);
     let u64_type = map.get_or_add_scalar(builder, ast::ScalarType::U64);
@@ -7378,7 +7430,7 @@ fn emit_load_var(
         Some((index, Some(width))) => {
             let vector_type = match details.typ {
                 ast::Type::Scalar(scalar_t) => ast::Type::Vector(scalar_t, width),
-                _ => return Err(TranslateError::MismatchedType),
+                _ => return Err(error_mismatched_type()),
             };
             let vector_type_spirv = map.get_or_add(builder, SpirvType::new(vector_type));
             let vector_temp = builder.load(
@@ -9401,7 +9453,7 @@ impl<T: ArgParamsEx> ast::Instruction<T> {
                 let result_bits: u32 = match d.dst {
                     ast::ScalarType::F32 | ast::ScalarType::S32 | ast::ScalarType::U32 => 32,
                     ast::ScalarType::F16 | ast::ScalarType::S16 | ast::ScalarType::U16 => 16,
-                    _ => return Err(TranslateError::Todo),
+                    _ => return Err(error_todo()),
                 };
                 let result_registers =
                     ((d.m as u32 * d.n as u32 / 32) * result_bits / 32) as u8;
@@ -9417,7 +9469,7 @@ impl<T: ArgParamsEx> ast::Instruction<T> {
                     ast::ScalarType::F16 | ast::ScalarType::B16 => 16,
                     ast::ScalarType::B32 => 32,
                     ast::ScalarType::S8 | ast::ScalarType::U8 => 8,
-                    _ => return Err(TranslateError::Todo),
+                    _ => return Err(error_todo()),
                 };
                 let a_registers = ((d.m as u32 * d.k as u32 / 32) * element_bits as u32 / 32) as u8;
                 let b_registers = ((d.n as u32 * d.k as u32 / 32) * element_bits as u32 / 32) as u8;
@@ -9981,7 +10033,7 @@ impl ast::Type {
                     && kind != ast::ScalarKind::Bit)
                     || (width == 8)
                 {
-                    return Err(TranslateError::MismatchedType);
+                    return Err(error_mismatched_type());
                 }
                 let width = scalar.size_of();
                 if (kind != ast::ScalarKind::Signed
@@ -9989,7 +10041,7 @@ impl ast::Type {
                     && kind != ast::ScalarKind::Bit)
                     || (width == 8)
                 {
-                    return Err(TranslateError::MismatchedType);
+                    return Err(error_mismatched_type());
                 }
                 Ok(ast::Type::Scalar(ast::ScalarType::from_parts(
                     width * 2,
@@ -11346,7 +11398,7 @@ fn default_implicit_conversion_space(
                 // spells a generic pointer.
                 | ast::StateSpace::Reg => Ok(Some(ConversionKind::BitToPtr)),
                 _ => {
-                    Err(TranslateError::MismatchedType)
+                    Err(error_mismatched_type())
                 }
             },
             ast::Type::Scalar(ast::ScalarType::B32)
@@ -11361,10 +11413,10 @@ fn default_implicit_conversion_space(
                 | ast::StateSpace::Global
                 | ast::StateSpace::Generic
                 | ast::StateSpace::Param => Ok(Some(ConversionKind::BitToPtr)),
-                _ => Err(TranslateError::MismatchedType),
+                _ => Err(error_mismatched_type()),
             },
             _ => {
-                Err(TranslateError::MismatchedType)
+                Err(error_mismatched_type())
             }
         }
     } else if instruction_space.is_compatible(ast::StateSpace::Reg) {
@@ -11378,10 +11430,10 @@ fn default_implicit_conversion_space(
                     Ok(None)
                 }
             }
-            _ => Err(TranslateError::MismatchedType),
+            _ => Err(error_mismatched_type()),
         }
     } else {
-        Err(TranslateError::MismatchedType)
+        Err(error_mismatched_type())
     }
 }
 
@@ -11497,14 +11549,14 @@ fn should_convert_relaxed_src_wrapper(
     (instruction_space, instruction_type): (ast::StateSpace, &ast::Type),
 ) -> Result<Option<ConversionKind>, TranslateError> {
     if !operand_space.is_compatible(instruction_space) {
-        return Err(TranslateError::MismatchedType);
+        return Err(error_mismatched_type());
     }
     if operand_type == instruction_type {
         return Ok(None);
     }
     match should_convert_relaxed_src(operand_type, instruction_type) {
         conv @ Some(_) => Ok(conv),
-        None => Err(TranslateError::MismatchedType),
+        None => Err(error_mismatched_type()),
     }
 }
 
@@ -11562,14 +11614,14 @@ fn should_convert_relaxed_dst_wrapper(
     (instruction_space, instruction_type): (ast::StateSpace, &ast::Type),
 ) -> Result<Option<ConversionKind>, TranslateError> {
     if !operand_space.is_compatible(instruction_space) {
-        return Err(TranslateError::MismatchedType);
+        return Err(error_mismatched_type());
     }
     if operand_type == instruction_type {
         return Ok(None);
     }
     match should_convert_relaxed_dst(operand_type, instruction_type) {
         conv @ Some(_) => Ok(conv),
-        None => Err(TranslateError::MismatchedType),
+        None => Err(error_mismatched_type()),
     }
 }
 

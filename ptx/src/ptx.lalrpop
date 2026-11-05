@@ -1610,10 +1610,11 @@ InstRcp: ast::Instruction<ast::ParsedArgParams<'input>> = {
         };
         ast::Instruction::Rcp(details, a)
     },
-    "rcp" <rn:RoundingModeFloat> ".f64" <a:Arg2> => {
+    // The approximate form exists for f64 as well: "rcp.approx.ftz.f64".
+    "rcp" <rounding:RcpRoundingMode> <ftz:".ftz"?> ".f64" <a:Arg2> => {
         let details = ast::RcpDetails {
-            rounding: Some(rn),
-            flush_to_zero: None,
+            rounding,
+            flush_to_zero: Some(ftz.is_some()),
             is_f64: true,
         };
         ast::Instruction::Rcp(details, a)
@@ -1724,9 +1725,9 @@ InstBar: ast::Instruction<ast::ParsedArgParams<'input>> = {
 // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#warp-shuffle-functions
 //   shfl.sync.mode.b32 d[|p], a, b, c, membermask;   (c: clamp [4:0], segment mask [12:8])
 // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#warp-level-matrix-instructions-ldmatrix
-//   ldmatrix.sync.aligned.m8n8.x{1,2,4}.b16 {d...}, [p];  with optional ".trans"
+//   ldmatrix.sync.aligned.m8n8.x{1,2,4}{.trans}{.shared}.b16 {d...}, [p];
 InstLdMatrix: ast::Instruction<ast::ParsedArgParams<'input>> = {
-    "ldmatrix" ".sync" ".aligned" ".m8n8" <num:LdMatrixNum> <trans:".trans"?> ".b16" <dst:DstOperandVec> "," <src:MemoryOperand> => {
+    "ldmatrix" ".sync" ".aligned" ".m8n8" <num:LdMatrixNum> <trans:".trans"?> <_ss:".shared"?> ".b16" <dst:DstOperandVec> "," <src:MemoryOperand> => {
         ast::Instruction::LdMatrix(
             ast::LdMatrixDetails {
                 num,

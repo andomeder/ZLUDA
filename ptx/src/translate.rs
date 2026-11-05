@@ -548,6 +548,21 @@ pub fn to_spirv_module<'a>(ast: ast::Module<'a>) -> Result<Module, TranslateErro
         directives,
         &mut kernel_info,
     )?;
+    // A float atomic is an extension instruction, and a module that uses one has
+    // to declare both the capability and the extension. Declared only when used,
+    // because an unused capability in every module is a larger change than it
+    // looks: torch's large reductions are the path that needs it.
+    let uses_float_atomic = builder
+        .module_mut()
+        .functions
+        .iter()
+        .flat_map(|function| function.blocks.iter())
+        .flat_map(|block| block.instructions.iter())
+        .any(|instruction| instruction.class.opcode == spirv::Op::AtomicFAddEXT);
+    if uses_float_atomic {
+        builder.capability(spirv::Capability::AtomicFloat32AddEXT);
+        builder.extension("SPV_EXT_shader_atomic_float_add");
+    }
     let spirv = builder.module();
     Ok(Module {
         spirv,

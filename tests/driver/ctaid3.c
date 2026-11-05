@@ -14,9 +14,14 @@ int main() {
     CHECK(cuMemAlloc(&dout,128));
     CHECK(cuMemcpyHtoD(dout,out,128));
     void* args[1]={&dout};
-    CHECK(cuLaunchKernel(k,2,1,1,4,1,1,0,0,args,NULL));
+    CHECK(cuLaunchKernel(k,8,1,1,1,1,1,0,0,args,NULL));
     CHECK(cuCtxSynchronize());
     CHECK(cuMemcpyDtoH(out,dout,128));
-    for (int i=0;i<4;i++) printf("block %d: ctaid.x=%u\n", i, out[i]);
-    return 0;
+    int wrong = 0;
+    for (int i=0;i<8;i++) {
+        if (out[i] != (unsigned)i) wrong++;
+    }
+    printf("CTAID.X TEST: %d/8 blocks wrong, values %u %u %u %u %u %u %u %u\n",
+           wrong, out[0], out[1], out[2], out[3], out[4], out[5], out[6], out[7]);
+    return wrong ? 1 : 0;
 }

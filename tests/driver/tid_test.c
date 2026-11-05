@@ -18,6 +18,11 @@ int main() {
     CHECK(cuLaunchKernel(k,1,1,1,4,1,1,0,0,args,NULL));
     CHECK(cuCtxSynchronize());
     CHECK(cuMemcpyDtoH(out,dout,128));
-    for (int i=0;i<4;i++) printf("tid.x=%u -> out[%d]=%u\n", i, i, out[i]);
-    return 0;
+    int wrong = 0;
+    for (int i=0;i<4;i++) {
+        if (out[i] != (unsigned)i) wrong++;
+    }
+    printf("TID TEST: %d/4 threads wrong, values %u %u %u %u\n",
+           wrong, out[0], out[1], out[2], out[3]);
+    return wrong ? 1 : 0;
 }

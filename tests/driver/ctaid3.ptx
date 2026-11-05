@@ -10,7 +10,9 @@
     ld.param.u64 %rd1, [out];
     cvta.to.global.u64 %rd1, %rd1;
     mov.u32 %r1, %ctaid.x;
-    /* store raw ctaid.x at offset 0 */
-    st.global.u32 [%rd1], %r1;
+    /* out[blockIdx.x] = blockIdx.x, so every block's value is observable */
+    mul.wide.u32 %rd2, %r1, 4;
+    add.s64 %rd3, %rd1, %rd2;
+    st.global.u32 [%rd3], %r1;
     ret;
 }

@@ -18,6 +18,11 @@ int main(int argc, char** argv) {
     CHECK(cuLaunchKernel(k,gx,gy,1,1,1,1,0,0,args,NULL));
     CHECK(cuCtxSynchronize());
     CHECK(cuMemcpyDtoH(out,dout,256));
-    printf("grid %dx%d, last block wins: ctaid.y = %u\n", gx, gy, out[0]);
-    return 0;
+    int wrong = 0;
+    for (int i=0;i<gy;i++) {
+        if (out[i] != (unsigned)i) wrong++;
+    }
+    printf("CTAID.Y TEST: grid %dx%d, %d/%d rows wrong, values %u %u %u %u\n",
+           gx, gy, wrong, gy, out[0], out[1], out[2], out[3]);
+    return wrong ? 1 : 0;
 }

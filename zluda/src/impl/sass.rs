@@ -15,6 +15,8 @@
 //!     ZLUDA_SASS_CUOBJDUMP cuobjdump to disassemble with (default: PATH)
 //!     ZLUDA_SASS_PYTHON    python for the lifter (default: the venv next to it)
 //!     ZLUDA_SASS_LLC       llc to use (default: PATH)
+//!     ZLUDA_SASS_REQUIRE_FULL   "1" fails the load on an instruction the lifter
+//!                          could only placeholder, instead of warning
 //!
 //! The result is cached per cubin (`<cache>/<sha256 of the cubin>/`), so a
 //! second load of the same image is a file read.
@@ -45,6 +47,68 @@ pub fn enabled() -> bool {
         Ok(value) => value == "1" || value.eq_ignore_ascii_case("true"),
         Err(_) => false,
     }
+}
+
+/// Instructions the lifter had to placeholder are emitted as a stub named
+/// `sass_unsupported_<instruction>`, and the instruction's effect is absent from
+/// the lifted text. Some of those are on unreachable paths (torch's `mean`
+/// reductions carry one and compute correctly), and some are load bearing
+/// (`ubmsk` feeds a lane mask in CUB's radix sort, which then computes garbage),
+/// so the default is to say which instruction it was and let the load proceed:
+/// refusing outright would break kernels that work. `ZLUDA_SASS_REQUIRE_FULL=1`
+/// makes it fatal for a run that must not tolerate a partial translation.
+const PLACEHOLDER: &str = "sass_unsupported_";
+
+fn placeholders(ptx: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for line in ptx.lines() {
+        if let Some(at) = line.find(PLACEHOLDER) {
+            let rest = &line[at + PLACEHOLDER.len()..];
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if !name.is_empty() && !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+    names
+}
+
+fn require_full() -> bool {
+    match std::env::var("ZLUDA_SASS_REQUIRE_FULL") {
+        Ok(value) => value == "1" || value.eq_ignore_ascii_case("true"),
+        Err(_) => false,
+    }
+}
+
+/// Reports, and optionally refuses, a lift that could not translate everything.
+fn check_complete(ptx: &str, kernel: &str) -> Result<(), CUresult> {
+    let names = placeholders(ptx);
+    if names.is_empty() {
+        return Ok(());
+    }
+    let list = names.join(", ");
+    if require_full() {
+        return Err(fail(
+            "lift",
+            kernel,
+            &format!(
+                "the lifter could not translate: {} (it substitutes a stub for an \
+                 instruction it does not model), so the kernel would compute without \
+                 that instruction",
+                list
+            ),
+        ));
+    }
+    eprintln!(
+        "zluda: sass lift: the lifter could not translate {} in {}; it substitutes a stub, \
+         so the kernel runs without that instruction and may compute a wrong value \
+         (set ZLUDA_SASS_REQUIRE_FULL=1 to turn this into a load failure)",
+        list, kernel
+    );
+    Ok(())
 }
 
 /// The compute capability of a cubin, read from its ELF header.
@@ -207,6 +271,7 @@ pub fn lift_kernel(cubin: &[u8], kernel: &str) -> Result<String, CUresult> {
         // A cache entry that was interrupted while it was written, or written
         // by a different lifter, is not trusted: it has to define the kernel.
         if has_entry(&recovered, kernel) {
+            check_complete(&recovered, kernel)?;
             eprintln!(
                 "zluda: sass lift: {:.3} ms (cache hit) {}",
                 started.elapsed().as_secs_f64() * 1e3,
@@ -217,6 +282,7 @@ pub fn lift_kernel(cubin: &[u8], kernel: &str) -> Result<String, CUresult> {
     }
     let started = Instant::now();
     let ptx = lift_uncached(cubin, kernel, arch, &hash)?;
+    check_complete(&ptx, kernel)?;
     let elapsed = started.elapsed().as_secs_f64() * 1e3;
     // The cache is an optimisation: a directory that cannot be written is not
     // a reason to fail the load.

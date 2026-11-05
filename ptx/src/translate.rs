@@ -394,6 +394,16 @@ impl TypeWordMap {
             ast::Type::Array(typ, dims) => match dims.as_slice() {
                 [] => return Err(error_unreachable()),
                 [dim] => {
+                    // One SPIR-V instruction holds at most 65535 words, and a
+                    // composite spends one word per constituent, so a larger
+                    // array cannot be written flat. Naming the size here beats
+                    // emitting a module that the validator rejects.
+                    if *dim as usize >= 65535 - 2 {
+                        return Err(TranslateError::MismatchedTypeIn(format!(
+                            "an initialiser of {} elements is too large for one SPIR-V instruction",
+                            dim
+                        )));
+                    }
                     let result_type = self
                         .get_or_add(b, SpirvType::Array(SpirvScalarKey::from(*typ), vec![*dim]));
                     let size_of_t = typ.size_of();
@@ -500,6 +510,7 @@ pub fn to_spirv_module<'a>(ast: ast::Module<'a>) -> Result<Module, TranslateErro
     let call_map = get_kernels_call_map(&directives);
     let callee_param_types = get_callee_param_types(&directives);
     let mut directives = convert_dynamic_shared_memory_usage(directives, &mut || builder.id());
+    directives = pack_large_byte_globals(directives);
     normalize_variable_decls(&mut directives);
     let denorm_information = compute_denorm_information(&directives);
     // https://www.khronos.org/registry/spir-v/specs/unified1/SPIRV.html#_a_id_logicallayout_a_logical_layout_of_a_module
@@ -988,6 +999,47 @@ fn multi_hash_map_append<K: Eq + std::hash::Hash, V>(m: &mut MultiHashMap<K, V>,
       transformation has a semantical meaning - we emit additional
       "OpFunctionParameter ..." with type "OpTypePointer Workgroup ...")
 */
+/// Rewrite a byte array whose initialiser is too large for one SPIR-V
+/// instruction into the same bytes seen as 32-bit words.
+///
+/// One instruction holds at most 65535 words and a composite spends one word per
+/// constituent, so an initialiser above that cannot be written flat. The bytes
+/// do not change, only their width, and accesses to these globals already go
+/// through a byte pointer, so nothing else has to know.
+fn widen_large_byte_array(var: &mut ast::Variable<spirv::Word>, limit: u32) {
+    if let ast::Type::Array(ast::ScalarType::B8, dims) = &var.v_type {
+        let count: u32 = dims.iter().product();
+        if count >= limit {
+            // Up to three bytes of padding; each global is its own variable, so
+            // growing one cannot disturb another.
+            let words = (count + 3) / 4;
+            var.array_init.resize(words as usize * 4, 0);
+            var.v_type = ast::Type::Array(ast::ScalarType::U32, vec![words]);
+        }
+    }
+}
+
+fn pack_large_byte_globals<'input>(module: Vec<Directive<'input>>) -> Vec<Directive<'input>> {
+    const LIMIT: u32 = 65535 - 2;
+    module
+        .into_iter()
+        .map(|directive| match directive {
+            Directive::Variable(linking, mut var) => {
+                widen_large_byte_array(&mut var, LIMIT);
+                Directive::Variable(linking, var)
+            }
+            // A lifted kernel keeps the data it initialises in its own globals.
+            Directive::Method(mut func) => {
+                for var in func.globals.iter_mut() {
+                    widen_large_byte_array(var, LIMIT);
+                }
+                Directive::Method(func)
+            }
+            directive => directive,
+        })
+        .collect()
+}
+
 fn convert_dynamic_shared_memory_usage<'input>(
     module: Vec<Directive<'input>>,
     new_id: &mut impl FnMut() -> spirv::Word,

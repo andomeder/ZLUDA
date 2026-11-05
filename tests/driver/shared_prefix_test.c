@@ -79,7 +79,7 @@ int main(void) {
             wrong++;
         }
     }
-    printf("SHARED WINDOW TEST: %d/%d wrong (static %d + dynamic %u bytes)\n",
-           wrong, THREADS, STATIC_BYTES, dynamic_shared);
+    printf("SHARED WINDOW TEST: %d/%d wrong (static %d + dynamic %u bytes) %s\n",
+           wrong, THREADS, STATIC_BYTES, dynamic_shared, wrong ? "FAILED" : "OK");
     return wrong ? 1 : 0;
 }

@@ -301,6 +301,27 @@ pub fn alloc_host_v2(pp: *mut *mut c_void, bytesize: usize) -> Result<(), CUresu
     Ok(())
 }
 
+/// A pinned host allocation that is never freed.
+///
+/// Used by the parameter-buffer slots: the launch stages its arguments here and
+/// the command list copies them to the device, and this driver cannot DMA from a
+/// pageable buffer.
+pub fn alloc_host_pinned(bytesize: usize) -> Result<*mut c_void, CUresult> {
+    GlobalState::lock_current_context_unchecked(|ctx| {
+        let ctx_ptr = ctx as *mut _;
+        let ctx_data = ctx.as_result_mut()?;
+        let dev = unsafe { &mut *ctx_data.device };
+        let ptr = dev.l0_context.mem_alloc_host(bytesize, 0)?;
+        ctx_data.pointer_registry.register(super::pointer::Allocation {
+            base: ptr as *mut c_void,
+            size: bytesize,
+            is_host: true,
+            context: ctx_ptr,
+        });
+        Ok::<_, CUresult>(ptr as *mut c_void)
+    })?
+}
+
 pub fn host_alloc(
     pp: *mut *mut c_void,
     bytesize: usize,

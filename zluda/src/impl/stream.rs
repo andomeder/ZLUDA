@@ -157,6 +157,28 @@ impl StreamData {
         Ok(())
     }
 
+    /// Wait until at most `keep` launches are still in flight, retiring the
+    /// oldest markers as they signal.
+    ///
+    /// A caller that reuses a buffer a launch read needs this: the marker
+    /// `keep` launches back retires no earlier than that launch did, so once
+    /// the queue is that short the buffer is free.
+    pub fn wait_for_pending(&mut self, keep: usize) -> l0::Result<()> {
+        while self.busy_events.len() > keep {
+            let (event, ready) = match self.busy_events.get(0) {
+                None => return Ok(()),
+                Some((event, _)) => (event, event.is_ready()?),
+            };
+            if !ready {
+                event.host_synchronize(60_000_000_000)?;
+            }
+            let (event, marker) = self.busy_events.pop_front().unwrap();
+            event.host_reset()?;
+            self.free_events.push_back((event, marker));
+        }
+        Ok(())
+    }
+
     pub fn get_last_event(&self) -> Option<&l0::Event<'static>> {
         self.busy_events.iter().next_back().map(|(ev, _)| ev)
     }

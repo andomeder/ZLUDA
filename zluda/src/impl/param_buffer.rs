@@ -17,6 +17,7 @@
 //! the same in spirit, only the layout is ours.
 
 use super::CUresult;
+use crate::l0;
 use std::ffi::c_void;
 
 /// The limit IGC enforces on the total size of a kernel's arguments.
@@ -52,6 +53,30 @@ pub fn publish(
     kernel_params: *mut *mut c_void,
     extra: *mut *mut c_void,
 ) -> Result<*mut c_void, CUresult> {
+    let block = collect(layout, kernel_params, extra)?;
+    let device = super::memory::alloc_v2_raw(layout.total)?;
+    if std::env::var_os("ZLUDA_TRACE_STAGE").is_some() {
+        eprintln!("publish: device {:p} bytes {} src {:p}", device, layout.total, block.as_ptr());
+    }
+    // The copy is blocking, so it also establishes that every earlier kernel
+    // that read one of the buffers below has retired.
+    super::memory::copy_v2(device, block.as_ptr() as *const c_void, layout.total)?;
+    free_published();
+    PUBLISHED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .push(SendPtr(device));
+    Ok(device)
+}
+
+/// One launch's arguments as one contiguous block, in the layout the rewrite
+/// gave the kernel.
+pub fn collect(
+    layout: &ParamBuffer,
+    kernel_params: *mut *mut c_void,
+    extra: *mut *mut c_void,
+) -> Result<Vec<u8>, CUresult> {
     let mut block = vec![0u8; layout.total];
     if !kernel_params.is_null() {
         for (index, size) in layout.sizes.iter().enumerate() {
@@ -80,17 +105,7 @@ pub fn publish(
     } else {
         return Err(CUresult::CUDA_ERROR_INVALID_VALUE);
     }
-    let device = super::memory::alloc_v2_raw(layout.total)?;
-    // The copy is blocking, so it also establishes that every earlier kernel
-    // that read one of the buffers below has retired.
-    super::memory::copy_v2(device, block.as_ptr() as *const c_void, layout.total)?;
-    free_published();
-    PUBLISHED
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap()
-        .push(SendPtr(device));
-    Ok(device)
+    Ok(block)
 }
 
 /// The markers a packed launch uses, mirrored from `cuLaunchKernel`'s contract.
@@ -558,4 +573,115 @@ mod tests {
         let text = ".version 8.7\n.visible .entry other(\n\t.param .align 4 .b8 blob[3000]\n)\n{\n\tld.param.u32 %r1, [blob];\n\tret;\n}\n";
         assert!(rewrite(text, "big").is_none());
     }
+}
+
+/// A rotating pool of buffers for one function.
+///
+/// The blocking path above costs a device allocation, a zero fill and a drain of
+/// every stream, per launch: on torch's `cat` that was 2.5 ms per call and 73% of
+/// a model's decode step. None of that is needed. The launch's own command list
+/// is in order, so a copy appended just before the launch is guaranteed to land
+/// before the kernel reads it, and the slot only has to be free when it is
+/// reused - which the stream's markers already tell us.
+struct Slot {
+    /// The block's address, kept as an integer so the static pool is `Send`.
+    ///
+    /// This is device-accessible pinned host memory, so the kernel reads its
+    /// arguments from here directly and no copy is involved at all. A device
+    /// buffer plus a DMA per launch is what the blocking path did, and it is
+    /// more than this needs.
+    host: usize,
+    /// A device copy of the same block, used when ZLUDA_PARAM_IN_DEVICE=1.
+    device: usize,
+    size: usize,
+}
+
+/// Whether the kernel reads its arguments from device memory or from pinned host
+/// memory. Host memory costs nothing to fill but every read crosses the
+/// interconnect; device memory needs one DMA per launch but the reads are local.
+fn in_device() -> bool {
+    std::env::var_os("ZLUDA_PARAM_IN_DEVICE").is_some()
+}
+
+struct Pool {
+    slots: Vec<Slot>,
+    next: usize,
+}
+
+/// How many buffers a function rotates through, and therefore how many of its
+/// launches may be in flight before the oldest slot has to be waited for.
+pub const SLOTS: usize = 8;
+
+fn pools() -> &'static std::sync::Mutex<std::collections::HashMap<(usize, usize), Pool>> {
+    static POOLS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<(usize, usize), Pool>>,
+    > = std::sync::OnceLock::new();
+    POOLS.get_or_init(Default::default)
+}
+
+/// Allocate a function's slots, if it has none yet.
+///
+/// Called before the stream is locked: a device allocation takes the global
+/// state lock, and the launch path already holds the stream.
+pub fn reserve(layout: &ParamBuffer, function: usize) -> Result<(), CUresult> {
+    let mut pools = pools().lock().unwrap();
+    let pool = pools
+        .entry((function, layout.total))
+        .or_insert_with(|| Pool { slots: Vec::new(), next: 0 });
+    while pool.slots.len() < SLOTS {
+        let host = super::memory::alloc_host_pinned(layout.total)? as usize;
+        let device = super::memory::alloc_v2_raw(layout.total)? as usize;
+        pool.slots.push(Slot { host, device, size: layout.total });
+    }
+    Ok(())
+}
+
+/// Put one launch's arguments in a slot and enqueue the copy that fills it.
+///
+/// Returns the device address to pass as the kernel's single argument. The copy
+/// is appended to the launch's own command list with no signal and no wait: the
+/// list is in order, so it retires before the kernel that follows it.
+pub fn stage(
+    layout: &ParamBuffer,
+    block: &[u8],
+    function: usize,
+    cmd_list: &l0::CommandList,
+) -> Result<*mut c_void, CUresult> {
+    let mut pools = pools().lock().unwrap();
+    let pool = match pools.get_mut(&(function, layout.total)) {
+        Some(pool) => pool,
+        None => return Err(CUresult::CUDA_ERROR_INVALID_VALUE),
+    };
+    let index = pool.next % pool.slots.len();
+    pool.next = pool.next.wrapping_add(1);
+    let slot = &mut pool.slots[index];
+    if block.len() > slot.size {
+        return Err(CUresult::CUDA_ERROR_INVALID_VALUE);
+    }
+    // A plain host write into the pinned block, then one DMA the launch's own
+    // command list will run before the kernel.
+    unsafe {
+        std::ptr::copy_nonoverlapping(block.as_ptr(), slot.host as *mut u8, block.len());
+    }
+    let mut block_ptr = slot.host as *mut c_void;
+    if in_device() {
+        // One DMA on the launch's own list, ahead of the kernel.
+        unsafe {
+            cmd_list.append_memory_copy_raw(
+                slot.device as *mut c_void,
+                slot.host as *const c_void,
+                layout.total,
+                None,
+                &[],
+            )?
+        };
+        block_ptr = slot.device as *mut c_void;
+    }
+    if std::env::var_os("ZLUDA_TRACE_STAGE").is_some() {
+        eprintln!(
+            "stage: function {:#x} slot {} block {:p} bytes {}",
+            function, index, block_ptr, layout.total
+        );
+    }
+    Ok(block_ptr)
 }

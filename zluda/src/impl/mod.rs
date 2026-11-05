@@ -348,6 +348,56 @@ impl GlobalState {
         })?
     }
 
+    /// The same enqueue as `lock_enqueue`, but first waits until at most
+    /// `keep_pending` launches are still in flight.
+    ///
+    /// A launch that fills a parameter buffer needs that: it reuses a buffer an
+    /// earlier launch read, and the stream's own markers are what say that
+    /// launch has retired. The wait happens here, before the previous marker is
+    /// borrowed, because retiring markers mutates the queue.
+    fn lock_enqueue_staged(
+        stream: *mut stream::Stream,
+        keep_pending: usize,
+        f: impl FnOnce(
+            &l0::CommandList,
+            &l0::Event<'static>,
+            &[&l0::Event<'static>],
+        ) -> Result<(), CUresult>,
+    ) -> Result<(), CUresult> {
+        Self::lock_stream(stream, |stream_data| {
+            let l0_dev = unsafe { (*(*stream_data.context).device).base };
+            let l0_ctx = unsafe { &mut (*(*stream_data.context).device).l0_context };
+            let cmd_list = unsafe { transmute_lifetime(&stream_data.cmd_list) };
+            let timing = std::env::var_os("ZLUDA_TRACE_LAUNCH_MS").is_some();
+            let t0 = std::time::Instant::now();
+            stream_data.wait_for_pending(keep_pending)?;
+            let t_wait = t0.elapsed();
+            let t1 = std::time::Instant::now();
+            let (new_event, new_marker) = stream_data.get_event(l0_dev, l0_ctx)?;
+            let t_event = t1.elapsed();
+            let t2 = std::time::Instant::now();
+            stream_data.try_reuse_finished_events()?;
+            let t_reuse = t2.elapsed();
+            if timing {
+                eprintln!(
+                    "lock ms: wait {:.3} event {:.3} reuse {:.3} busy {} free {}",
+                    t_wait.as_secs_f64() * 1e3,
+                    t_event.as_secs_f64() * 1e3,
+                    t_reuse.as_secs_f64() * 1e3,
+                    stream_data.busy_events.len(),
+                    stream_data.free_events.len()
+                );
+            }
+            let prev_event = stream_data.get_last_event();
+            let prev_event_array = prev_event.map(|e| [e]);
+            let empty = [];
+            let prev_event_slice = prev_event_array.as_ref().map_or(&empty[..], |arr| &arr[..]);
+            f(cmd_list, &new_event, prev_event_slice)?;
+            stream_data.push_event((new_event, new_marker));
+            Ok(())
+        })?
+    }
+
     fn lock_function<T>(
         func: *mut function::Function,
         f: impl FnOnce(&mut function::FunctionData) -> T,

@@ -115,19 +115,39 @@ pub fn launch_kernel(
         }
     }
     // A kernel whose arguments do not fit in the parameter list reads them from
-    // a buffer, which has to be filled before the stream is locked: the copy
-    // that fills it takes the same locks.
+    // a buffer. Gathering the bytes is plain host work; filling a buffer here
+    // rather than inside the lock is deliberate, because a device allocation
+    // takes the global state lock and the launch path holds the stream.
     let mut param_block = None;
+    let mut param_bytes = None;
+    let function_key = f as usize;
+    // ZLUDA_PARAM_BLOCKING=1 restores the old path: allocate a buffer per launch
+    // and fill it with a copy that drains the context. Slow (2.5 ms per launch on
+    // torch's cat) but kept as the reference the staged path is measured against.
+    let blocking = std::env::var_os("ZLUDA_PARAM_BLOCKING").is_some();
     if let Ok(func) = unsafe { &mut *f }.as_result_mut() {
         if let Some(layout) = func.param_buffer.clone() {
-            param_block = Some(super::param_buffer::publish(
-                &layout,
-                kernel_params,
-                extra,
-            )?);
+            if blocking {
+                param_block = Some(super::param_buffer::publish(&layout, kernel_params, extra)?);
+            } else {
+                super::param_buffer::reserve(&layout, function_key)?;
+                param_bytes = Some((
+                    layout.clone(),
+                    super::param_buffer::collect(&layout, kernel_params, extra)?,
+                ));
+            }
         }
     }
-    GlobalState::lock_enqueue(hstream, |cmd_list, signal, wait| {
+    // A launch with no parameter buffer has nothing to wait for.
+    let keep_pending = if param_bytes.is_some() {
+        super::param_buffer::SLOTS
+    } else {
+        usize::MAX
+    };
+    let timing = std::env::var_os("ZLUDA_TRACE_LAUNCH_MS").is_some();
+    let t_enter = std::time::Instant::now();
+    GlobalState::lock_enqueue_staged(hstream, keep_pending, |cmd_list, signal, wait| {
+        let t_locked = t_enter.elapsed();
         let func: &mut FunctionData = match unsafe { &mut *f }.as_result_mut() {
             Ok(func) => func,
             Err(e) => {
@@ -144,6 +164,37 @@ pub fn launch_kernel(
         let dump_this = std::env::var("ZLUDA_DUMP_PARAMS")
             .map(|want| func.name.to_string_lossy().contains(want.as_str()))
             .unwrap_or(false);
+        let traced_stage = std::env::var_os("ZLUDA_TRACE_STAGE").is_some();
+        if let Some((layout, bytes)) = param_bytes.take() {
+            // The slot pool rotates, so this launch gets a buffer that no
+            // launch still in flight can be reading. Its copy is appended to
+            // this list, ahead of the launch, which is all the ordering a
+            // single queue needs.
+            let t_stage_start = std::time::Instant::now();
+            match super::param_buffer::stage(&layout, &bytes, function_key, cmd_list) {
+                Ok(block) => {
+                    if traced_stage {
+                        eprintln!("launch: staged block {:p} for {}", block, func.name.to_string_lossy());
+                    }
+                    param_block = Some(block);
+                    if timing {
+                        eprintln!(
+                            "launch ms: lock {:.3} stage {:.3}",
+                            t_locked.as_secs_f64() * 1e3,
+                            t_stage_start.elapsed().as_secs_f64() * 1e3
+                        );
+                    }
+                }
+                Err(error) => {
+                    eprintln!(
+                        "launch: staging failed for {} -> {:?}",
+                        func.name.to_string_lossy(),
+                        error
+                    );
+                    return Err(error);
+                }
+            }
+        }
         if let Some(block) = param_block {
             // The whole argument list is one eight byte value: the address of
             // the buffer it was copied into.

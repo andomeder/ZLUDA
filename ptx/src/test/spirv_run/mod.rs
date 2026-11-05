@@ -182,6 +182,9 @@ test_ptx!(
 );
 test_ptx!(non_scalar_ptr_offset, [1u32, 2u32, 3u32, 4u32], [7u32]);
 test_ptx!(stateful_neg_offset, [1237518u64], [1237518u64]);
+// The mask of the lanes still active: one thread runs, so it is 1, not the
+// all-lanes mask a hardcoded expansion would report.
+test_ptx!(active_mask, [0u64], [1u64]);
 
 struct DisplayError<T: Debug> {
     err: T,

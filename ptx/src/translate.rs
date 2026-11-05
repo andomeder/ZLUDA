@@ -3250,6 +3250,9 @@ fn statements_need_full_warp(statements: &[ExpandedStatement]) -> bool {
     statements.iter().any(|statement| match statement {
         Statement::Instruction(ast::Instruction::Shfl(..))
         | Statement::Instruction(ast::Instruction::Vote(..))
+        // A ballot is a subgroup operation, so the subgroup has to be the
+        // 32 lane warp for the mask to mean what the ISA says.
+        | Statement::Instruction(ast::Instruction::Activemask(..))
         | Statement::Instruction(ast::Instruction::LdMatrix(..))
         | Statement::Instruction(ast::Instruction::Mma(..))
         | Statement::Instruction(ast::Instruction::MovMatrix(..))
@@ -4015,6 +4018,44 @@ fn emit_function_body_ops(
                 // The member mask is ignored: the Intel ops cover the subgroup.
                 ast::Instruction::Shfl(mode, typ, arg) => {
                     emit_shfl(builder, map, laneid, *mode, *typ, arg)?
+                }
+                // activemask.b32 d - the lanes of the warp that are still
+                // active. A ballot over a predicate that is true in every lane
+                // reports exactly the lanes that reach the instruction, which
+                // is what the hardware does (measured: half a warp returned
+                // gives 0x0000ffff on both the B580 and an RTX 2070).
+                ast::Instruction::Activemask(dst) => {
+                    let u32_type = map.get_or_add_scalar(builder, ast::ScalarType::U32);
+                    let bool_type = map.get_or_add_scalar(builder, ast::ScalarType::Pred);
+                    let subgroup_scope = map.get_or_add_constant(
+                        builder,
+                        &ast::Type::Scalar(ast::ScalarType::U32),
+                        &vec_repr(spirv::Scope::Subgroup as u32),
+                    )?;
+                    let one = map.get_or_add_constant(
+                        builder,
+                        &ast::Type::Scalar(ast::ScalarType::U32),
+                        &vec_repr(1u32),
+                    )?;
+                    let always = builder.i_equal(bool_type, None, one, one)?;
+                    // A ballot is a vector of four words covering up to 128
+                    // lanes; a warp has 32, so take the first.
+                    let ballot_type = map.get_or_add(
+                        builder,
+                        SpirvType::Vector(SpirvScalarKey::B32, 4),
+                    );
+                    let ballot = builder.group_non_uniform_ballot(
+                        ballot_type,
+                        None,
+                        subgroup_scope,
+                        always,
+                    )?;
+                    builder.composite_extract(
+                        u32_type,
+                        Some(*dst),
+                        ballot,
+                        [0].iter().copied(),
+                    )?;
                 }
                 // vote.sync.mode.pred d, a, membermask   (a is a predicate)
                 // vote.sync.ballot.b32 d, a, membermask
@@ -9824,6 +9865,19 @@ impl<T: ArgParamsEx> ast::Instruction<T> {
                     },
                 )
             }
+            ast::Instruction::Activemask(dst) => {
+                let dst = visitor.operand(
+                    ArgumentDescriptor {
+                        op: dst,
+                        is_dst: true,
+                        is_memory_access: false,
+                        non_default_implicit_conversion: None,
+                    },
+                    &ast::Type::Scalar(ast::ScalarType::U32),
+                    ast::StateSpace::Reg,
+                )?;
+                ast::Instruction::Activemask(dst)
+            }
             ast::Instruction::Vote(m, t, a) => {
                 let typ = ast::Type::Scalar(t);
                 let pred_typ = ast::Type::Scalar(ast::ScalarType::Pred);
@@ -10294,6 +10348,7 @@ impl ast::Instruction<ExpandedArgParams> {
             ast::Instruction::BarRedPred(_, _, _, _) => None,
             ast::Instruction::Shfl(_, _, _) => None,
             ast::Instruction::Vote(_, _, _) => None,
+            ast::Instruction::Activemask(_) => None,
             ast::Instruction::Atom(_, _) => None,
             ast::Instruction::Red(_, _) => None,
             ast::Instruction::AtomCas(_, _) => None,

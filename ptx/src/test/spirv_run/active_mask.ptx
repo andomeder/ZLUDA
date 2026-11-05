@@ -1,0 +1,23 @@
+.version 6.5
+.target sm_70
+.address_size 64
+
+// activemask reports the lanes of the warp that are still active. One thread
+// runs, so the mask is 1; a translator that expands the instruction to the
+// all-lanes mask writes 0xffffffff here instead. The value is what a partial
+// warp hands to a shuffle or a warp barrier, and a multi-block reduction uses
+// it to find the leader lane that votes on whether the last block has finished.
+.visible .entry active_mask(
+	.param .u64 input,
+	.param .u64 output
+)
+{
+	.reg .b32 %r<3>;
+	.reg .b64 %rd<3>;
+
+	ld.param.u64 %rd1, [input];
+	ld.param.u64 %rd2, [output];
+	activemask.b32 %r1;
+	st.b32 [%rd2], %r1;
+	ret;
+}

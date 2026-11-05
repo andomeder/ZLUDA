@@ -364,6 +364,11 @@ pub enum Instruction<P: ArgParams> {
     /// `cp.async.wait_all;` - wait for every group.
     CpAsyncWaitAll,
     Vote(VoteMode, ScalarType, ArgVote<P>),
+    /// `activemask.b32 d;` - a bitmask of the lanes of the warp that are still
+    /// active at this point. The value changes as lanes leave the warp, so it
+    /// is a ballot over the lanes that reach the instruction rather than a
+    /// constant.
+    Activemask(P::Operand),
     Atom(AtomDetails, Arg3<P>),
     /// `red` - a reduction whose result is discarded.
     Red(AtomDetails, Arg2St<P>),

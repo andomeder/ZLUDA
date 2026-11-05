@@ -1686,20 +1686,12 @@ SelpType: ast::ScalarType = {
 // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#memory-consistency-model-membar
 InstMembar: ast::Instruction<ast::ParsedArgParams<'input>> = {
     "membar" <scope:MemScope> => ast::Instruction::Membar(scope),
-    // The instruction reports which lanes are active. A ballot over the
-    // subgroup would be exact, but a group operation needs a register predicate
-    // and this has none, and the value is used as a shuffle or barrier mask
-    // where every lane is active. So it expands to the all-active mask.
-    "activemask" ".b32" <dst:ExtendedID> => {
-        let details = ast::MovDetails::new(ast::Type::Scalar(ast::ScalarType::B32));
-        ast::Instruction::Mov(
-            details,
-            ast::Arg2Mov {
-                dst: ast::Operand::Reg(dst),
-                src: ast::Operand::Imm(ast::ImmediateValue::U64(u32::MAX as u64)),
-            },
-        )
-    }
+    // The instruction reports which lanes of the warp are still active. It is
+    // the mask a partial warp hands to a shuffle or a warp barrier, and the
+    // value changes as lanes leave the warp, so it is lowered to a ballot over
+    // the lanes that reach the instruction (see the emitter: the hardware's
+    // ballot reports exactly the active lanes).
+    "activemask" ".b32" <dst:Operand> => ast::Instruction::Activemask(dst)
 }
 
 // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-bar

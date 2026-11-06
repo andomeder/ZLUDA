@@ -37,18 +37,24 @@ pub mod fatbin;
 pub mod pointer;
 pub mod sass;
 
-#[cfg(debug_assertions)]
+/// An entry point that is known but not implemented.
+///
+/// Always a returned error, never a panic: this crosses the C ABI, and a panic
+/// through that boundary is undefined behaviour on the caller's side - which in
+/// practice means a crash in whichever library made the call, with no clue which
+/// entry point it was. In a debug build it also names the call.
 pub fn unimplemented() -> CUresult {
-    unimplemented!()
-}
-
-#[cfg(not(debug_assertions))]
-pub fn unimplemented() -> CUresult {
-    if std::env::var_os("ZLUDA_TRACE_STUBS").is_some() {
-        eprintln!("unimplemented entry point called");
+    if cfg!(debug_assertions) {
+        eprintln!(
+            "zluda: an unimplemented driver entry point was called (debug build); returning \
+             CUDA_ERROR_NOT_SUPPORTED. In a release build, ZLUDA_TRACE_STUBS=1 logs this."
+        );
+    } else if std::env::var_os("ZLUDA_TRACE_STUBS").is_some() {
+        eprintln!("zluda: an unimplemented driver entry point was called, returning CUDA_ERROR_NOT_SUPPORTED");
     }
     CUresult::CUDA_ERROR_NOT_SUPPORTED
 }
+
 
 pub trait HasLivenessCookie: Sized {
     const COOKIE: usize;

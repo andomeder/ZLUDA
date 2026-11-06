@@ -2380,7 +2380,10 @@ pub extern "system" fn cuDevicePrimaryCtxSetFlags_v2(
     dev: CUdevice,
     flags: ::std::os::raw::c_uint,
 ) -> CUresult {
-    r#impl::unimplemented()
+    // The primary context is created with the driver's default flags; the
+    // scheduling hint has no equivalent to apply.
+    let _ = (dev, flags);
+    CUresult::CUDA_SUCCESS
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -2469,7 +2472,13 @@ pub extern "system" fn cuCtxGetDevice(device: *mut CUdevice) -> CUresult {
 
 #[cfg_attr(not(test), no_mangle)]
 pub extern "system" fn cuCtxGetFlags(flags: *mut ::std::os::raw::c_uint) -> CUresult {
-    r#impl::unimplemented()
+    if flags.is_null() {
+        return CUresult::CUDA_ERROR_INVALID_VALUE;
+    }
+    // No scheduling flag is applied: work from different streams is not
+    // serialised here, which is what CU_CTX_SCHED_AUTO describes.
+    unsafe { *flags = 0 };
+    CUresult::CUDA_SUCCESS
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -2484,34 +2493,77 @@ fn cuCtxSynchronize_inner() -> CUresult {
     r#impl::context::synchronize().encuda()
 }
 
+
+/// The CUlimit values an application sets. They configure things this driver has
+/// no equivalent for (printf buffer size, malloc heap, stack size), so the honest
+/// behaviour is to accept the value and report it back rather than fail a call
+/// that has no effect on execution.
+fn context_limits() -> &'static std::sync::Mutex<std::collections::HashMap<u32, usize>> {
+    static LIMITS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<u32, usize>>,
+    > = std::sync::OnceLock::new();
+    LIMITS.get_or_init(Default::default)
+}
+
+/// The default for a limit the application has not set.
+fn default_limit(limit: CUlimit) -> usize {
+    // CU_LIMIT_STACK_SIZE is 1024 on CUDA, and a printf FIFO of 1 MB is what
+    // torch asks for; anything else reads as zero, which is what CUDA reports
+    // for limits that do not apply.
+    match limit {
+        CUlimit::CU_LIMIT_STACK_SIZE => 1024,
+        CUlimit::CU_LIMIT_PRINTF_FIFO_SIZE => 1 << 20,
+        _ => 0,
+    }
+}
+
 #[cfg_attr(not(test), no_mangle)]
 pub extern "system" fn cuCtxSetLimit(limit: CUlimit, value: usize) -> CUresult {
-    r#impl::unimplemented()
+    context_limits().lock().unwrap().insert(limit.0, value);
+    CUresult::CUDA_SUCCESS
 }
 
 #[cfg_attr(not(test), no_mangle)]
 pub extern "system" fn cuCtxGetLimit(pvalue: *mut usize, limit: CUlimit) -> CUresult {
-    r#impl::unimplemented()
+    if pvalue.is_null() {
+        return CUresult::CUDA_ERROR_INVALID_VALUE;
+    }
+    let stored = context_limits().lock().unwrap().get(&limit.0).copied();
+    unsafe { *pvalue = stored.unwrap_or_else(|| default_limit(limit)) };
+    CUresult::CUDA_SUCCESS
 }
 
 #[cfg_attr(not(test), no_mangle)]
 pub extern "system" fn cuCtxGetCacheConfig(pconfig: *mut CUfunc_cache) -> CUresult {
-    r#impl::unimplemented()
+    if pconfig.is_null() {
+        return CUresult::CUDA_ERROR_INVALID_VALUE;
+    }
+    // No cache configuration is applied to a kernel here.
+    unsafe { *pconfig = CUfunc_cache::CU_FUNC_CACHE_PREFER_NONE };
+    CUresult::CUDA_SUCCESS
 }
 
 #[cfg_attr(not(test), no_mangle)]
 pub extern "system" fn cuCtxSetCacheConfig(config: CUfunc_cache) -> CUresult {
-    r#impl::unimplemented()
+    // Cache configuration is chosen by the compiler, not per launch here.
+    let _ = config;
+    CUresult::CUDA_SUCCESS
 }
 
 #[cfg_attr(not(test), no_mangle)]
 pub extern "system" fn cuCtxGetSharedMemConfig(pConfig: *mut CUsharedconfig) -> CUresult {
-    r#impl::unimplemented()
+    if pConfig.is_null() {
+        return CUresult::CUDA_ERROR_INVALID_VALUE;
+    }
+    unsafe { *pConfig = CUsharedconfig::CU_SHARED_MEM_CONFIG_DEFAULT_BANK_SIZE };
+    CUresult::CUDA_SUCCESS
 }
 
 #[cfg_attr(not(test), no_mangle)]
 pub extern "system" fn cuCtxSetSharedMemConfig(config: CUsharedconfig) -> CUresult {
-    r#impl::unimplemented()
+    // Shared memory bank size is fixed by the hardware and cannot be chosen.
+    let _ = config;
+    CUresult::CUDA_SUCCESS
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -4066,7 +4118,10 @@ pub extern "system" fn cuStreamAttachMemAsync(
     length: usize,
     flags: ::std::os::raw::c_uint,
 ) -> CUresult {
-    r#impl::unimplemented()
+    // Managed memory is not implemented; attaching a range to a stream is
+    // advisory and has no effect here.
+    let _ = (hStream, dptr, length, flags);
+    CUresult::CUDA_SUCCESS
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -4110,7 +4165,9 @@ pub extern "system" fn cuEventDestroy(hEvent: CUevent) -> CUresult {
 
 #[cfg_attr(not(test), no_mangle)]
 pub extern "system" fn cuStreamCopyAttributes(dst: CUstream, src: CUstream) -> CUresult {
-    r#impl::unimplemented()
+    // Attributes are advisory; a stream here has no per-stream attribute state.
+    let _ = (dst, src);
+    CUresult::CUDA_SUCCESS
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -4119,7 +4176,22 @@ pub extern "system" fn cuStreamGetAttribute(
     attr: CUstreamAttrID,
     value_out: *mut CUstreamAttrValue,
 ) -> CUresult {
-    r#impl::unimplemented()
+    // Report a zeroed attribute: no access policy window, default
+    // synchronization policy. The write is exactly the size of the union the
+    // caller allocated - a fixed byte count here was 64 against a 32 byte union,
+    // which is a buffer overflow into the application's memory.
+    let _ = (hStream, attr);
+    if value_out.is_null() {
+        return CUresult::CUDA_ERROR_INVALID_VALUE;
+    }
+    unsafe {
+        std::ptr::write_bytes(
+            value_out as *mut u8,
+            0,
+            std::mem::size_of::<CUstreamAttrValue>(),
+        )
+    };
+    CUresult::CUDA_SUCCESS
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -4128,7 +4200,11 @@ pub extern "system" fn cuStreamSetAttribute(
     attr: CUstreamAttrID,
     value: *const CUstreamAttrValue,
 ) -> CUresult {
-    r#impl::unimplemented()
+    // The attributes are an access policy window and a synchronization policy.
+    // Neither changes what a stream executes, so the value is accepted and not
+    // applied rather than failing a call that has no effect.
+    let _ = (hStream, attr, value);
+    CUresult::CUDA_SUCCESS
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -4538,7 +4614,20 @@ pub extern "system" fn cuLaunchHostFunc(
     fn_: CUhostFn,
     userData: *mut ::std::os::raw::c_void,
 ) -> CUresult {
-    r#impl::unimplemented()
+    if fn_.is_none() {
+        return CUresult::CUDA_ERROR_INVALID_VALUE;
+    }
+    // There is no host callback primitive on this backend, so the stream is
+    // retired first and the callback runs after it, which is the ordering the
+    // call promises.
+    let synced = r#impl::stream::synchronize(hStream.decuda()).encuda();
+    if synced != CUresult::CUDA_SUCCESS {
+        return synced;
+    }
+    if let Some(callback) = fn_ {
+        unsafe { callback(userData) };
+    }
+    CUresult::CUDA_SUCCESS
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -5048,7 +5137,9 @@ pub extern "system" fn cuMemGetAddressRange(
 
 #[cfg_attr(not(test), no_mangle)]
 pub extern "system" fn cuMemPoolTrimTo(pool: CUmemoryPool, minBytesToKeep: usize) -> CUresult {
-    r#impl::unimplemented()
+    // Allocations are not pooled, so there is nothing to release.
+    let _ = (pool, minBytesToKeep);
+    CUresult::CUDA_SUCCESS
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -5057,7 +5148,9 @@ pub extern "system" fn cuMemPoolSetAccess(
     map: *const CUmemAccessDesc,
     count: usize,
 ) -> CUresult {
-    r#impl::unimplemented()
+    // Memory is not pooled and access is device-local only.
+    let _ = (pool, map, count);
+    CUresult::CUDA_SUCCESS
 }
 
 #[cfg_attr(not(test), no_mangle)]

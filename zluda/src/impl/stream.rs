@@ -95,6 +95,11 @@ pub cmd_list: l0::CommandList<'static>,
 pub busy_events: VecDeque<(l0::Event<'static>, u64)>,
 // A deque so the earliest enqueued event is reused first.
 pub free_events: VecDeque<(l0::Event<'static>, u64)>,
+// Launches left before the event list is examined again (see
+// try_reuse_finished_events).
+recycle_countdown: u32,
+// Last known size of the retired prefix, the first guess of the next search.
+retired_hint: usize,
     pub synchronization_event: (l0::Event<'static>, u64),
     pub flags: u32,
 }
@@ -110,6 +115,8 @@ impl StreamData {
             cmd_list: l0::CommandList::new_immediate(ctx, device)?,
             busy_events: VecDeque::new(),
             free_events: VecDeque::new(),
+            recycle_countdown: 0,
+            retired_hint: 1,
             synchronization_event: host_event,
             flags: 0,
     })
@@ -126,12 +133,15 @@ impl StreamData {
             cmd_list,
             busy_events: VecDeque::new(),
             free_events: VecDeque::new(),
+            recycle_countdown: 0,
+            retired_hint: 1,
             synchronization_event,
             flags,
         })
     }
 
-    /// Recycle the oldest event, if it is safe to.
+    /// Recycle every ready event except the newest, so an event is only reusable
+    /// once nothing can still be waiting on it.
     ///
     /// An event is not safe to reuse the moment it signals. Each launch appends
     /// a barrier that waits on the *previous* launch's event, and that barrier
@@ -143,37 +153,72 @@ impl StreamData {
     /// launches one kernel per parameter - and why a 200 launch loop sometimes
     /// stalled and sometimes did not.
     ///
-    /// So: recycle only when this event is ready AND the one after it is ready
-    /// too (its barrier has been processed), or when it is the newest event and
-    /// nothing waits on it yet.
-    fn recycle_ready_front(&mut self) -> l0::Result<bool> {
-        // ZLUDA_IDLE_SYNC_BARRIER=1 appends the barrier anyway, which is what
-        // this used to do: it is how the regression test below is shown to be
-        // able to fail.
-        if self.busy_events.is_empty()
-            && std::env::var_os("ZLUDA_IDLE_SYNC_BARRIER").is_none()
-        {
-            return Ok(false);
+    /// A handful of status queries for the whole list, not one per event: events
+    /// signal in the order their commands were appended, so "the event at index
+    /// i has signalled" is monotone in i and a bisect finds the boundary. One
+    /// query costs 3.5 us here, almost twice the launch's own append
+    /// (`tmp/harness/launchcost/query_cost.c`), which is why asking per event
+    /// was the most expensive thing in a page call.
+    fn recycle_all_ready(&mut self) -> l0::Result<usize> {
+        let len = self.busy_events.len();
+        let lag = super::diag::wait_lag();
+        // Recycling event i is safe only once the launch `lag` places after it
+        // has retired, because that launch's barrier is what waits on it. The
+        // newest event is kept, and so are the `lag` before it.
+        if len <= lag {
+            return Ok(0);
         }
-        if !self.busy_events.front().unwrap().0.is_ready()? {
-            return Ok(false);
+        let max = len - lag;
+        // Search the retired prefix: `count` events may be recycled when the
+        // event at `count - 1 + lag` has signalled. That predicate is monotone
+        // (a later event never signals before an earlier one), so a bisect finds
+        // the whole prefix in a few queries, and the previous answer is the first
+        // guess because a steady stream retires a similar number each time.
+        let mut lo = 0usize;
+        let mut hi = max;
+        let mut probe = self.retired_hint.clamp(1, max);
+        // A capped number of probes: when nothing has retired, walking a stale
+        // guess down to zero would cost log2(guess) queries every time, and the
+        // guess only becomes stale when the device has stopped keeping up. Four
+        // probes still find a prefix that has shrunk by 16x.
+        for _ in 0..4 {
+            let index = probe - 1 + lag;
+            let ready = self.busy_events.get(index).unwrap().0.is_ready()?;
+            if ready {
+                lo = probe;
+            } else {
+                hi = probe - 1;
+            }
+            if lo >= hi {
+                break;
+            }
+            probe = lo + (hi - lo + 1) / 2;
         }
-        // The command that waits on this event is `lag` commands later, so that
-        // is the one that has to have retired before the event is free. With
-        // lag 1 that is the immediate successor, which is the case the rule was
-        // written for; a larger lag makes the waiter further back.
-        let lag = super::wait_lag();
-        if self.busy_events.len() > lag && !self.busy_events.get(lag).unwrap().0.is_ready()? {
-            return Ok(false);
+        self.retired_hint = lo;
+        for _ in 0..lo {
+            let (event, marker) = self.busy_events.pop_front().unwrap();
+            event.host_reset()?;
+            self.free_events.push_back((event, marker));
         }
-        let (event, marker) = self.busy_events.pop_front().unwrap();
-        event.host_reset()?;
-        self.free_events.push_back((event, marker));
-        Ok(true)
+        Ok(lo)
     }
 
     pub fn try_reuse_finished_events(&mut self) -> l0::Result<()> {
-        while self.recycle_ready_front()? {}
+        // Nothing to do while the free list has a comfortable stock, and nothing
+        // to do until the counter says an examination is due: a query costs
+        // 3.5 us on this driver (`tmp/harness/launchcost/query_cost.c`), almost
+        // twice the append it is guarding, so it is worth asking rarely and
+        // taking a whole prefix when we do.
+        let interval = super::diag::event_recycle_interval() as usize;
+        if self.free_events.len() >= interval {
+            return Ok(());
+        }
+        if self.recycle_countdown > 0 {
+            self.recycle_countdown -= 1;
+            return Ok(());
+        }
+        self.recycle_countdown = interval as u32;
+        self.recycle_all_ready()?;
         Ok(())
     }
 
@@ -192,16 +237,27 @@ impl StreamData {
     /// A caller that reuses a buffer a launch read needs this: the marker
     /// `keep` launches back retires no earlier than that launch did, so once
     /// the queue is that short the buffer is free.
+    ///
+    /// One synchronise, not one status query per event: events retire in the
+    /// order they were appended, so waiting for the last event that has to go
+    /// retires all of them, and the retired prefix is then moved to the free
+    /// list without asking about each one. It used to ask per event, which at
+    /// 3.5 us a query made this path the most expensive thing in a page call
+    /// once the recycler stopped trimming the list on every launch.
     pub fn wait_for_pending(&mut self, keep: usize) -> l0::Result<()> {
+        let lag = super::diag::wait_lag();
         while self.busy_events.len() > keep {
-            if self.recycle_ready_front()? {
+            // Free whatever has already retired before blocking at all, and
+            // again after each block: one bisect, not one query per event.
+            if self.recycle_all_ready()? > 0 {
                 continue;
             }
-            // Nothing can be recycled yet. Wait for the second event rather than
-            // the first: the first is the one a pending barrier may still be
-            // holding, and the second retiring implies its barrier was processed.
-            let index = if self.busy_events.len() > 1 { 1 } else { 0 };
-            match self.busy_events.get(index) {
+            // Nothing more can go without waiting. Block on the event whose
+            // retirement makes enough of the list recyclable, which is
+            // `lag` places past the oldest event that has to go.
+            let needing = self.busy_events.len() - keep;
+            let probe = (needing - 1 + lag).min(self.busy_events.len() - 1);
+            match self.busy_events.get(probe) {
                 None => return Ok(()),
                 Some((event, _)) => event.host_synchronize(60_000_000_000)?,
             }
@@ -218,13 +274,11 @@ impl StreamData {
     }
 
     pub fn synchronize(&mut self) -> l0::Result<()> {
-        let trace = std::env::var_os("ZLUDA_TRACE_STREAM").is_some();
+        let trace = super::diag::trace_stream();
         // ZLUDA_IDLE_SYNC_BARRIER=1 appends the barrier anyway, which is what
         // this used to do: it is how the regression test below is shown to be
         // able to fail.
-        if self.busy_events.is_empty()
-            && std::env::var_os("ZLUDA_IDLE_SYNC_BARRIER").is_none()
-        {
+        if self.busy_events.is_empty() && !super::diag::idle_sync_barrier() {
             // Nothing is queued on this stream, so there is nothing to wait
             // for. It matters: a barrier appended with an empty wait list does
             // not signal on this driver, so waiting on one stalls until the

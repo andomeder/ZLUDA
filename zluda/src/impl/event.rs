@@ -73,7 +73,7 @@ impl EventData {
             // reset it while this barrier still waits on it, which is the hazard
             // that hung the launch chain in d1a9f172.
             // ZLUDA_RECORD_WAIT=1 restores the old wait for comparison.
-            let last_event = if std::env::var_os("ZLUDA_RECORD_WAIT").is_some() {
+            let last_event = if super::diag::record_wait() {
                 stream_data.get_last_event()
             } else {
                 None

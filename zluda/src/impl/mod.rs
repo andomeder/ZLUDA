@@ -19,6 +19,7 @@ use std::{
 pub mod test;
 pub mod context;
 pub mod device;
+pub mod diag;
 pub mod export_table;
 pub mod function;
 pub mod library;
@@ -34,6 +35,7 @@ pub mod stream;
 pub mod driver_proc_address;
 pub mod event;
 pub mod fatbin;
+pub mod launch_trace;
 pub mod pointer;
 pub mod sass;
 
@@ -372,6 +374,7 @@ impl GlobalState {
         stream: *mut stream::Stream,
         keep_pending: usize,
         wait_last: bool,
+        trace: &launch_trace::Trace,
         f: impl FnOnce(
             &l0::CommandList,
             &l0::Event<'static>,
@@ -382,26 +385,15 @@ impl GlobalState {
             let l0_dev = unsafe { (*(*stream_data.context).device).base };
             let l0_ctx = unsafe { &mut (*(*stream_data.context).device).l0_context };
             let cmd_list = unsafe { transmute_lifetime(&stream_data.cmd_list) };
-            let timing = std::env::var_os("ZLUDA_TRACE_LAUNCH_MS").is_some();
-            let t0 = std::time::Instant::now();
+            let t_wait = trace.start();
             stream_data.wait_for_pending(keep_pending)?;
-            let t_wait = t0.elapsed();
-            let t1 = std::time::Instant::now();
+            trace.add(t_wait, |t| &t.lock);
+            let t1 = trace.start();
             let (new_event, new_marker) = stream_data.get_event(l0_dev, l0_ctx)?;
-            let t_event = t1.elapsed();
-            let t2 = std::time::Instant::now();
+            trace.add(t1, |t| &t.event);
+            let t2 = trace.start();
             stream_data.try_reuse_finished_events()?;
-            let t_reuse = t2.elapsed();
-            if timing {
-                eprintln!(
-                    "lock ms: wait {:.3} event {:.3} reuse {:.3} busy {} free {}",
-                    t_wait.as_secs_f64() * 1e3,
-                    t_event.as_secs_f64() * 1e3,
-                    t_reuse.as_secs_f64() * 1e3,
-                    stream_data.busy_events.len(),
-                    stream_data.free_events.len()
-                );
-            }
+            trace.add(t2, |t| &t.reuse);
             // Which earlier command a new one waits on. One means the command
             // before it, and that round trip measured about 80 us per launch -
             // a decode step of 2167 launches spent 212 ms queued against 40 ms
@@ -411,7 +403,7 @@ impl GlobalState {
             // A launch whose arguments were just copied into a buffer has to
             // wait for that copy, which is the most recent command, so it takes
             // the immediate predecessor regardless of the lag.
-            let lag = if wait_last { 1 } else { wait_lag() };
+            let lag = if wait_last { 1 } else { diag::wait_lag() };
             let prev_event = if lag <= 1 {
                 stream_data.get_last_event()
             } else {
@@ -426,7 +418,9 @@ impl GlobalState {
             let empty = [];
             let prev_event_slice = prev_event_array.as_ref().map_or(&empty[..], |arr| &arr[..]);
             f(cmd_list, &new_event, prev_event_slice)?;
+            let t_book = trace.start();
             stream_data.push_event((new_event, new_marker));
+            trace.add(t_book, |t| &t.book);
             Ok(())
         })?
     }
@@ -448,15 +442,6 @@ impl GlobalState {
 // TODO: implement
 fn is_intel_gpu_driver(_: &l0::Driver) -> bool {
     true
-}
-
-/// How many commands back a new command waits on (ZLUDA_WAIT_LAG, default 1).
-pub fn wait_lag() -> usize {
-    std::env::var("ZLUDA_WAIT_LAG")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value >= 1)
-        .unwrap_or(1)
 }
 
 pub fn init() -> Result<(), CUresult> {

@@ -86,12 +86,17 @@ pub fn launch_kernel(
     kernel_params: *mut *mut c_void,
     extra: *mut *mut c_void,
 ) -> Result<(), CUresult> {
-    let trace = std::env::var_os("ZLUDA_TRACE_FUNC").is_some();
+    let timing = super::diag::trace_launch_ms();
+    let trace = super::launch_trace::Trace::new(timing);
+    // The whole call, including the diagnostic environment lookups below, so
+    // that what the phases do not account for is visible rather than hidden.
+    let t_enter = std::time::Instant::now();
+    let trace_func = super::diag::trace_func();
     if f == ptr::null_mut()
         || (kernel_params == ptr::null_mut() && extra == ptr::null_mut())
         || (kernel_params != ptr::null_mut() && extra != ptr::null_mut())
     {
-        if trace {
+        if trace_func {
             eprintln!(
                 "launch_kernel: bad arguments f={:?} kernel_params={:?} extra={:?}",
                 f, kernel_params, extra
@@ -99,7 +104,7 @@ pub fn launch_kernel(
         }
         return Err(CUresult::CUDA_ERROR_INVALID_VALUE);
     }
-    if trace {
+    if trace_func {
         if let Ok(func) = unsafe { &mut *f }.as_result_mut() {
             eprintln!(
                 "launch_kernel: {} grid=({},{},{}) block=({},{},{}) shared={}",
@@ -125,7 +130,8 @@ pub fn launch_kernel(
     // ZLUDA_PARAM_BLOCKING=1 restores the old path: allocate a buffer per launch
     // and fill it with a copy that drains the context. Slow (2.5 ms per launch on
     // torch's cat) but kept as the reference the staged path is measured against.
-    let blocking = std::env::var_os("ZLUDA_PARAM_BLOCKING").is_some();
+    let blocking = super::diag::param_blocking();
+    let t_gather = trace.start();
     if let Ok(func) = unsafe { &mut *f }.as_result_mut() {
         if let Some(layout) = func.param_buffer.clone() {
             if blocking {
@@ -162,14 +168,13 @@ pub fn launch_kernel(
     } else {
         usize::MAX
     };
-    let timing = std::env::var_os("ZLUDA_TRACE_LAUNCH_MS").is_some();
-    let t_enter = std::time::Instant::now();
+    trace.add(t_gather, |t| &t.gather);
     let wait_last = param_block.is_some();
-    GlobalState::lock_enqueue_staged(hstream, keep_pending, wait_last, |cmd_list, signal, wait| {
+    GlobalState::lock_enqueue_staged(hstream, keep_pending, wait_last, &trace, |cmd_list, signal, wait| {
         let func: &mut FunctionData = match unsafe { &mut *f }.as_result_mut() {
             Ok(func) => func,
             Err(e) => {
-                if trace {
+                if trace_func {
                     eprintln!("launch_kernel: handle {:?} is not a live function: {:?}", f, e);
                 }
                 return Err(e);
@@ -179,10 +184,8 @@ pub fn launch_kernel(
         // matching launch. A kernel that only misbehaves for some inputs cannot
         // be diagnosed from the source alone, and the parameter block is the
         // only place the difference shows.
-        let dump_this = std::env::var("ZLUDA_DUMP_PARAMS")
-            .map(|want| func.name.to_string_lossy().contains(want.as_str()))
-            .unwrap_or(false);
-        let traced_stage = std::env::var_os("ZLUDA_TRACE_STAGE").is_some();
+        let dump_this = super::diag::dump_params(&func.name.to_string_lossy());
+        let traced_stage = super::diag::trace_stage();
         if let Some((layout, bytes)) = param_bytes.take() {
             // The slot pool rotates, so this launch gets a buffer that no
             // launch still in flight can be reading. Its copy is appended to
@@ -210,8 +213,11 @@ pub fn launch_kernel(
         if let Some(block) = param_block {
             // The whole argument list is one eight byte value: the address of
             // the buffer it was copied into.
+            let t = trace.start();
             unsafe { func.base.set_arg_raw(0, std::mem::size_of::<*mut c_void>(), &block as *const _ as *const c_void)? };
+            trace.add(t, |t| &t.set_arg);
         } else if kernel_params != ptr::null_mut() {
+            let t = trace.start();
             for (i, arg_size) in func.arg_size.iter().enumerate() {
                 let value = unsafe { *kernel_params.add(i) };
                 if dump_this {
@@ -224,7 +230,7 @@ pub fn launch_kernel(
                     }
                 }
                 if let Err(e) = unsafe { func.base.set_arg_raw(i as u32, *arg_size, value) } {
-                    if trace {
+                    if trace_func {
                         eprintln!(
                             "launch_kernel: set_arg_raw({}, {}) failed: {:?}",
                             i, arg_size, e
@@ -233,6 +239,7 @@ pub fn launch_kernel(
                     return Err(e.into());
                 }
             }
+            trace.add(t, |t| &t.set_arg);
         } else {
             let mut offset = 0;
             let mut buffer_ptr = None;
@@ -247,7 +254,7 @@ pub fn launch_kernel(
                         buffer_size = Some(unsafe { *(*extra.add(offset + 1) as *mut usize) });
                     }
                     _ => {
-                        if trace {
+                        if trace_func {
                             eprintln!("launch_kernel: unknown launch parameter");
                         }
                         return Err(CUresult::CUDA_ERROR_INVALID_VALUE);
@@ -262,7 +269,7 @@ pub fn launch_kernel(
                             size_of_arg + round_up_to_multiple(offset, *size_of_arg)
                         });
                     if buffer_size < sum_of_kernel_argument_sizes {
-                        if trace {
+                        if trace_func {
                             eprintln!(
                                 "launch_kernel: buffer too small {} < {}",
                                 buffer_size, sum_of_kernel_argument_sizes
@@ -297,12 +304,15 @@ pub fn launch_kernel(
             // The application asks for its own dynamic shared memory; the
             // prefix the kernel assumes sits in front of it.
             let dynamic_shared = shared_mem_bytes as usize + func.shared_mem_prefix;
+            let t = trace.start();
             unsafe {
                 func.base.set_arg_raw(own_parameters as u32, dynamic_shared, ptr::null())?
             };
+            trace.add(t, |t| &t.shared);
         }
+        let t = trace.start();
         if let Err(e) = func.base.set_group_size(block_dim_x, block_dim_y, block_dim_z) {
-            if trace {
+            if trace.enabled {
                 eprintln!(
                     "launch_kernel: set_group_size({}, {}, {}) failed: {:?}",
                     block_dim_x, block_dim_y, block_dim_z, e
@@ -310,7 +320,9 @@ pub fn launch_kernel(
             }
             return Err(e.into());
         }
+        trace.add(t, |t| &t.group);
         func.legacy_args.reset();
+        let t_append = trace.start();
         unsafe {
             // Launching without this wait is tempting and wrong: the list is in
             // order, but a decode step's launches stop completing altogether
@@ -320,7 +332,7 @@ pub fn launch_kernel(
             // goes on the event round trip. Narrowing which launches need the
             // wait is the open item.
             let no_wait: &[&l0::Event<'static>] = &[];
-            let launch_wait = if std::env::var_os("ZLUDA_NO_LAUNCH_WAIT").is_some() {
+            let launch_wait = if super::diag::no_launch_wait() {
                 no_wait
             } else {
                 wait
@@ -331,7 +343,7 @@ pub fn launch_kernel(
                 Some(signal),
                 launch_wait,
             ) {
-                if trace {
+                if trace_func {
                     eprintln!(
                         "launch_kernel: append_launch_kernel grid ({}, {}, {}) failed: {:?}",
                         grid_dim_x, grid_dim_y, grid_dim_z, e
@@ -340,6 +352,7 @@ pub fn launch_kernel(
                 return Err(e.into());
             }
         }
+        trace.add(t_append, |t| &t.append);
         Ok::<_, CUresult>(())
     })
     .map_err(|error| {
@@ -359,22 +372,21 @@ pub fn launch_kernel(
     // ZLUDA_SYNC_LAUNCH makes every launch block until it retires, a
     // diagnostic: a difference with it on separates a missing ordering from a
     // wrong value.
-    if std::env::var_os("ZLUDA_TRACE_STREAM").is_some() {
+    if super::diag::trace_stream() {
         if let Ok(func) = unsafe { &mut *f }.as_result_mut() {
             super::stream::remember_launched_kernel(&func.name.to_string_lossy());
         }
     }
-    if std::env::var_os("ZLUDA_SYNC_LAUNCH").is_some() {
+    if super::diag::sync_launch() {
         crate::r#impl::stream::synchronize(hstream)?;
     }
     if timing {
         // Printed last, so with ZLUDA_SYNC_LAUNCH the number is the kernel's own
         // time: the sync above does not return until it retired.
         if let Ok(func) = unsafe { &mut *f }.as_result_mut() {
-            eprintln!(
-                "launch ms: {:.3} {}",
+            trace.print(
+                &func.name.to_string_lossy(),
                 t_enter.elapsed().as_secs_f64() * 1e3,
-                func.name.to_string_lossy()
             );
         }
     }

@@ -55,7 +55,7 @@ pub fn publish(
 ) -> Result<*mut c_void, CUresult> {
     let block = collect(layout, kernel_params, extra)?;
     let device = super::memory::alloc_v2_raw(layout.total)?;
-    if std::env::var_os("ZLUDA_TRACE_STAGE").is_some() {
+    if super::diag::trace_stage() {
         eprintln!("publish: device {:p} bytes {} src {:p}", device, layout.total, block.as_ptr());
     }
     // The copy is blocking, so it also establishes that every earlier kernel
@@ -607,7 +607,7 @@ pub fn in_device() -> bool {
     // The copy is one command on the launch's own list, so it is ordered with
     // the kernel and costs nothing else. ZLUDA_PARAM_HOST=1 keeps the old
     // no-copy variant for comparison.
-    std::env::var_os("ZLUDA_PARAM_HOST").is_none()
+    !super::diag::param_host()
 }
 
 struct Pool {
@@ -621,17 +621,22 @@ struct Pool {
 /// The size is a throughput knob as well as a bound: a launch that has to wait
 /// for its slot cannot run ahead of the device, and the kernels here take about
 /// a millisecond each, so a small ring turns the whole decode into a lockstep.
-/// A slot is a few kilobytes, so this costs under a megabyte per function.
-pub const SLOTS: usize = 128;
+/// A slot is a few kilobytes, so this costs a couple of megabytes per function.
+///
+/// It was 128 until the launch path got cheap enough that the host could run
+/// further ahead of the device than that, at which point the wait below became
+/// the most expensive thing in a page call: the args-buffer path cost 26.7 us of
+/// host time per launch at 128, and the page benchmark moved from 995 / 906 /
+/// 1108 / 396 ms at 128 to 768 / 711 / 859 / 344 ms at 1024
+/// (`tmp/harness/pagebench.py`, medians of five). The wait is what enforces the
+/// bound, and `tmp/harness/launchcost/ring_slots.c` verifies the ring hands out
+/// nothing still in flight at 2, 8, 64, 128, 256, 512 and 1024.
+pub const SLOTS: usize = 1024;
 
 /// The ring size in use, so it can be swept without a rebuild: the bound and the
 /// throttle are the same number, and which one matters is a measurement.
 pub fn slots() -> usize {
-    std::env::var("ZLUDA_PARAM_SLOTS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value >= 2)
-        .unwrap_or(SLOTS)
+    super::diag::param_slots()
 }
 
 /// Slot rings, keyed by (function, buffer size, stream).
@@ -651,18 +656,35 @@ fn pools() -> &'static std::sync::Mutex<std::collections::HashMap<(usize, usize,
 ///
 /// Called before the stream is locked: a device allocation takes the global
 /// state lock, and the launch path already holds the stream.
+///
+/// Only the first slot is allocated here. The ring grows on demand, one slot per
+/// launch that needs a new one, up to the bound: a ring preallocated to the bound
+/// costs the bound's worth of memory for every kernel that takes the argument
+/// buffer path, and a page call has 57 of them, most of which never go deep.
+/// Growing on demand makes the memory follow the depth actually reached, which is
+/// what a deeper bound was for.
 pub fn reserve(layout: &ParamBuffer, function: usize, stream: usize) -> Result<(), CUresult> {
     let mut pools = pools().lock().unwrap();
     let pool = pools
         .entry((function, layout.total, stream))
         .or_insert_with(|| Pool { slots: Vec::new(), next: 0 });
-    let slots = slots();
-    while pool.slots.len() < slots {
-        let host = super::memory::alloc_host_pinned(layout.total)? as usize;
-        let device = super::memory::alloc_v2_raw(layout.total)? as usize;
-        pool.slots.push(Slot { host, device, size: layout.total });
+    if pool.slots.is_empty() {
+        pool.slots.push(alloc_slot(layout.total)?);
     }
     Ok(())
+}
+
+/// One slot's storage: pinned host for the fill, device for the kernel to read.
+fn alloc_slot(size: usize) -> Result<Slot, CUresult> {
+    let host = super::memory::alloc_host_pinned(size)? as usize;
+    let device = match super::memory::alloc_v2_raw(size) {
+        Ok(device) => device as usize,
+        Err(error) => {
+            super::memory::free_host(host as *mut std::ffi::c_void)?;
+            return Err(error);
+        }
+    };
+    Ok(Slot { host, device, size })
 }
 
 /// Put one launch's arguments in a slot and hand back the addresses.
@@ -681,7 +703,21 @@ pub fn take_slot(
         Some(pool) => pool,
         None => return Err(CUresult::CUDA_ERROR_INVALID_VALUE),
     };
-    let index = pool.next % pool.slots.len();
+    if pool.slots.is_empty() {
+        return Err(CUresult::CUDA_ERROR_INVALID_VALUE);
+    }
+    // The ring grows into a fresh slot until it reaches the bound, so nothing is
+    // ever reused while it is still growing; once it is full the index cycles and
+    // the caller's wait (at most `slots()` launches unconfirmed) is what makes
+    // reuse safe.
+    let bound = slots();
+    let index = if pool.slots.len() < bound {
+        let index = pool.slots.len();
+        pool.slots.push(alloc_slot(layout.total)?);
+        index
+    } else {
+        pool.next % pool.slots.len()
+    };
     pool.next = pool.next.wrapping_add(1);
     let slot = &mut pool.slots[index];
     if block.len() > slot.size {
@@ -708,7 +744,14 @@ pub fn stage(
         Some(pool) => pool,
         None => return Err(CUresult::CUDA_ERROR_INVALID_VALUE),
     };
-    let index = pool.next % pool.slots.len();
+    let bound = slots();
+    let index = if pool.slots.len() < bound {
+        let index = pool.slots.len();
+        pool.slots.push(alloc_slot(layout.total)?);
+        index
+    } else {
+        pool.next % pool.slots.len()
+    };
     pool.next = pool.next.wrapping_add(1);
     let slot = &mut pool.slots[index];
     if block.len() > slot.size {
@@ -733,7 +776,7 @@ pub fn stage(
         };
         block_ptr = slot.device as *mut c_void;
     }
-    if std::env::var_os("ZLUDA_TRACE_STAGE").is_some() {
+    if super::diag::trace_stage() {
         eprintln!(
             "stage: function {:#x} slot {} block {:p} bytes {}",
             function, index, block_ptr, layout.total

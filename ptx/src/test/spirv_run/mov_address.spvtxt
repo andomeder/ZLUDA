@@ -26,8 +26,8 @@
      %uint_8 = OpConstant %uint 8
 %_arr_uchar_uint_8 = OpTypeArray %uchar %uint_8
 %_ptr_Function__arr_uchar_uint_8 = OpTypePointer Function %_arr_uchar_uint_8
-   %uint_8_0 = OpConstant %uint 8
-%_ptr_Generic__arr_uchar_uint_8 = OpTypePointer Generic %_arr_uchar_uint_8
+%_ptr_Function_uchar = OpTypePointer Function %uchar
+%_ptr_Generic_uchar = OpTypePointer Generic %uchar
           %1 = OpFunction %void None %15
           %6 = OpFunctionParameter %ulong
           %7 = OpFunctionParameter %ulong
@@ -38,8 +38,9 @@
           %5 = OpVariable %_ptr_Function_ulong Function
                OpStore %2 %6
                OpStore %3 %7
-         %24 = OpPtrCastToGeneric %_ptr_Generic__arr_uchar_uint_8 %4
-          %9 = OpConvertPtrToU %ulong %24
+         %23 = OpBitcast %_ptr_Function_uchar %4
+         %25 = OpPtrCastToGeneric %_ptr_Generic_uchar %23
+          %9 = OpConvertPtrToU %ulong %25
           %8 = OpCopyObject %ulong %9
                OpStore %5 %8
                OpReturn

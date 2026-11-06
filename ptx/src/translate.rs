@@ -7555,6 +7555,22 @@ fn generic_address(
         SpirvType::Pointer(inner, _) => *inner,
         other => other,
     };
+    // An array is addressed by the pointer to its first element, and a shared
+    // window substituted for an extern shared symbol is already a byte pointer,
+    // so the operand of a cast on an array's address is not always
+    // "pointer to array". OpPtrCastToGeneric requires its operand and its result
+    // to point to the same type, so the address is reduced to a byte pointer
+    // first, which is what both cases mean. The bitcast does not change the
+    // address.
+    let (pointee_type, pointer) = match pointee_type {
+        SpirvType::Array(..) => {
+            let byte_type = SpirvType::Base(SpirvScalarKey::B8);
+            let byte_pointer_type =
+                map.get_or_add(builder, SpirvType::Pointer(Box::new(byte_type.clone()), storage_class));
+            (byte_type, builder.bitcast(byte_pointer_type, None, pointer)?)
+        }
+        other => (other, pointer),
+    };
     let generic_type = map.get_or_add(
         builder,
         SpirvType::Pointer(Box::new(pointee_type), spirv::StorageClass::Generic),

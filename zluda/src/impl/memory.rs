@@ -37,6 +37,11 @@ pub fn alloc_v2(dptr: *mut *mut c_void, bytesize: usize) -> Result<(), CUresult>
 }
 
 pub fn copy_v2(dst: *mut c_void, src: *const c_void, bytesize: usize) -> Result<(), CUresult> {
+// A zero-byte copy is a no-op, and one that reaches the copy engine hangs the
+// host (see copy_async).
+if bytesize == 0 {
+    return Ok(());
+}
 // A blocking copy runs on the legacy stream, which CUDA orders against every
 // other blocking stream. The immediate command lists are independent queues,
 // so the ordering has to be made here.
@@ -124,6 +129,12 @@ pub fn copy_async(
     bytesize: usize,
     hstream: *mut stream::Stream,
 ) -> Result<(), CUresult> {
+    // A zero-byte copy is a no-op in CUDA. Handing it to the copy engine blocks
+    // the host here (measured: a zero-length cuMemcpyDtoH hangs until the
+    // caller's timeout), and torch issues one for every empty tensor.
+    if bytesize == 0 {
+        return Ok(());
+    }
     GlobalState::lock_enqueue(hstream, |cmd_list, signal, wait| {
         unsafe { cmd_list.append_memory_copy_raw(dst, src, bytesize, Some(signal), wait)? };
         Ok(())
@@ -159,6 +170,9 @@ pub fn copy_dtoh_async(
     bytesize: usize,
     hstream: *mut stream::Stream,
 ) -> Result<(), CUresult> {
+    if bytesize == 0 {
+        return Ok(());
+    }
     if host_untracked(dst) {
         // Unpinned host destination: bounce through cached pinned staging.
         let stage = take_staging(bytesize)?;

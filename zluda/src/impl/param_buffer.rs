@@ -634,9 +634,15 @@ pub fn slots() -> usize {
         .unwrap_or(SLOTS)
 }
 
-fn pools() -> &'static std::sync::Mutex<std::collections::HashMap<(usize, usize), Pool>> {
+/// Slot rings, keyed by (function, buffer size, stream).
+///
+/// The stream is part of the key because the reuse guard is per stream: a ring
+/// shared between two streams could have a slot overwritten while the other
+/// stream's kernel is still reading it. One ring per stream costs a few hundred
+/// kilobytes per function and removes that possibility entirely.
+fn pools() -> &'static std::sync::Mutex<std::collections::HashMap<(usize, usize, usize), Pool>> {
     static POOLS: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<(usize, usize), Pool>>,
+        std::sync::Mutex<std::collections::HashMap<(usize, usize, usize), Pool>>,
     > = std::sync::OnceLock::new();
     POOLS.get_or_init(Default::default)
 }
@@ -645,10 +651,10 @@ fn pools() -> &'static std::sync::Mutex<std::collections::HashMap<(usize, usize)
 ///
 /// Called before the stream is locked: a device allocation takes the global
 /// state lock, and the launch path already holds the stream.
-pub fn reserve(layout: &ParamBuffer, function: usize) -> Result<(), CUresult> {
+pub fn reserve(layout: &ParamBuffer, function: usize, stream: usize) -> Result<(), CUresult> {
     let mut pools = pools().lock().unwrap();
     let pool = pools
-        .entry((function, layout.total))
+        .entry((function, layout.total, stream))
         .or_insert_with(|| Pool { slots: Vec::new(), next: 0 });
     let slots = slots();
     while pool.slots.len() < slots {
@@ -668,9 +674,10 @@ pub fn take_slot(
     layout: &ParamBuffer,
     block: &[u8],
     function: usize,
+    stream: usize,
 ) -> Result<(usize, usize), CUresult> {
     let mut pools = pools().lock().unwrap();
-    let pool = match pools.get_mut(&(function, layout.total)) {
+    let pool = match pools.get_mut(&(function, layout.total, stream)) {
         Some(pool) => pool,
         None => return Err(CUresult::CUDA_ERROR_INVALID_VALUE),
     };
@@ -693,10 +700,11 @@ pub fn stage(
     layout: &ParamBuffer,
     block: &[u8],
     function: usize,
+    stream: usize,
     cmd_list: &l0::CommandList,
 ) -> Result<*mut c_void, CUresult> {
     let mut pools = pools().lock().unwrap();
-    let pool = match pools.get_mut(&(function, layout.total)) {
+    let pool = match pools.get_mut(&(function, layout.total, stream)) {
         Some(pool) => pool,
         None => return Err(CUresult::CUDA_ERROR_INVALID_VALUE),
     };

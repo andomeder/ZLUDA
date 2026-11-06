@@ -65,7 +65,19 @@ impl EventData {
         // global lock, because lock_stream would deadlock (not reentrant).
         GlobalState::lock_stream(stream, |stream_data| {
             let empty = [];
-            let last_event = stream_data.get_last_event();
+            // The barrier below is ordered behind everything already queued: the
+            // command list is in order, and a dependent-pair test
+            // (`tmp/harness/launchcost/ordering.c`) is exact with and without
+            // waits. Waiting on the stream's last event as well is not merely
+            // redundant - that event is not in busy_events, so the recycler can
+            // reset it while this barrier still waits on it, which is the hazard
+            // that hung the launch chain in d1a9f172.
+            // ZLUDA_RECORD_WAIT=1 restores the old wait for comparison.
+            let last_event = if std::env::var_os("ZLUDA_RECORD_WAIT").is_some() {
+                stream_data.get_last_event()
+            } else {
+                None
+            };
             let last_event_array = last_event.map(|e| [e]);
             let wait = last_event_array.as_ref().map_or(&empty[..], |arr| &arr[..]);
             // Recording re-arms the event: L0 events stay signaled until
@@ -110,6 +122,19 @@ impl EventData {
         Ok(())
     }
 
+    /// Wall-clock interval between two records.
+    ///
+    /// NOT the device interval, and it cannot be: the Level Zero timestamp query
+    /// that would give one is only defined for an event signalled by a kernel,
+    /// and `cuEventRecord` appends a barrier. Reading a kernel timestamp from a
+    /// barrier-signalled event returned 1.6 to 21 seconds for a 0.5 ms kernel, and
+    /// a pool created with ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP did not behave as
+    /// host visible either (synchronising on its events failed). The correct
+    /// primitive for a device-side marker is `zeCommandListAppendWriteGlobalTimestamp`,
+    /// which writes the device clock into memory at a point in the stream; that is
+    /// the next thing to try here. Until then, device timings come from
+    /// `tmp/tools/zetrace`, which reads the timestamp of the event that signals a
+    /// launch.
     pub fn elapsed_time(&self, other: &EventData) -> Result<f32, CUresult> {
         if !self.recorded || !other.recorded {
             return Err(CUresult::CUDA_ERROR_INVALID_HANDLE);

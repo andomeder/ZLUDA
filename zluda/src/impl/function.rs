@@ -121,6 +121,7 @@ pub fn launch_kernel(
     let mut param_block = None;
     let mut param_bytes = None;
     let function_key = f as usize;
+    let stream_key = hstream as usize;
     // ZLUDA_PARAM_BLOCKING=1 restores the old path: allocate a buffer per launch
     // and fill it with a copy that drains the context. Slow (2.5 ms per launch on
     // torch's cat) but kept as the reference the staged path is measured against.
@@ -130,7 +131,7 @@ pub fn launch_kernel(
             if blocking {
                 param_block = Some(super::param_buffer::publish(&layout, kernel_params, extra)?);
             } else {
-                super::param_buffer::reserve(&layout, function_key).map_err(|error| {
+                super::param_buffer::reserve(&layout, function_key, stream_key).map_err(|error| {
                     eprintln!("launch_kernel: reserve failed {:?}", error);
                     error
                 })?;
@@ -141,7 +142,7 @@ pub fn launch_kernel(
                     // own stream, ahead of the kernel, so it is ordered.
                     GlobalState::wait_stream_pending(hstream, super::param_buffer::slots())?;
                     let (device, host) =
-                        super::param_buffer::take_slot(&layout, &bytes, function_key)?;
+                        super::param_buffer::take_slot(&layout, &bytes, function_key, stream_key)?;
                     super::memory::copy_htod_async(
                         device as *mut std::ffi::c_void,
                         host as *const std::ffi::c_void,
@@ -188,7 +189,7 @@ pub fn launch_kernel(
             // this list, ahead of the launch, which is all the ordering a
             // single queue needs.
             let t_stage_start = std::time::Instant::now();
-            match super::param_buffer::stage(&layout, &bytes, function_key, cmd_list) {
+            match super::param_buffer::stage(&layout, &bytes, function_key, stream_key, cmd_list) {
                 Ok(block) => {
                     if traced_stage {
                         eprintln!("launch: staged block {:p} for {}", block, func.name.to_string_lossy());

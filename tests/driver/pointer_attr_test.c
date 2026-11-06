@@ -69,6 +69,25 @@ int main(void) {
         exit(1);
     }
 
+    // DEVICE_POINTER answers for the pointer it was asked about, not for the
+    // allocation. torch's caching allocator carves several tensors out of one
+    // block, and a caller that normalises a pointer through this attribute (Triton
+    // does it for every kernel argument) would otherwise address the first tensor
+    // for all of them.
+    CUdeviceptr self = 0;
+    CHECK(cuPointerGetAttribute(&self, CU_POINTER_ATTRIBUTE_DEVICE_POINTER, interior));
+    if (self != interior) {
+        fprintf(stderr, "FAIL: interior DEVICE_POINTER %p != queried %p\n",
+                (void *)self, (void *)interior);
+        exit(1);
+    }
+    CHECK(cuPointerGetAttribute(&self, CU_POINTER_ATTRIBUTE_DEVICE_POINTER, dptr));
+    if (self != dptr) {
+        fprintf(stderr, "FAIL: base DEVICE_POINTER %p != queried %p\n",
+                (void *)self, (void *)dptr);
+        exit(1);
+    }
+
     // --- host pinned pointer ---
     CHECK(cuMemAllocHost(&hptr, size));
     CUdeviceptr hdptr = 0;

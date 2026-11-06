@@ -46,10 +46,19 @@ impl PointerRegistry {
 }
 
 /// Write one attribute of `alloc` into `data`.
+///
+/// `queried` is the address the application asked about, which may be inside the
+/// allocation. The address attributes have to answer with the address that
+/// corresponds to THAT pointer, not with the allocation base: torch's caching
+/// allocator carves several tensors out of one 2 MiB block, and a caller that
+/// normalises a pointer through this attribute (Triton does it for every kernel
+/// argument) gets the first tensor's address back for all of them if the base is
+/// returned. The symptom is a kernel that computes into the wrong tensor.
 pub fn write_attribute(
     data: *mut c_void,
     attribute: u32,
     alloc: &Allocation,
+    queried: *mut c_void,
     dev_ordinal: i32,
 ) -> Result<(), CUresult> {
     if data == ptr::null_mut() {
@@ -74,11 +83,17 @@ pub fn write_attribute(
         MEMORY_TYPE => unsafe {
             *(data as *mut c_int) = if alloc.is_host { 1 } else { 2 };
         },
+        // The device pointer that corresponds to the queried address. A device
+        // allocation is directly addressable, and pinned host memory is mapped
+        // into the device's address space at the same address, so in both cases
+        // the answer is the queried pointer itself.
         DEVICE_POINTER => unsafe {
-            *(data as *mut *mut c_void) = alloc.base;
+            *(data as *mut *mut c_void) = queried;
         },
+        // The host pointer for a device pointer. Only a host allocation has one
+        // here, and again it is the queried address, not the block it sits in.
         HOST_POINTER => unsafe {
-            *(data as *mut *mut c_void) = if alloc.is_host { alloc.base } else { ptr::null_mut() };
+            *(data as *mut *mut c_void) = if alloc.is_host { queried } else { ptr::null_mut() };
         },
         IS_MANAGED => unsafe {
             *(data as *mut c_int) = 0;
@@ -115,7 +130,7 @@ let alloc = ctx
 .pointer_registry
             .find(ptr)
             .ok_or(CUresult::CUDA_ERROR_INVALID_VALUE)?;
-        write_attribute(data, attribute, alloc, dev_ordinal)
+        write_attribute(data, attribute, alloc, ptr, dev_ordinal)
 })??;
 Ok(())
 }
@@ -142,7 +157,7 @@ pub fn get_attributes(
         for i in 0..num_attributes as usize {
             let attr = unsafe { *attributes.add(i) };
             let data_i = unsafe { *data.add(i) };
-            write_attribute(data_i, attr, alloc, dev_ordinal)?;
+            write_attribute(data_i, attr, alloc, ptr, dev_ordinal)?;
         }
         Ok::<(), CUresult>(())
     })??;

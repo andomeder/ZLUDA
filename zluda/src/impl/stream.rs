@@ -147,13 +147,23 @@ impl StreamData {
     /// too (its barrier has been processed), or when it is the newest event and
     /// nothing waits on it yet.
     fn recycle_ready_front(&mut self) -> l0::Result<bool> {
-        if self.busy_events.is_empty() {
+        // ZLUDA_IDLE_SYNC_BARRIER=1 appends the barrier anyway, which is what
+        // this used to do: it is how the regression test below is shown to be
+        // able to fail.
+        if self.busy_events.is_empty()
+            && std::env::var_os("ZLUDA_IDLE_SYNC_BARRIER").is_none()
+        {
             return Ok(false);
         }
         if !self.busy_events.front().unwrap().0.is_ready()? {
             return Ok(false);
         }
-        if self.busy_events.len() > 1 && !self.busy_events.get(1).unwrap().0.is_ready()? {
+        // The command that waits on this event is `lag` commands later, so that
+        // is the one that has to have retired before the event is free. With
+        // lag 1 that is the immediate successor, which is the case the rule was
+        // written for; a larger lag makes the waiter further back.
+        let lag = super::wait_lag();
+        if self.busy_events.len() > lag && !self.busy_events.get(lag).unwrap().0.is_ready()? {
             return Ok(false);
         }
         let (event, marker) = self.busy_events.pop_front().unwrap();
@@ -209,6 +219,20 @@ impl StreamData {
 
     pub fn synchronize(&mut self) -> l0::Result<()> {
         let trace = std::env::var_os("ZLUDA_TRACE_STREAM").is_some();
+        // ZLUDA_IDLE_SYNC_BARRIER=1 appends the barrier anyway, which is what
+        // this used to do: it is how the regression test below is shown to be
+        // able to fail.
+        if self.busy_events.is_empty()
+            && std::env::var_os("ZLUDA_IDLE_SYNC_BARRIER").is_none()
+        {
+            // Nothing is queued on this stream, so there is nothing to wait
+            // for. It matters: a barrier appended with an empty wait list does
+            // not signal on this driver, so waiting on one stalls until the
+            // timeout - which is how a sync on an idle stream turned into a 60
+            // second hang with no work pending at all.
+            clear_pending_kernels();
+            return Ok(());
+        }
         let empty = [];
         let busy_event_arr = self.busy_events.back().map(|(ev, _)| [ev]);
         let wait_events = busy_event_arr.as_ref().map_or(&empty[..], |arr| &arr[..]);

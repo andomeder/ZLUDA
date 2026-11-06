@@ -365,6 +365,7 @@ impl GlobalState {
     fn lock_enqueue_staged(
         stream: *mut stream::Stream,
         keep_pending: usize,
+        wait_last: bool,
         f: impl FnOnce(
             &l0::CommandList,
             &l0::Event<'static>,
@@ -395,7 +396,26 @@ impl GlobalState {
                     stream_data.free_events.len()
                 );
             }
-            let prev_event = stream_data.get_last_event();
+            // Which earlier command a new one waits on. One means the command
+            // before it, and that round trip measured about 80 us per launch -
+            // a decode step of 2167 launches spent 212 ms queued against 40 ms
+            // with each launch run alone. Waiting `lag` commands back keeps a
+            // dependency chain (removing it entirely deadlocks the runtime) but
+            // lets that many commands be in flight instead of one.
+            // A launch whose arguments were just copied into a buffer has to
+            // wait for that copy, which is the most recent command, so it takes
+            // the immediate predecessor regardless of the lag.
+            let lag = if wait_last { 1 } else { wait_lag() };
+            let prev_event = if lag <= 1 {
+                stream_data.get_last_event()
+            } else {
+                let len = stream_data.busy_events.len();
+                if len >= lag {
+                    stream_data.busy_events.get(len - lag).map(|(event, _)| event)
+                } else {
+                    None
+                }
+            };
             let prev_event_array = prev_event.map(|e| [e]);
             let empty = [];
             let prev_event_slice = prev_event_array.as_ref().map_or(&empty[..], |arr| &arr[..]);
@@ -422,6 +442,15 @@ impl GlobalState {
 // TODO: implement
 fn is_intel_gpu_driver(_: &l0::Driver) -> bool {
     true
+}
+
+/// How many commands back a new command waits on (ZLUDA_WAIT_LAG, default 1).
+pub fn wait_lag() -> usize {
+    std::env::var("ZLUDA_WAIT_LAG")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value >= 1)
+        .unwrap_or(1)
 }
 
 pub fn init() -> Result<(), CUresult> {

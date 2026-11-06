@@ -163,8 +163,8 @@ pub fn launch_kernel(
     };
     let timing = std::env::var_os("ZLUDA_TRACE_LAUNCH_MS").is_some();
     let t_enter = std::time::Instant::now();
-    GlobalState::lock_enqueue_staged(hstream, keep_pending, |cmd_list, signal, wait| {
-        let t_locked = t_enter.elapsed();
+    let wait_last = param_block.is_some();
+    GlobalState::lock_enqueue_staged(hstream, keep_pending, wait_last, |cmd_list, signal, wait| {
         let func: &mut FunctionData = match unsafe { &mut *f }.as_result_mut() {
             Ok(func) => func,
             Err(e) => {
@@ -194,13 +194,7 @@ pub fn launch_kernel(
                         eprintln!("launch: staged block {:p} for {}", block, func.name.to_string_lossy());
                     }
                     param_block = Some(block);
-                    if timing {
-                        eprintln!(
-                            "launch ms: lock {:.3} stage {:.3}",
-                            t_locked.as_secs_f64() * 1e3,
-                            t_stage_start.elapsed().as_secs_f64() * 1e3
-                        );
-                    }
+                    let _ = &t_stage_start;
                 }
                 Err(error) => {
                     eprintln!(
@@ -345,14 +339,6 @@ pub fn launch_kernel(
                 return Err(e.into());
             }
         }
-        if timing {
-            eprintln!(
-                "launch ms: total {:.3} (lock {:.3}) {}",
-                t_enter.elapsed().as_secs_f64() * 1e3,
-                t_locked.as_secs_f64() * 1e3,
-                func.name.to_string_lossy()
-            );
-        }
         Ok::<_, CUresult>(())
     })
     .map_err(|error| {
@@ -379,6 +365,17 @@ pub fn launch_kernel(
     }
     if std::env::var_os("ZLUDA_SYNC_LAUNCH").is_some() {
         crate::r#impl::stream::synchronize(hstream)?;
+    }
+    if timing {
+        // Printed last, so with ZLUDA_SYNC_LAUNCH the number is the kernel's own
+        // time: the sync above does not return until it retired.
+        if let Ok(func) = unsafe { &mut *f }.as_result_mut() {
+            eprintln!(
+                "launch ms: {:.3} {}",
+                t_enter.elapsed().as_secs_f64() * 1e3,
+                func.name.to_string_lossy()
+            );
+        }
     }
     Ok(())
 }

@@ -34,6 +34,8 @@ pub struct ModuleData {
     /// The kernels whose arguments do not fit in the parameter list, with the
     /// layout of the buffer they read them from instead.
     pub param_buffers: HashMap<String, super::param_buffer::ParamBuffer>,
+    /// The kernels whose shared-memory need is provable from their PTX.
+    pub shared_bounds: HashMap<String, super::shared_window::SharedBound>,
     pub device_binaries: HashMap<device::Index, CompiledModules>,
 }
 
@@ -60,6 +62,9 @@ pub struct TranslatedKernel {
     /// Set when the kernel reads its arguments from a buffer instead of the
     /// parameter list, because the list is larger than the compiler allows.
     pub param_buffer: Option<super::param_buffer::ParamBuffer>,
+    /// How much shared memory the kernel can address, when that is provable
+    /// from its PTX; the launch uses it instead of the declared size.
+    pub shared_bound: Option<super::shared_window::SharedBound>,
     /// The kernel calls into the PTX implementation module, which has to be
     /// linked in; the others are built on their own.
     pub need_ptx_impl: bool,
@@ -269,6 +274,8 @@ impl SpirvModule {
             Some((rewritten, layout)) => (rewritten, Some(layout)),
             None => (split, None),
         };
+        // What the kernel can address in shared memory, when its PTX proves it.
+        let shared_bound = super::shared_window::bound(&split);
         let trace = std::env::var_os("ZLUDA_TRACE_LIBRARY").is_some();
         let mut errors = Vec::new();
         let ast = ptx::ModuleParser::new()
@@ -319,6 +326,7 @@ impl SpirvModule {
         Ok(TranslatedKernel {
             binary,
             param_buffer,
+            shared_bound,
             need_ptx_impl: spirv_module.should_link_ptx_impl.is_some(),
             ptx_impl: spirv_module.should_link_ptx_impl,
             info,
@@ -477,6 +485,9 @@ pub fn get_function(
             if let Some(layout) = translated.param_buffer.clone() {
                 module.param_buffers.insert(kernel_name.clone(), layout);
             }
+            if let Some(bound) = translated.shared_bound {
+                module.shared_bounds.insert(kernel_name.clone(), bound);
+            }
             module.kernel_info.insert(kernel_name.clone(), translated.info);
         }
         let kernel_info = module
@@ -522,6 +533,7 @@ pub fn get_function(
             param_buffer: module.param_buffers.get(&kernel_name).cloned(),
             use_shared_mem: kernel_info.uses_shared_mem,
             shared_mem_prefix: kernel_info.shared_mem_prefix,
+            shared_bound: module.shared_bounds.get(&kernel_name).copied(),
             properties: None,
             legacy_args: LegacyArguments::new(),
             name: name.clone(),
@@ -677,6 +689,7 @@ pub fn load_data_impl(pmod: *mut *mut Module, spirv_data: SpirvModule) -> Result
             spirv: spirv_data,
             kernel_info: HashMap::new(),
             param_buffers: HashMap::new(),
+            shared_bounds: HashMap::new(),
             device_binaries,
         };
         Ok::<_, CUresult>(module_data)

@@ -1,0 +1,55 @@
+.version 8.7
+.target sm_75
+.address_size 64
+
+// Two kernels that both declare a 32 KB shared window, which is the size a
+// lifted kernel inherits from its module. One addresses it only at constant
+// offsets, so the driver can prove how much of it is reachable and asks for
+// that instead; the other indexes it by blockIdx, which no launch-independent
+// size bounds, so the driver has to keep the declared size.
+.extern .shared .align 16 .b8 shared_mem[32768];
+
+// bound(.b32 words [0, 64) of the window) -> the driver may ask for 64 bytes.
+.visible .entry shared_bound_const(.param .u64 out)
+{
+	.reg .b32 %r<4>;
+	.reg .b64 %rd<4>;
+
+	ld.param.u64 %rd1, [out];
+	mov.b64 %rd2, shared_mem;
+	mov.u32 %r1, 0;
+	st.volatile.shared.b32 [%rd2+0], %r1;
+	add.u32 %r1, %r1, 1;
+	st.volatile.shared.b32 [%rd2+4], %r1;
+	add.u32 %r1, %r1, 1;
+	st.volatile.shared.b32 [%rd2+56], %r1;
+	add.u32 %r1, %r1, 1;
+	st.volatile.shared.b32 [%rd2+60], %r1;
+	bar.sync 0;
+	ld.volatile.shared.b32 %r2, [%rd2+56];
+	ld.volatile.shared.b32 %r3, [%rd2+60];
+	add.s32 %r2, %r2, %r3;
+	st.global.b32 [%rd1], %r2;
+	ret;
+}
+
+// The same window indexed by the block, which is not bounded by anything the
+// launch knows: the declared size has to stay.
+.visible .entry shared_bound_ctaid(.param .u64 out)
+{
+	.reg .b32 %r<6>;
+	.reg .b64 %rd<6>;
+
+	ld.param.u64 %rd1, [out];
+	mov.b64 %rd2, shared_mem;
+	mov.u32 %r1, %ctaid.x;
+	shl.b32 %r2, %r1, 2;
+	cvt.u64.u32 %rd3, %r2;
+	add.s64 %rd4, %rd2, %rd3;
+	mov.u32 %r3, 7;
+	st.volatile.shared.b32 [%rd4], %r3;
+	bar.sync 0;
+	ld.volatile.shared.b32 %r4, [%rd4];
+	st.global.b32 [%rd1], %r4;
+	ret;
+}

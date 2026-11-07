@@ -17,6 +17,7 @@ pub static TRACE_FUNC: OnceLock<bool> = OnceLock::new();
 pub static TRACE_STAGE: OnceLock<bool> = OnceLock::new();
 pub static TRACE_STREAM: OnceLock<bool> = OnceLock::new();
 pub static TRACE_LAUNCH_MS: OnceLock<bool> = OnceLock::new();
+pub static TRACE_SHARED: OnceLock<bool> = OnceLock::new();
 pub static PARAM_BLOCKING: OnceLock<bool> = OnceLock::new();
 pub static PARAM_HOST: OnceLock<bool> = OnceLock::new();
 pub static NO_LAUNCH_WAIT: OnceLock<bool> = OnceLock::new();
@@ -81,6 +82,13 @@ pub fn idle_sync_barrier() -> bool {
 /// ZLUDA_RECORD_WAIT=1 makes cuEventRecord wait on the stream's last event.
 pub fn record_wait() -> bool {
     flag(&RECORD_WAIT, "ZLUDA_RECORD_WAIT")
+}
+
+/// ZLUDA_TRACE_SHARED=1 prints the shared memory a launch asks the engine for,
+/// split into the prefix the kernel's own addressing assumes and the
+/// application's own dynamic request.
+pub fn trace_shared() -> bool {
+    flag(&TRACE_SHARED, "ZLUDA_TRACE_SHARED")
 }
 
 /// ZLUDA_DUMP_PARAMS=<substring> prints the bytes of every argument of a launch

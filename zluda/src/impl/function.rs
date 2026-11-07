@@ -36,6 +36,10 @@ pub struct FunctionData {
     /// window: a lifted kernel declares its whole shared memory as one symbol,
     /// and the static part of it becomes the prefix.
     pub shared_mem_prefix: usize,
+    /// What the kernel can actually address, when its PTX proves it: the
+    /// declared prefix above is the size of the symbol, which is the module's
+    /// static shared size and can be many times what the kernel touches.
+    pub shared_bound: Option<super::shared_window::SharedBound>,
     pub properties: Option<Box<l0::sys::ze_kernel_properties_t>>,
     pub legacy_args: LegacyArguments,
     /// The name the kernel was looked up with, for the launch trace.
@@ -119,6 +123,7 @@ pub fn launch_kernel(
             );
         }
     }
+    let shared_trace = super::diag::trace_shared();
     // A kernel whose arguments do not fit in the parameter list reads them from
     // a buffer. Gathering the bytes is plain host work; filling a buffer here
     // rather than inside the lock is deliberate, because a device allocation
@@ -302,13 +307,45 @@ pub fn launch_kernel(
                 func.arg_size.len()
             };
             // The application asks for its own dynamic shared memory; the
-            // prefix the kernel assumes sits in front of it.
-            let dynamic_shared = shared_mem_bytes as usize + func.shared_mem_prefix;
+            // prefix the kernel assumes sits in front of it. The declared
+            // prefix is the size of the shared symbol, which for a lifted
+            // kernel is the whole module's static shared size, so it can be
+            // many times what the kernel addresses. When the PTX proves a
+            // bound, that bound is what decides - never below the
+            // application's own request, never above the declared window.
+            let declared_window = shared_mem_bytes as usize + func.shared_mem_prefix;
+            let window = match func.shared_bound {
+                Some(bound) => {
+                    let threads = block_dim_x as u64 * block_dim_y as u64 * block_dim_z as u64;
+                    let needed = bound.bytes(threads) as usize;
+                    declared_window.min(needed.max(shared_mem_bytes as usize))
+                }
+                None => declared_window,
+            };
+            if shared_trace {
+                eprintln!(
+                    "shared: {} prefix={} app={} total={} declared={} bound={:?}{}",
+                    func.name.to_string_lossy(),
+                    func.shared_mem_prefix,
+                    shared_mem_bytes,
+                    window,
+                    declared_window,
+                    func.shared_bound,
+                    if window < declared_window { " narrowed" } else { "" }
+                );
+            }
             let t = trace.start();
             unsafe {
-                func.base.set_arg_raw(own_parameters as u32, dynamic_shared, ptr::null())?
+                func.base.set_arg_raw(own_parameters as u32, window, ptr::null())?
             };
             trace.add(t, |t| &t.shared);
+        } else if shared_trace {
+            eprintln!(
+                "shared: {} prefix=0 app={} total={} (no window)",
+                func.name.to_string_lossy(),
+                shared_mem_bytes,
+                shared_mem_bytes
+            );
         }
         let t = trace.start();
         if let Err(e) = func.base.set_group_size(block_dim_x, block_dim_y, block_dim_z) {

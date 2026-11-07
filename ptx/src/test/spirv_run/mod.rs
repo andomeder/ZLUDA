@@ -20,13 +20,22 @@ use std::{cmp, collections::hash_map::Entry};
 
 macro_rules! test_ptx {
     ($fn_name:ident, $input:expr, $output:expr) => {
+        test_ptx_threads!($fn_name, 1u32, $input, $output);
+    };
+}
+
+// Same as test_ptx!, for a kernel that needs more than one thread: the masks a
+// warp computes only differ from each other at the last lane, and the device
+// harness launches a single thread by default.
+macro_rules! test_ptx_threads {
+    ($fn_name:ident, $threads:expr, $input:expr, $output:expr) => {
         paste::item! {
             #[test]
             fn [<$fn_name _ptx>]() -> Result<(), Box<dyn std::error::Error>> {
                 let ptx = include_str!(concat!(stringify!($fn_name), ".ptx"));
                 let input = $input;
                 let mut output = $output;
-                test_ptx_assert(stringify!($fn_name), ptx, &input, &mut output)
+                test_ptx_assert(stringify!($fn_name), ptx, &input, &mut output, $threads)
             }
         }
 
@@ -182,6 +191,30 @@ test_ptx!(
 );
 test_ptx!(non_scalar_ptr_offset, [1u32, 2u32, 3u32, 4u32], [7u32]);
 test_ptx!(stateful_neg_offset, [1237518u64], [1237518u64]);
+// lane_masks: %lanemask_le and %lanemask_gt for every lane of one warp, so the
+// last lane is covered. le at lane 31 is all ones; building it as
+// (1 << (lane + 1)) - 1 makes that a shift by 32, which PTX defines as 0 and
+// SPIR-V leaves undefined.
+const LANE_MASKS: [u64; 64] = [
+    1u64, 4294967294u64, 3u64, 4294967292u64,
+    7u64, 4294967288u64, 15u64, 4294967280u64,
+    31u64, 4294967264u64, 63u64, 4294967232u64,
+    127u64, 4294967168u64, 255u64, 4294967040u64,
+    511u64, 4294966784u64, 1023u64, 4294966272u64,
+    2047u64, 4294965248u64, 4095u64, 4294963200u64,
+    8191u64, 4294959104u64, 16383u64, 4294950912u64,
+    32767u64, 4294934528u64, 65535u64, 4294901760u64,
+    131071u64, 4294836224u64, 262143u64, 4294705152u64,
+    524287u64, 4294443008u64, 1048575u64, 4293918720u64,
+    2097151u64, 4292870144u64, 4194303u64, 4290772992u64,
+    8388607u64, 4286578688u64, 16777215u64, 4278190080u64,
+    33554431u64, 4261412864u64, 67108863u64, 4227858432u64,
+    134217727u64, 4160749568u64, 268435455u64, 4026531840u64,
+    536870911u64, 3758096384u64, 1073741823u64, 3221225472u64,
+    2147483647u64, 2147483648u64, 4294967295u64, 0u64,
+];
+test_ptx_threads!(lane_masks, 32u32, [0u64], LANE_MASKS);
+
 // The mask of the lanes still active: one thread runs, so it is 1, not the
 // all-lanes mask a hardcoded expansion would report.
 test_ptx!(active_mask, [0u64], [1u64]);
@@ -213,13 +246,14 @@ fn test_ptx_assert<
     ptx_text: &'a str,
     input: &[Input],
     output: &mut [Output],
+    threads: u32,
 ) -> Result<(), Box<dyn error::Error + 'a>> {
     let mut errors = Vec::new();
     let ast = ptx::ModuleParser::new().parse(&mut errors, ptx_text)?;
     assert!(errors.len() == 0);
     let zluda_module = translate::to_spirv_module(ast)?;
     let name = CString::new(name)?;
-    let result = run_spirv(name.as_c_str(), zluda_module, input, output)
+    let result = run_spirv(name.as_c_str(), zluda_module, input, output, threads)
         .map_err(|err| DisplayError { err })?;
     assert_eq!(result.as_slice(), output);
     Ok(())
@@ -230,6 +264,7 @@ fn run_spirv<Input: From<u8> + Copy + Debug, Output: From<u8> + Copy + Debug + D
     module: translate::Module,
     input: &[Input],
     output: &mut [Output],
+    threads: u32,
 ) -> ze::Result<Vec<Output>> {
     ze::init()?;
     let spirv = module.spirv.assemble();
@@ -308,7 +343,7 @@ fn run_spirv<Input: From<u8> + Copy + Debug, Output: From<u8> + Copy + Debug + D
         )?;
         {
             let init_evs = [&ev0, &ev1];
-            kernel.set_group_size(1, 1, 1)?;
+            kernel.set_group_size(threads, 1, 1)?;
             kernel.set_arg_buffer(0, &inp_b)?;
             kernel.set_arg_buffer(1, &out_b)?;
             if use_shared_mem {
@@ -317,7 +352,7 @@ fn run_spirv<Input: From<u8> + Copy + Debug, Output: From<u8> + Copy + Debug + D
             ze::CommandListBuilder::new(&ctx, dev)?
                 .append_memory_copy(&inp_b, input, Some(&init_evs[0]), &[])?
                 .append_memory_fill(&out_b, &Output::default(), Some(&init_evs[1]), &[])?
-                .append_launch_kernel(&kernel, &[1, 1, 1], Some(&ev2), &init_evs)?
+                .append_launch_kernel(&kernel, &[threads, 1, 1], Some(&ev2), &init_evs)?
                 .append_memory_copy(&*result, &out_b, None, &[&ev2])?
                 .execute(&queue)?;
         }

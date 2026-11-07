@@ -1,0 +1,38 @@
+.version 6.5
+.target sm_70
+.address_size 64
+
+// The lane masks a warp computes, one warp's worth, so lane 31 is covered.
+//
+// lanemask_le is the mask of the lanes up to and including this one and
+// lanemask_gt its complement. At lane 31 le must be all ones; a translator that
+// builds it as (1 << (lane + 1)) - 1 shifts by 32 there, which PTX defines as 0
+// but SPIR-V leaves undefined, and a backend that masks the count to 5 bits
+// resolves it as (1 << 0) - 1 = 0. gatherTopK ranks a lane by
+// popc(lanemask_le & ballot), so at lane 31 that collapsed the rank to 0, two
+// lanes wrote the same output slot and one element of the top k was lost.
+//
+// The device harness launches `threads` threads of one block by default, but
+// this test asks for a full warp because a single thread only ever sees lane 0.
+//
+// output[lane * 2 + 0] = lanemask_le   output[lane * 2 + 1] = lanemask_gt
+.visible .entry lane_masks(
+	.param .u64 input,
+	.param .u64 output
+)
+{
+	.reg .b32 %r<4>;
+	.reg .b64 %rd<6>;
+
+	ld.param.u64 %rd1, [output];
+	mov.u32 %r1, %tid.x;
+	mov.u32 %r2, %lanemask_le;
+	mov.u32 %r3, %lanemask_gt;
+	mul.wide.u32 %rd2, %r1, 16;
+	add.s64 %rd3, %rd1, %rd2;
+	cvt.u64.u32 %rd4, %r2;
+	st.u64 [%rd3], %rd4;
+	cvt.u64.u32 %rd5, %r3;
+	st.u64 [%rd3+8], %rd5;
+	ret;
+}

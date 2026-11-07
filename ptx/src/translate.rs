@@ -1690,9 +1690,16 @@ fn to_ssa<'input, 'b>(
 
 /// Lower a `%lanemask_*` read into the shifts of the lane id that produce
 /// the mask. The mask covers the 32 lanes of a warp:
-///   lt: (1 << lane) - 1        le: (1 << (lane + 1)) - 1
-///   eq:  1 << lane             ge: ~((1 << lane) - 1)
-///   gt: ~((1 << (lane + 1)) - 1)
+///   eq: 1 << lane              lt: (1 << lane) - 1
+///   le: lt | eq                ge: ~lt
+///   gt: ~le
+///
+/// The one shift is by the lane id, which is always below the width. Writing
+/// le as "1 << (lane + 1)" instead was a bug: at lane 31 that is a shift by 32,
+/// which PTX defines as 0 but SPIR-V leaves undefined, and the backend resolved
+/// it as a shift by 0 - so the mask came out 0 instead of all ones and every
+/// lane-31 computation that used it was wrong. Measured on the B580 against an
+/// RTX 2070; `tmp/harness/topkdiag/` has the probe.
 fn expand_lane_mask(
     numeric_id_defs: &mut NumericIdResolver,
     mask: PtxSpecialRegister,
@@ -1721,95 +1728,89 @@ fn expand_lane_mask(
         typ: ast::ScalarType::U32,
         value: ast::ImmediateValue::U64(1),
     }));
-    // le and gt count one lane further than lt and ge.
-    let shift_amount = if matches!(
-        mask,
-        PtxSpecialRegister::LanemaskLe | PtxSpecialRegister::LanemaskGt
-    ) {
-        let next = numeric_id_defs.register_intermediate(Some((
-            ast::Type::Scalar(ast::ScalarType::U32),
-            ast::StateSpace::Reg,
-        )));
-        out.push(Statement::Instruction(ast::Instruction::Add(
-            ast::ArithDetails::Unsigned(ast::ScalarType::U32),
-            ast::Arg3 {
-                dst: TypedOperand::Reg(next),
-                src1: TypedOperand::Reg(lane),
-                src2: TypedOperand::Imm(ast::ImmediateValue::U64(1)),
-            },
-        )));
-        next
-    } else {
-        lane
-    };
-    let shifted = numeric_id_defs
+    // eq = 1 << lane, the only shift any of the masks needs.
+    let eq = numeric_id_defs
         .register_intermediate(Some((ast::Type::Scalar(ast::ScalarType::U32), ast::StateSpace::Reg)));
     out.push(Statement::Instruction(ast::Instruction::Shl(
         ast::ScalarType::U32,
         ast::Arg3 {
-            dst: TypedOperand::Reg(shifted),
+            dst: TypedOperand::Reg(eq),
             src1: TypedOperand::Reg(one),
-            src2: TypedOperand::Reg(shift_amount),
+            src2: TypedOperand::Reg(lane),
         },
     )));
-    match mask {
-        PtxSpecialRegister::LanemaskEq => {
-            out.push(Statement::Conversion(ImplicitConversion {
-                src: shifted,
-                dst,
-                from_type: ast::Type::Scalar(ast::ScalarType::U32),
-                from_space: ast::StateSpace::Reg,
-                to_type: ast::Type::Scalar(typ),
-                to_space: ast::StateSpace::Reg,
-                kind: ConversionKind::Default,
-            }));
-        }
+    fn u32_reg() -> Option<(ast::Type, ast::StateSpace)> {
+        Some((
+            ast::Type::Scalar(ast::ScalarType::U32),
+            ast::StateSpace::Reg,
+        ))
+    }
+    let value = match mask {
+        PtxSpecialRegister::LanemaskEq => eq,
         PtxSpecialRegister::LanemaskLt | PtxSpecialRegister::LanemaskLe | PtxSpecialRegister::LanemaskGe
         | PtxSpecialRegister::LanemaskGt => {
-            let minus_one = numeric_id_defs.register_intermediate(Some((
-                ast::Type::Scalar(ast::ScalarType::U32),
-                ast::StateSpace::Reg,
-            )));
+            // lt = eq - 1
+            let lt = numeric_id_defs.register_intermediate(u32_reg());
             out.push(Statement::Instruction(ast::Instruction::Sub(
                 ast::ArithDetails::Unsigned(ast::ScalarType::U32),
                 ast::Arg3 {
-                    dst: TypedOperand::Reg(minus_one),
-                    src1: TypedOperand::Reg(shifted),
+                    dst: TypedOperand::Reg(lt),
+                    src1: TypedOperand::Reg(eq),
                     src2: TypedOperand::Imm(ast::ImmediateValue::U64(1)),
                 },
             )));
-            // ge and gt are the complement of lt and le.
-            let value = if matches!(
-                mask,
-                PtxSpecialRegister::LanemaskGe | PtxSpecialRegister::LanemaskGt
-            ) {
-                let inverted = numeric_id_defs.register_intermediate(Some((
-                    ast::Type::Scalar(ast::ScalarType::U32),
-                    ast::StateSpace::Reg,
-                )));
-                out.push(Statement::Instruction(ast::Instruction::Not(
-                    ast::ScalarType::U32,
-                    ast::Arg2 {
-                        dst: TypedOperand::Reg(inverted),
-                        src: TypedOperand::Reg(minus_one),
-                    },
-                )));
-                inverted
-            } else {
-                minus_one
-            };
-            out.push(Statement::Conversion(ImplicitConversion {
-                src: value,
-                dst,
-                from_type: ast::Type::Scalar(ast::ScalarType::U32),
-                from_space: ast::StateSpace::Reg,
-                to_type: ast::Type::Scalar(typ),
-                to_space: ast::StateSpace::Reg,
-                kind: ConversionKind::Default,
-            }));
+            match mask {
+                PtxSpecialRegister::LanemaskLt => lt,
+                PtxSpecialRegister::LanemaskGe => {
+                    // ge = ~lt
+                    let ge = numeric_id_defs.register_intermediate(u32_reg());
+                    out.push(Statement::Instruction(ast::Instruction::Not(
+                        ast::ScalarType::U32,
+                        ast::Arg2 {
+                            dst: TypedOperand::Reg(ge),
+                            src: TypedOperand::Reg(lt),
+                        },
+                    )));
+                    ge
+                }
+                _ => {
+                    // le = lt | eq, and gt is its complement.
+                    let le = numeric_id_defs.register_intermediate(u32_reg());
+                    out.push(Statement::Instruction(ast::Instruction::Or(
+                        ast::ScalarType::U32,
+                        ast::Arg3 {
+                            dst: TypedOperand::Reg(le),
+                            src1: TypedOperand::Reg(lt),
+                            src2: TypedOperand::Reg(eq),
+                        },
+                    )));
+                    if matches!(mask, PtxSpecialRegister::LanemaskLe) {
+                        le
+                    } else {
+                        let gt = numeric_id_defs.register_intermediate(u32_reg());
+                        out.push(Statement::Instruction(ast::Instruction::Not(
+                            ast::ScalarType::U32,
+                            ast::Arg2 {
+                                dst: TypedOperand::Reg(gt),
+                                src: TypedOperand::Reg(le),
+                            },
+                        )));
+                        gt
+                    }
+                }
+            }
         }
         _ => unreachable!(),
-    }
+    };
+    out.push(Statement::Conversion(ImplicitConversion {
+        src: value,
+        dst,
+        from_type: ast::Type::Scalar(ast::ScalarType::U32),
+        from_space: ast::StateSpace::Reg,
+        to_type: ast::Type::Scalar(typ),
+        to_space: ast::StateSpace::Reg,
+        kind: ConversionKind::Default,
+    }));
     Ok(())
 }
 
@@ -4657,6 +4658,15 @@ fn emit_function_body_ops(
 
 // HACK ALERT
 // For some reason IGC fails linking if the value and shift size are of different type
+//
+// Note for `shl` and `shr.u`: PTX defines a count at or past the register width
+// as zero, SPIR-V leaves the result of OpShiftLeftLogical undefined there, so a
+// backend may mask the count instead - and this one does, differently depending
+// on how the instruction is spelled. `%lanemask_le` used to be written as
+// (1 << (lane + 1)) - 1 and came out 0 at lane 31 for exactly this reason. No
+// lifted kernel in the corpus shifts by a constant that wide, but a register
+// count can be, so anything that relies on the zero has to clamp or select for
+// it rather than assuming the backend will.
 fn insert_shift_hack(
     builder: &mut dr::Builder,
     map: &mut TypeWordMap,

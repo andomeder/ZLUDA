@@ -1505,6 +1505,15 @@ fn emit_capabilities(builder: &mut dr::Builder) {
     builder.capability(spirv::Capability::SubgroupShuffleINTEL);
     builder.capability(spirv::Capability::GroupNonUniformVote);
     builder.capability(spirv::Capability::GroupNonUniformBallot);
+    // A kernel that needs the whole 32 lane warp declares
+    // `OpExecutionMode SubgroupSize 32`, and that execution mode formally requires
+    // this capability. It is declared unconditionally because a module may hold
+    // several kernels and the capability is a module-level declaration; it has no
+    // effect on a module whose kernels do not use the mode.
+    builder.capability(spirv::Capability::SubgroupDispatch);
+    // The bitwise warp reductions (`redux.sync.or/and/xor`) lower to the group
+    // non-uniform bitwise operations, which are declared under this capability.
+    builder.capability(spirv::Capability::GroupNonUniformArithmetic);
     // bfe / bfi are lowered to the bit field operations, which formally need the
     // BitInstructions capability. The bundled SPIR-V headers predate it and a
     // capability cannot be named by number (the builder rejects the value), so a
@@ -4359,22 +4368,62 @@ fn emit_function_body_ops(
                     let result_type = map.get_or_add_scalar(builder, ast::ScalarType::from(*typ));
                     let signed = typ.kind() == ast::ScalarKind::Signed;
                     if typ.size_of() <= 4 {
+                        // Shifts rather than OpBitFieldExtract: that opcode formally
+                        // requires the BitInstructions capability, which the bundled
+                        // SPIR-V headers predate, and a capability cannot be named by
+                        // number (the builder rejects the value). IGC accepts the
+                        // undeclared form but spirv-val does not, so the 32-bit case
+                        // uses the same shift form as the 64-bit one below. Every
+                        // shift amount is clamped below the width first, so no shift
+                        // is undefined.
+                        let width: u32 = 32;
+                        let u_type = map.get_or_add_scalar(builder, ast::ScalarType::U32);
+                        let s_type = map.get_or_add_scalar(builder, ast::ScalarType::S32);
+                        let c = |builder: &mut dr::Builder, map: &mut TypeWordMap, v: u32| {
+                            map.get_or_add_constant(
+                                builder,
+                                &ast::Type::Scalar(ast::ScalarType::U32),
+                                &vec_repr(v),
+                            )
+                        };
+                        let c31 = c(builder, map, 31)?;
+                        let c32 = c(builder, map, 32)?;
+                        let c1 = c(builder, map, 1)?;
+                        let all_ones = c(builder, map, u32::MAX)?;
+                        let zero = c(builder, map, 0)?;
+                        let bool_type = map.get_or_add_scalar(builder, ast::ScalarType::Pred);
+                        // The field width, clamped to the register width.
+                        let len_wide = arg.src3;
+                        let over =
+                            builder.u_greater_than_equal(bool_type, None, len_wide, c32)?;
+                        let len_clamped =
+                            builder.select(u_type, None, over, c32, len_wide)?;
+                        let len_low = builder.bitwise_and(u_type, None, len_clamped, c31)?;
+                        let one_shifted =
+                            builder.shift_left_logical(u_type, None, c1, len_low)?;
+                        let mask = builder.i_sub(u_type, None, one_shifted, c1)?;
+                        let mask = builder.select(u_type, None, over, all_ones, mask)?;
+                        // The bit position; a position at or past the width yields 0.
+                        let pos_wide = arg.src2;
+                        let pos_low = builder.bitwise_and(u_type, None, pos_wide, c31)?;
+                        let shifted =
+                            builder.shift_right_logical(u_type, None, arg.src1, pos_low)?;
+                        let pos_over =
+                            builder.u_greater_than_equal(bool_type, None, pos_wide, c32)?;
+                        let shifted = builder.select(u_type, None, pos_over, zero, shifted)?;
+                        let masked = builder.bitwise_and(u_type, None, shifted, mask)?;
                         if signed {
-                            builder.bit_field_s_extract(
-                                result_type,
-                                Some(arg.dst),
-                                arg.src1,
-                                arg.src2,
-                                arg.src3,
-                            )?;
+                            // Sign-extend the field: shift its top bit up, then
+                            // arithmetic-shift back.
+                            let back = builder.i_sub(u_type, None, c32, len_clamped)?;
+                            let top = builder.shift_left_logical(u_type, None, masked, back)?;
+                            let top = builder.bitcast(s_type, None, top)?;
+                            let extended =
+                                builder.shift_right_arithmetic(s_type, None, top, back)?;
+                            let extended = builder.bitcast(u_type, None, extended)?;
+                            builder.copy_object(result_type, Some(arg.dst), extended)?;
                         } else {
-                            builder.bit_field_u_extract(
-                                result_type,
-                                Some(arg.dst),
-                                arg.src1,
-                                arg.src2,
-                                arg.src3,
-                            )?;
+                            builder.copy_object(result_type, Some(arg.dst), masked)?;
                         }
                     } else {
                         let width: u32 = 64;

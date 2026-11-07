@@ -11,6 +11,7 @@
                OpCapability SubgroupShuffleINTEL
                OpCapability GroupNonUniformVote
                OpCapability GroupNonUniformBallot
+               OpCapability SubgroupDispatch
                OpExtension "SPV_INTEL_kernel_attributes"
                OpExtension "SPV_INTEL_subgroups"
          %35 = OpExtInstImport "OpenCL.std"
@@ -28,6 +29,12 @@
       %uchar = OpTypeInt 8 0
 %_ptr_Generic_uchar = OpTypePointer Generic %uchar
     %ulong_8 = OpConstant %ulong 8
+    %uint_31 = OpConstant %uint 31
+    %uint_32 = OpConstant %uint 32
+     %uint_1 = OpConstant %uint 1
+%uint_4294967295 = OpConstant %uint 4294967295
+     %uint_0 = OpConstant %uint 0
+       %bool = OpTypeBool
           %1 = OpFunction %void None %38
           %9 = OpFunctionParameter %ulong
          %10 = OpFunctionParameter %ulong
@@ -66,7 +73,18 @@
          %20 = OpLoad %uint %6
          %21 = OpLoad %uint %7
          %22 = OpLoad %uint %8
-         %19 = OpBitFieldUExtract %uint %20 %21 %22
+         %55 = OpUGreaterThanEqual %bool %22 %uint_32
+         %56 = OpSelect %uint %55 %uint_32 %22
+         %57 = OpBitwiseAnd %uint %56 %uint_31
+         %58 = OpShiftLeftLogical %uint %uint_1 %57
+         %59 = OpISub %uint %58 %uint_1
+         %60 = OpSelect %uint %55 %uint_4294967295 %59
+         %61 = OpBitwiseAnd %uint %21 %uint_31
+         %62 = OpShiftRightLogical %uint %20 %61
+         %63 = OpUGreaterThanEqual %bool %21 %uint_32
+         %64 = OpSelect %uint %63 %uint_0 %62
+         %65 = OpBitwiseAnd %uint %64 %60
+         %19 = OpCopyObject %uint %65
                OpStore %6 %19
          %23 = OpLoad %ulong %5
          %24 = OpLoad %uint %6

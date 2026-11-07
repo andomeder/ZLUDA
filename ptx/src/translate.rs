@@ -3594,40 +3594,8 @@ fn emit_function_body_ops(
             Statement::Instruction(inst) => match inst {
                 ast::Instruction::Abs(d, arg) => emit_abs(builder, map, opencl, d, arg)?,
                 ast::Instruction::Call(_) => unreachable!(),
-                // A memory barrier: OpMemoryBarrier with the semantics of the
-                // barrier and acquire-release ordering.
-                //
-                // The scope is always Device, even for `membar.cta`. This
-                // backend does not compile `ld.volatile` into an uncached
-                // read, so the fence is the only thing that makes another
-                // workgroup's store visible to a workgroup polling for it,
-                // and a workgroup-scope fence does not order memory across
-                // workgroups. CUB's device-wide scan is exactly that shape:
-                // it polls a tile descriptor until its predecessor publishes
-                // an inclusive prefix. With the PTX scope, torch.cumsum over
-                // 100000 int64 was wrong in 5 runs of 12 on the Arc B580 -
-                // the window never saw the write, walked off the tile-state
-                // array and faulted 2 MiB below it - and with a device-scope
-                // fence it was 12 of 12 exact. A device fence is a superset
-                // of the one PTX asks for, so this synchronises more than
-                // the program requires rather than changing what it means.
-                ast::Instruction::Membar(_) => {
-                    let scope_id = map.get_or_add_constant(
-                        builder,
-                        &ast::Type::Scalar(ast::ScalarType::U32),
-                        &vec_repr(ast::MemScope::Gpu.to_spirv() as u32),
-                    )?;
-                    let semantics_id = map.get_or_add_constant(
-                        builder,
-                        &ast::Type::Scalar(ast::ScalarType::U32),
-                        &vec_repr(
-                            spirv::MemorySemantics::ACQUIRE_RELEASE
-                                | spirv::MemorySemantics::WORKGROUP_MEMORY
-                                | spirv::MemorySemantics::CROSS_WORKGROUP_MEMORY,
-                        ),
-                    )?;
-                    builder.memory_barrier(scope_id, semantics_id)?;
-                }
+                // A memory barrier, at device scope: see emit_device_fence.
+                ast::Instruction::Membar(_) => emit_device_fence(builder, map)?,
                 // SPIR-V does not support marking jumps as guaranteed-converged
                 ast::Instruction::Bra(_, arg) => {
                     builder.branch(arg.src)?;
@@ -3703,6 +3671,21 @@ fn emit_function_body_ops(
                             // requires the Vulkan memory model a compute kernel
                             // must not declare, so the load stays plain.
                         }
+                    }
+                    // A volatile load has to observe what another workgroup
+                    // stored, and the Volatile flag alone does not make it: see
+                    // emit_device_fence. Shared and local memory cannot be
+                    // written by another workgroup, so those keep the plain
+                    // load.
+                    if data.qualifier == ast::LdStQualifier::Volatile
+                        && !matches!(
+                            data.state_space,
+                            ast::StateSpace::Shared
+                                | ast::StateSpace::Local
+                                | ast::StateSpace::Const
+                        )
+                    {
+                        emit_device_fence(builder, map)?;
                     }
                     builder.load(
                         result_type,
@@ -7200,6 +7183,52 @@ fn struct2_bitcast_to_wide(
     let vector =
         builder.composite_construct(vector_type, None, [low_bits, high_bits].iter().copied())?;
     builder.bitcast(dst_type_id, Some(dst), vector)?;
+    Ok(())
+}
+
+/// Emits a device-scope memory fence: OpMemoryBarrier with acquire-release
+/// ordering over workgroup and cross-workgroup memory.
+///
+/// The scope is always Device, even for a workgroup-scope `membar.cta`, because
+/// this backend does not compile `ld.volatile` into an uncached read, so the
+/// fence is the only thing that makes another workgroup's store visible to a
+/// workgroup polling for it. Two measurements put it there, both on CUB's
+/// device-wide scan (which polls a tile descriptor until its predecessor
+/// publishes an inclusive prefix):
+///
+/// - `membar.cta` at PTX scope made torch.cumsum over 100000 int64 wrong in 5
+///   runs of 12; the window never saw the write, walked off the tile-state
+///   array and faulted 2 MiB below it. Device scope: 12 of 12 exact.
+/// - CUB stops issuing that fence at all once gridDim.x reaches 500
+///   (`NANOSLEEP` replaces `MEMBAR.SC.CTA` in both poll loops), which is sound
+///   on NVIDIA because its poll is `LD.E.STRONG.GPU` and a PTX volatile load
+///   there is uncached. Here the load is cached, so from exactly 500 tiles the
+///   poll spun for ever: 448000 int64 (500 tiles of 896) timed out while
+///   447104 (499 tiles) was exact, and the same lifted text at 500 tiles was
+///   exact on an RTX 2070. A volatile load therefore carries this fence too.
+///
+/// A device fence is a superset of what a workgroup-scope barrier asks for, so
+/// this synchronises more than the program requires rather than changing what
+/// it means.
+fn emit_device_fence(
+    builder: &mut dr::Builder,
+    map: &mut TypeWordMap,
+) -> Result<(), TranslateError> {
+    let scope_id = map.get_or_add_constant(
+        builder,
+        &ast::Type::Scalar(ast::ScalarType::U32),
+        &vec_repr(ast::MemScope::Gpu.to_spirv() as u32),
+    )?;
+    let semantics_id = map.get_or_add_constant(
+        builder,
+        &ast::Type::Scalar(ast::ScalarType::U32),
+        &vec_repr(
+            spirv::MemorySemantics::ACQUIRE_RELEASE
+                | spirv::MemorySemantics::WORKGROUP_MEMORY
+                | spirv::MemorySemantics::CROSS_WORKGROUP_MEMORY,
+        ),
+    )?;
+    builder.memory_barrier(scope_id, semantics_id)?;
     Ok(())
 }
 

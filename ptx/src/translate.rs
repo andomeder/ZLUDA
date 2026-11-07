@@ -3594,13 +3594,28 @@ fn emit_function_body_ops(
             Statement::Instruction(inst) => match inst {
                 ast::Instruction::Abs(d, arg) => emit_abs(builder, map, opencl, d, arg)?,
                 ast::Instruction::Call(_) => unreachable!(),
-                // A memory barrier: OpMemoryBarrier with the scope of the
-                // barrier and acquire-release semantics.
-                ast::Instruction::Membar(scope) => {
+                // A memory barrier: OpMemoryBarrier with the semantics of the
+                // barrier and acquire-release ordering.
+                //
+                // The scope is always Device, even for `membar.cta`. This
+                // backend does not compile `ld.volatile` into an uncached
+                // read, so the fence is the only thing that makes another
+                // workgroup's store visible to a workgroup polling for it,
+                // and a workgroup-scope fence does not order memory across
+                // workgroups. CUB's device-wide scan is exactly that shape:
+                // it polls a tile descriptor until its predecessor publishes
+                // an inclusive prefix. With the PTX scope, torch.cumsum over
+                // 100000 int64 was wrong in 5 runs of 12 on the Arc B580 -
+                // the window never saw the write, walked off the tile-state
+                // array and faulted 2 MiB below it - and with a device-scope
+                // fence it was 12 of 12 exact. A device fence is a superset
+                // of the one PTX asks for, so this synchronises more than
+                // the program requires rather than changing what it means.
+                ast::Instruction::Membar(_) => {
                     let scope_id = map.get_or_add_constant(
                         builder,
                         &ast::Type::Scalar(ast::ScalarType::U32),
-                        &vec_repr(scope.to_spirv() as u32),
+                        &vec_repr(ast::MemScope::Gpu.to_spirv() as u32),
                     )?;
                     let semantics_id = map.get_or_add_constant(
                         builder,

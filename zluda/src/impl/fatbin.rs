@@ -1,12 +1,17 @@
 //! Parses CUDA fatbinary containers (fatbin) and extracts what they carry.
 //!
 //! The image is either a `FatbincWrapper` (magic `FbC\xB1`) wrapping one or
-//! more `FatbinHeader` frames, a bare `FatbinHeader` (magic `P\xEDU\xBA`), or
-//! plain PTX text. PTX records are consumed as they are (optionally
-//! LZ4-compressed); CUBIN/ELF records are NVIDIA SASS, which the translator
-//! cannot read. An image that carries no PTX at all is refused unless the SASS
-//! lift is enabled (`super::sass`), in which case its cubins are handed to the
-//! loader and lifted to PTX when one of their kernels is first used.
+//! more `FatbinHeader` frames, a bare `FatbinHeader` (magic `P\xEDU\xBA`), a
+//! bare ELF cubin (magic `\x7fELF`), or plain PTX text. PTX records are
+//! consumed as they are (optionally LZ4-compressed); CUBIN/ELF records are
+//! NVIDIA SASS, which the translator cannot read. An image that carries no PTX
+//! at all is refused unless the SASS lift is enabled (`super::sass`), in which
+//! case its cubins are handed to the loader and lifted to PTX when one of
+//! their kernels is first used.
+//!
+//! A bare cubin is the shape the CUDA runtime uses for a module it built at run
+//! time (torch's jiterator ops, for one), and reading it as PTX text finds no
+//! `.entry` at all, so it has to be sniffed rather than guessed.
 
 use std::{
     cmp,
@@ -113,9 +118,12 @@ impl FatbinFileHeader {
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum BinaryKind {
     Ptx,
+    Elf,
     FatbincWrapper,
     FatbinHeader,
 }
+
+const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 
 fn sniff(image: *const c_void) -> Result<BinaryKind, CUresult> {
     if image.is_null() {
@@ -124,8 +132,61 @@ fn sniff(image: *const c_void) -> Result<BinaryKind, CUresult> {
     match unsafe { *image.cast::<[u8; 4]>() } {
         FATBINC_MAGIC => Ok(BinaryKind::FatbincWrapper),
         FATBIN_MAGIC => Ok(BinaryKind::FatbinHeader),
+        ELF_MAGIC => Ok(BinaryKind::Elf),
         _ => Ok(BinaryKind::Ptx),
     }
+}
+
+/// Size of a bare ELF image, from its own headers.
+///
+/// `cuModuleLoadData` takes a pointer with no length: PTX text is read as a C
+/// string and a fatbin describes its own extent, but a cubin has neither, so
+/// the size is the end of its section and program header tables. A cubin whose
+/// headers do not describe it is not one, and is refused rather than read past
+/// whatever the caller allocated.
+fn elf_len(image: *const c_void) -> Option<usize> {
+    unsafe {
+        let head = slice::from_raw_parts(image as *const u8, 0x40);
+        if head[0..4] != ELF_MAGIC {
+            return None;
+        }
+        let u16_at = |off: usize| u16::from_le_bytes([head[off], head[off + 1]]) as usize;
+        let u64_at = |off: usize| {
+            let mut bytes = [0u8; 8];
+            bytes.copy_from_slice(&head[off..off + 8]);
+            u64::from_le_bytes(bytes) as usize
+        };
+        let mut end = 0x40;
+        let phoff = u64_at(0x20);
+        let phentsize = u16_at(0x36);
+        let phnum = u16_at(0x38);
+        if phoff != 0 && phentsize != 0 {
+            end = end.max(phoff.checked_add(phnum.checked_mul(phentsize)?)?);
+        }
+        let shoff = u64_at(0x28);
+        let shentsize = u16_at(0x3a);
+        let shnum = u16_at(0x3c);
+        if shoff != 0 && shentsize != 0 {
+            end = end.max(shoff.checked_add(shnum.checked_mul(shentsize)?)?);
+        }
+        Some(end)
+    }
+}
+
+/// A bare cubin, as the one record of an image.
+fn elf_module(image: *const c_void) -> Result<ModuleSource, CUresult> {
+    let len = elf_len(image).ok_or(CUresult::CUDA_ERROR_INVALID_IMAGE)?;
+    if !super::sass::enabled() {
+        eprintln!(
+            "zluda: the image is a cubin ({} bytes), which is NVIDIA SASS. Rebuild it with PTX \
+             embedded (for nvcc: -gencode arch=compute_XX,code=compute_XX), or set \
+             ZLUDA_SASS_LIFT=1 to translate it",
+            len
+        );
+        return Err(CUresult::CUDA_ERROR_NOT_SUPPORTED);
+    }
+    let cubin = unsafe { slice::from_raw_parts(image as *const u8, len) }.to_vec();
+    Ok(ModuleSource::Cubin(cubin))
 }
 
 struct FatbinFileIter<'a> {
@@ -165,7 +226,7 @@ unsafe fn visit_submodules<'a>(
     mut visit: impl FnMut(&'a FatbinHeader) -> Result<(), CUresult>,
 ) -> Result<(), CUresult> {
     match unsafe { sniff(image) }? {
-        BinaryKind::Ptx => Ok(()),
+        BinaryKind::Ptx | BinaryKind::Elf => Ok(()),
         BinaryKind::FatbinHeader => {
             let header = unsafe { &*image.cast::<FatbinHeader>() };
             visit(header)
@@ -279,6 +340,8 @@ pub unsafe fn extract_ptx(image: *const c_void) -> Result<Vec<u8>, CUresult> {
             let text = unsafe { CStr::from_ptr(image as *const i8) };
             Ok(text.to_bytes().to_vec())
         }
+        // A bare cubin is SASS: there is no PTX to return.
+        BinaryKind::Elf => Err(CUresult::CUDA_ERROR_NOT_SUPPORTED),
         _ => {
             let mut best: Option<(i32, Vec<u8>)> = None;
             // Whether the fatbin carried any non-PTX image: a SASS-only one is
@@ -369,6 +432,7 @@ pub unsafe fn extract_modules(image: *const c_void) -> Result<Vec<ModuleSource>,
             let text = unsafe { CStr::from_ptr(image as *const i8) };
             Ok(vec![ModuleSource::Ptx(text.to_bytes().to_vec())])
         }
+        BinaryKind::Elf => Ok(vec![unsafe { elf_module(image) }?]),
         _ => {
             let mut modules: Vec<ModuleSource> = Vec::new();
             let mut cubins: Vec<ModuleSource> = Vec::new();

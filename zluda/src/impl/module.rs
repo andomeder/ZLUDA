@@ -675,6 +675,18 @@ fn rename_duplicate_kernels(sources: &mut [super::fatbin::ModuleSource]) {
 }
 
 pub fn load_data_impl(pmod: *mut *mut Module, spirv_data: SpirvModule) -> Result<(), CUresult> {
+    // An image that yielded no kernel cannot serve a single cuModuleGetFunction,
+    // so loading it "successfully" only moves the failure to the first lookup,
+    // where it reads as a missing symbol instead of an image that was refused.
+    // Real CUDA answers CUDA_ERROR_INVALID_IMAGE/INVALID_PTX here.
+    if spirv_data.kernel_units.is_empty() {
+        eprintln!(
+            "zluda: the image carries no kernel: {} record(s), and none of them defines an \
+             entry point",
+            spirv_data.units.len()
+        );
+        return Err(CUresult::CUDA_ERROR_INVALID_PTX);
+    }
     let module = GlobalState::lock_current_context(|ctx| {
         let device = unsafe { &mut *ctx.device };
         // Kernels are translated and built on first use; see get_function.

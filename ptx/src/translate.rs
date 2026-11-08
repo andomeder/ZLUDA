@@ -11727,15 +11727,23 @@ fn default_implicit_conversion_type(
     instruction_type: &ast::Type,
 ) -> Result<Option<ConversionKind>, TranslateError> {
     if space.is_compatible(ast::StateSpace::Reg) {
-        // The instruction wants a narrower value than the register holds (an
-        // 8-bit value lives in the low byte of a 16-bit register): keep the
-        // low bits.
+        // The instruction wants a narrower value than the register holds, or has
+        // written one (an 8-bit value lives in the low byte of a 16-bit
+        // register): keep the low bits.
+        //
+        // The register's own declaration does not decide this. PTX lets a narrow
+        // result be written to a register declared `.s16` or `.u16` as well as
+        // `.b16`, and the hardware extends it by the sign of the INSTRUCTION's
+        // type: `cvt.s8.s32` leaves 0xff80 in all three, and `cvt.u8.u32` leaves
+        // 0x0080 in all three. Only a register declared `.bN` used to be
+        // accepted here, so the same instruction into a `.s16` register failed
+        // to translate at all.
         if let (ast::Type::Scalar(instr), ast::Type::Scalar(operand)) =
             (instruction_type, operand_type)
         {
             if instr.size_of() < operand.size_of()
-                && operand.kind() == ast::ScalarKind::Bit
-                && instr.kind() != ast::ScalarKind::Float
+                && operand.kind().is_integer()
+                && instr.kind().is_integer()
             {
                 return Ok(Some(ConversionKind::Truncate));
             }

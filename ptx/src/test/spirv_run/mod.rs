@@ -223,6 +223,18 @@ test_ptx!(active_mask, [0u64], [1u64]);
 // holds an .s8 value in PTX: 0x80 reads back as 0xff80, not 0x0080.
 test_ptx!(cvt_s8_s32, [0x7f80u32], [0xff80u32, 0x7fu32]);
 
+// The same narrowing, but with the destination register declared `.s16` or
+// `.u16` instead of `.b16`. PTX allows all three, and the sign that fills the
+// upper byte follows the INSTRUCTION's type, never the register's declaration:
+// cvt.s8.s32 leaves 0xff80 in a signed register and in an unsigned one alike,
+// and cvt.u8.u32 leaves 0x0080 in both. A rule that extends by the register's
+// own signedness fails half of these rows whichever way it is written.
+test_ptx!(
+    cvt_s16_dst,
+    [0x7f80u32, 0x7fu32],
+    [0xff80u32, 0xff80u32, 0x80u32, 0x80u32, 0x7fu32, 0x7fu32, 0xffffu32, 0xffffu32]
+);
+
 struct DisplayError<T: Debug> {
     err: T,
 }

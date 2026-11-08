@@ -1,0 +1,83 @@
+.version 6.5
+.target sm_30
+.address_size 64
+
+// A narrow conversion whose destination register is declared .s16 or .u16, not
+// .b16. PTX allows it and the hardware extends the narrow result by the sign of
+// the INSTRUCTION's type, not by the register's declaration:
+//
+//   cvt.s8.s32 into .s16   0x80 -> 0xff80
+//   cvt.s8.s32 into .u16   0x80 -> 0xff80
+//   cvt.u8.u32 into .u16   0x80 -> 0x0080
+//   cvt.u8.u32 into .s16   0x80 -> 0x0080
+//   cvt.rzi.s8.f32 into .s16 / .u16   -1.0 -> 0xffff
+//
+// The four .s16/.u16 pairs are the point: a rule that sign-extends whenever the
+// register is declared signed fails the 0x0080 rows, and a rule that
+// zero-extends whenever the register is declared unsigned fails the 0xff80
+// rows. Only "the instruction's type decides" passes all of them. The
+// sign-bit-clear rows (0x7f) keep a "fill the upper byte with ones" shortcut
+// from passing either.
+//
+// The third case also pins that the conversion is not a plain truncation of the
+// cvt's own result: 0xff80 is a sign extension into a 16-bit register.
+//
+// output[0] = (u32)(u16)(s8)(input[0] & 0xff)     cvt.s8.s32 -> .s16
+// output[1] = (u32)(u16)(s8)(input[0] & 0xff)     cvt.s8.s32 -> .u16
+// output[2] = (u32)(u16)(u8)(input[0] & 0xff)     cvt.u8.u32 -> .u16
+// output[3] = (u32)(u16)(u8)(input[0] & 0xff)     cvt.u8.u32 -> .s16
+// output[4] = (u32)(u16)(s8)(input[1] & 0xff)     cvt.s8.s32 -> .s16
+// output[5] = (u32)(u16)(u8)(input[1] & 0xff)     cvt.u8.u32 -> .u16
+// output[6] = (u32)(u16)(s8)-1.0f                 cvt.rzi.s8.f32 -> .s16
+// output[7] = (u32)(u16)(s8)-1.0f                 cvt.rzi.s8.f32 -> .u16
+.visible .entry cvt_s16_dst(
+	.param .u64 input,
+	.param .u64 output
+)
+{
+	.reg .b32 %r<16>;
+	.reg .s16 %s<8>;
+	.reg .u16 %h<8>;
+	.reg .f32 %f<4>;
+	.reg .b64 %rd<4>;
+
+	ld.param.u64 %rd1, [input];
+	ld.param.u64 %rd2, [output];
+	ld.u32 %r1, [%rd1];
+	ld.u32 %r2, [%rd1+4];
+
+	cvt.s8.s32 %s1, %r1;
+	cvt.u32.u16 %r3, %s1;
+	st.u32 [%rd2], %r3;
+
+	cvt.s8.s32 %h1, %r1;
+	cvt.u32.u16 %r4, %h1;
+	st.u32 [%rd2+4], %r4;
+
+	cvt.u8.u32 %h2, %r1;
+	cvt.u32.u16 %r5, %h2;
+	st.u32 [%rd2+8], %r5;
+
+	cvt.u8.u32 %s2, %r1;
+	cvt.u32.u16 %r6, %s2;
+	st.u32 [%rd2+12], %r6;
+
+	cvt.s8.s32 %s3, %r2;
+	cvt.u32.u16 %r7, %s3;
+	st.u32 [%rd2+16], %r7;
+
+	cvt.u8.u32 %h3, %r2;
+	cvt.u32.u16 %r8, %h3;
+	st.u32 [%rd2+20], %r8;
+
+	mov.f32 %f1, 0fBF800000;
+	cvt.rzi.s8.f32 %s4, %f1;
+	cvt.u32.u16 %r9, %s4;
+	st.u32 [%rd2+24], %r9;
+
+	cvt.rzi.s8.f32 %h4, %f1;
+	cvt.u32.u16 %r10, %h4;
+	st.u32 [%rd2+28], %r10;
+
+	ret;
+}

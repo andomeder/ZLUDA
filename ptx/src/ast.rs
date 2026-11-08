@@ -1207,6 +1207,17 @@ pub enum ScalarKind {
     Pred,
 }
 
+impl ScalarKind {
+    /// A kind that names an integer value rather than its bit pattern: the three
+    /// integer kinds and the untyped one. Floats and predicates are not.
+    pub fn is_integer(self) -> bool {
+        matches!(
+            self,
+            ScalarKind::Bit | ScalarKind::Unsigned | ScalarKind::Signed
+        )
+    }
+}
+
 impl ScalarType {
     pub fn kind(self) -> ScalarKind {
         match self {

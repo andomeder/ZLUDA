@@ -143,6 +143,32 @@ test_ptx!(
     [0b10110100100000010100110000101110u32]
 );
 test_ptx!(rem, [21692i32, 13i32], [8i32]);
+// The same instruction with a NEGATIVE dividend, at every width, which is the
+// half of div/rem's contract the test above cannot see: PTX truncates towards
+// zero, so -10 % 7 is -3 and -10 / 7 is -1.
+test_ptx!(
+    div_rem,
+    [
+        (-10i64) as u64,
+        7u64,
+        (-1i64) as u64,
+        7u64
+    ],
+    [
+        (-3i64) as u64,
+        (-1i64) as u64,
+        (-1i64) as u64,
+        0u64,
+        (-3i32) as i64 as u64,
+        (-1i32) as i64 as u64,
+        (-3i16) as i64 as u64,
+        (-1i16) as i64 as u64,
+        (65526u32 % 7u32) as u64,
+        (65526u32 / 7u32) as u64,
+        ((-10i64) as u64 % 7u64),
+        ((-10i64) as u64 / 7u64)
+    ]
+);
 test_ptx!(
     bfe,
     [0b11111000_11000001_00100010_10100000u32, 16u32, 8u32],

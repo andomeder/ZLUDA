@@ -1,0 +1,118 @@
+.version 6.5
+.target sm_30
+.address_size 64
+
+// div and rem at every width PTX has them, over a NEGATIVE dividend.
+//
+// PTX's div truncates towards zero and rem takes the sign of the dividend, so
+// -10 / 7 is -1 and -10 % 7 is -3; a floored lowering would answer -2 and 4.
+// The lowering was floored until 2026-11-03 (OpSMod), and the only test that
+// covered rem was 21692 % 13, whose dividend is positive and whose divisor
+// divides neither way, so the whole class was invisible. This test fails on a
+// floored lowering of either instruction, at 64 and at 32 bits.
+//
+// It also pins the narrow widths, which integer modulo reaches through the
+// unsigned path uint8 takes: rem.u16 of the widened 0xfff6 is 6, and reading
+// that result back through a SIGNED extension would give 6 too, while
+// div.s16 of -10 is -1 and only a signed read shows it.
+//
+//   input  [0] = -10 as u64     [1] = 7      [2] = -1 as u64    [3] = 7
+//   output [0] = rem.s64(in0, in1)                      -3
+//          [1] = div.s64(in0, in1)                      -1
+//          [2] = rem.s64(in2, in3)                      -1
+//          [3] = div.s64(in2, in3)                       0
+//          [4] = rem.s32(low(in0), low(in1))            -3
+//          [5] = div.s32(low(in0), low(in1))            -1
+//          [6] = rem.s16(-10, 7)                        -3
+//          [7] = div.s16(-10, 7)                        -1
+//          [8] = rem.u16(0xfff6, 7)                      6
+//          [9] = div.u16(0xfff6, 7)                   9360
+//         [10] = rem.u64(in0, in1)                       6
+//         [11] = div.u64(in0, in1)        2635249153387078800
+.visible .entry div_rem(
+	.param .u64 input,
+	.param .u64 output
+)
+{
+	.reg .u64 	in_addr;
+	.reg .u64 	out_addr;
+	.reg .u64 	pa;
+	.reg .u64 	pb;
+	.reg .s64 	sa;
+	.reg .s64 	sb;
+	.reg .s64 	sres;
+	.reg .u64 	ures;
+	.reg .b32 	la;
+	.reg .b32 	lb;
+	.reg .s32 	s32a;
+	.reg .s32 	s32b;
+	.reg .s32 	s32res;
+	.reg .b16 	ha;
+	.reg .b16 	hb;
+	.reg .s16 	shres;
+	.reg .b16 	uhres;
+
+	ld.param.u64 	in_addr, [input];
+	ld.param.u64 	out_addr, [output];
+
+	ld.u64 		pa, [in_addr];
+	ld.u64 		pb, [in_addr + 8];
+	ld.u64 		sa, [in_addr];
+	ld.u64 		sb, [in_addr + 8];
+
+	// 64 bit signed
+	rem.s64 	sres, sa, sb;
+	st.u64 		[out_addr], sres;
+	div.s64 	sres, sa, sb;
+	st.u64 		[out_addr + 8], sres;
+
+	ld.s64 		sa, [in_addr + 16];
+	ld.s64 		sb, [in_addr + 24];
+	rem.s64 	sres, sa, sb;
+	st.u64 		[out_addr + 16], sres;
+	div.s64 	sres, sa, sb;
+	st.u64 		[out_addr + 24], sres;
+
+	// 32 bit signed, from the low word of the first pair
+	ld.u32 		la, [in_addr];
+	ld.u32 		lb, [in_addr + 8];
+	cvt.s32.u32 	s32a, la;
+	cvt.s32.u32 	s32b, lb;
+	rem.s32 	s32res, s32a, s32b;
+	cvt.s64.s32 	sres, s32res;
+	st.u64 		[out_addr + 32], sres;
+	div.s32 	s32res, s32a, s32b;
+	cvt.s64.s32 	sres, s32res;
+	st.u64 		[out_addr + 40], sres;
+
+	// 16 bit signed
+	cvt.s16.s32 	ha, s32a;
+	cvt.s16.s32 	hb, s32b;
+	rem.s16 	shres, ha, hb;
+	cvt.s32.s16 	s32res, shres;
+	cvt.s64.s32 	sres, s32res;
+	st.u64 		[out_addr + 48], sres;
+	div.s16 	shres, ha, hb;
+	cvt.s32.s16 	s32res, shres;
+	cvt.s64.s32 	sres, s32res;
+	st.u64 		[out_addr + 56], sres;
+
+	// 16 bit unsigned, which is the width uint8 modulo widens into
+	cvt.u16.s32 	ha, s32a;
+	cvt.u16.s32 	hb, s32b;
+	rem.u16 	uhres, ha, hb;
+	cvt.u32.u16 	s32res, uhres;
+	cvt.s64.u32 	sres, s32res;
+	st.u64 		[out_addr + 64], sres;
+	div.u16 	uhres, ha, hb;
+	cvt.u32.u16 	s32res, uhres;
+	cvt.s64.u32 	sres, s32res;
+	st.u64 		[out_addr + 72], sres;
+
+	// 64 bit unsigned, same operands read unsigned
+	rem.u64 	ures, pa, pb;
+	st.u64 		[out_addr + 80], ures;
+	div.u64 	ures, pa, pb;
+	st.u64 		[out_addr + 88], ures;
+	ret;
+}

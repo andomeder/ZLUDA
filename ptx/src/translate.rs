@@ -7477,11 +7477,19 @@ fn emit_implicit_conversion(
                     cv.to_type.size_of()
                 );
             }
-            // The instruction wants a narrower value than the register holds:
-            // keep the low bits (an 8-bit value lives in the low byte of a
-            // 16-bit register in PTX).
+            // The instruction wants a narrower value than the register holds, or
+            // has written one. Reading one keeps the low bits (an 8-bit value
+            // lives in the low byte of a 16-bit register in PTX); writing one
+            // fills the upper byte from the narrow type's sign, so cvt.s8.s32 of
+            // 0x80 leaves 0xff80. A narrow signed type only appears in the
+            // writing direction, because the rule above does not apply to a
+            // register declared signed.
             let result_type = map.get_or_add(builder, SpirvType::new(cv.to_type.clone()));
-            builder.u_convert(result_type, Some(cv.dst), cv.src)?;
+            if from_parts.scalar_kind == ast::ScalarKind::Signed {
+                builder.s_convert(result_type, Some(cv.dst), cv.src)?;
+            } else {
+                builder.u_convert(result_type, Some(cv.dst), cv.src)?;
+            }
         }
         (TypeKind::Scalar, TypeKind::Scalar, &ConversionKind::SignExtend) => {
             let result_type = map.get_or_add(builder, SpirvType::new(cv.to_type.clone()));

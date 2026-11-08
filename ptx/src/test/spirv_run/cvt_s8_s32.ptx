@@ -1,0 +1,39 @@
+.version 6.5
+.target sm_30
+.address_size 64
+
+// cvt.s8.s32 sign-extends the low byte into the 16-bit register that holds an
+// .s8 value in PTX, so 0x80 must read back as 0xff80 and 0x7f as 0x007f.
+//
+// A plain truncation leaves 0x0080 instead, which is what the float16 radix
+// sort tripped on: its twiddle mask is (key & 0x8000) ? 0x8000 : 0xffff, so a
+// key whose sign bit was lost took the wrong mask and was stored complemented.
+//
+// Both signs are checked here because a "fill the upper byte with ones" shortcut
+// would pass the negative case alone.
+//
+// output[0] = (u32)(u16)(s8)(input & 0xff)
+// output[1] = (u32)(u16)(s8)((input >> 8) & 0xff)
+.visible .entry cvt_s8_s32(
+	.param .u64 input,
+	.param .u64 output
+)
+{
+	.reg .b32 %r<8>;
+	.reg .b16 %rs<4>;
+	.reg .b64 %rd<4>;
+
+	ld.param.u64 %rd1, [input];
+	ld.param.u64 %rd2, [output];
+	ld.u32 %r1, [%rd1];
+
+	cvt.s8.s32 %rs1, %r1;
+	shr.u32 %r3, %r1, 8;
+	cvt.s8.s32 %rs2, %r3;
+
+	cvt.u32.u16 %r2, %rs1;
+	st.u32 [%rd2], %r2;
+	cvt.u32.u16 %r4, %rs2;
+	st.u32 [%rd2+4], %r4;
+	ret;
+}

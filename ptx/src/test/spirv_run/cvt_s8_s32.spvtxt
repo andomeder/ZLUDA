@@ -1,0 +1,115 @@
+               OpCapability GenericPointer
+               OpCapability Linkage
+               OpCapability Addresses
+               OpCapability Kernel
+               OpCapability Int8
+               OpCapability Int16
+               OpCapability Int64
+               OpCapability Float16
+               OpCapability Float64
+               OpCapability KernelAttributesINTEL
+               OpCapability SubgroupShuffleINTEL
+               OpCapability GroupNonUniformVote
+               OpCapability GroupNonUniformBallot
+               OpCapability SubgroupDispatch
+               OpCapability GroupNonUniformArithmetic
+               OpExtension "SPV_INTEL_kernel_attributes"
+               OpExtension "SPV_INTEL_subgroups"
+         %63 = OpExtInstImport "OpenCL.std"
+               OpMemoryModel Physical64 OpenCL
+               OpEntryPoint Kernel %1 "cvt_s8_s32"
+               OpExecutionMode %1 MaxWorkgroupSizeINTEL 256 256 256
+       %void = OpTypeVoid
+      %ulong = OpTypeInt 64 0
+         %66 = OpTypeFunction %void %ulong %ulong
+%_ptr_Function_ulong = OpTypePointer Function %ulong
+       %uint = OpTypeInt 32 0
+%_ptr_Function_uint = OpTypePointer Function %uint
+     %ushort = OpTypeInt 16 0
+%_ptr_Function_ushort = OpTypePointer Function %ushort
+%_ptr_Generic_uint = OpTypePointer Generic %uint
+      %uchar = OpTypeInt 8 0
+     %uint_8 = OpConstant %uint 8
+    %ulong_4 = OpConstant %ulong 4
+%_ptr_Generic_uchar = OpTypePointer Generic %uchar
+          %1 = OpFunction %void None %66
+         %20 = OpFunctionParameter %ulong
+         %21 = OpFunctionParameter %ulong
+         %61 = OpLabel
+          %2 = OpVariable %_ptr_Function_ulong Function
+          %3 = OpVariable %_ptr_Function_ulong Function
+          %4 = OpVariable %_ptr_Function_uint Function
+          %5 = OpVariable %_ptr_Function_uint Function
+          %6 = OpVariable %_ptr_Function_uint Function
+          %7 = OpVariable %_ptr_Function_uint Function
+          %8 = OpVariable %_ptr_Function_uint Function
+          %9 = OpVariable %_ptr_Function_uint Function
+         %10 = OpVariable %_ptr_Function_uint Function
+         %11 = OpVariable %_ptr_Function_uint Function
+         %12 = OpVariable %_ptr_Function_ushort Function
+         %13 = OpVariable %_ptr_Function_ushort Function
+         %14 = OpVariable %_ptr_Function_ushort Function
+         %15 = OpVariable %_ptr_Function_ushort Function
+         %16 = OpVariable %_ptr_Function_ulong Function
+         %17 = OpVariable %_ptr_Function_ulong Function
+         %18 = OpVariable %_ptr_Function_ulong Function
+         %19 = OpVariable %_ptr_Function_ulong Function
+               OpStore %2 %20
+               OpStore %3 %21
+         %43 = OpLoad %ulong %2 Aligned 8
+         %22 = OpCopyObject %ulong %43
+               OpStore %17 %22
+         %44 = OpLoad %ulong %3 Aligned 8
+         %23 = OpCopyObject %ulong %44
+               OpStore %18 %23
+         %25 = OpLoad %ulong %17
+         %46 = OpConvertUToPtr %_ptr_Generic_uint %25
+         %45 = OpLoad %uint %46 Aligned 4
+         %24 = OpCopyObject %uint %45
+               OpStore %5 %24
+         %27 = OpLoad %uint %5
+         %48 = OpCopyObject %uint %27
+         %73 = OpBitcast %uint %48
+         %75 = OpSConvert %uchar %73
+         %47 = OpCopyObject %uchar %75
+         %26 = OpSConvert %ushort %47
+               OpStore %13 %26
+         %29 = OpLoad %uint %5
+         %50 = OpCopyObject %uint %29
+         %49 = OpShiftRightLogical %uint %50 %uint_8
+         %28 = OpCopyObject %uint %49
+               OpStore %7 %28
+         %31 = OpLoad %uint %7
+         %52 = OpCopyObject %uint %31
+         %76 = OpBitcast %uint %52
+         %77 = OpSConvert %uchar %76
+         %51 = OpCopyObject %uchar %77
+         %30 = OpSConvert %ushort %51
+               OpStore %14 %30
+         %33 = OpLoad %ushort %13
+         %54 = OpCopyObject %ushort %33
+         %78 = OpBitcast %ushort %54
+         %53 = OpUConvert %uint %78
+         %32 = OpCopyObject %uint %53
+               OpStore %6 %32
+         %34 = OpLoad %ulong %18
+         %35 = OpLoad %uint %6
+         %55 = OpConvertUToPtr %_ptr_Generic_uint %34
+         %56 = OpCopyObject %uint %35
+               OpStore %55 %56 Aligned 4
+         %37 = OpLoad %ushort %14
+         %58 = OpCopyObject %ushort %37
+         %79 = OpBitcast %ushort %58
+         %57 = OpUConvert %uint %79
+         %36 = OpCopyObject %uint %57
+               OpStore %8 %36
+         %38 = OpLoad %ulong %18
+         %39 = OpLoad %uint %8
+         %59 = OpConvertUToPtr %_ptr_Generic_uint %38
+         %81 = OpBitcast %_ptr_Generic_uchar %59
+         %82 = OpInBoundsPtrAccessChain %_ptr_Generic_uchar %81 %ulong_4
+         %42 = OpBitcast %_ptr_Generic_uint %82
+         %60 = OpCopyObject %uint %39
+               OpStore %42 %60 Aligned 4
+               OpReturn
+               OpFunctionEnd

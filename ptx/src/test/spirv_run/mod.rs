@@ -219,6 +219,10 @@ test_ptx_threads!(lane_masks, 32u32, [0u64], LANE_MASKS);
 // all-lanes mask a hardcoded expansion would report.
 test_ptx!(active_mask, [0u64], [1u64]);
 
+// A narrowed signed conversion has to sign-extend into the 16-bit register that
+// holds an .s8 value in PTX: 0x80 reads back as 0xff80, not 0x0080.
+test_ptx!(cvt_s8_s32, [0x7f80u32], [0xff80u32, 0x7fu32]);
+
 struct DisplayError<T: Debug> {
     err: T,
 }

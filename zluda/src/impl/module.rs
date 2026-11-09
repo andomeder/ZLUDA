@@ -37,6 +37,13 @@ pub struct ModuleData {
     /// The kernels whose shared-memory need is provable from their PTX.
     pub shared_bounds: HashMap<String, super::shared_window::SharedBound>,
     pub device_binaries: HashMap<device::Index, CompiledModules>,
+    /// The architecture the image was built for: a cubin's SM byte, or the
+    /// `.target sm_XY` of a PTX record, or 0 when the image does not say.
+    /// `cuFuncGetAttribute` answers PTX_VERSION and BINARY_VERSION from this,
+    /// because an application that picks a launch configuration by PTX version
+    /// (cub's dispatch does, and the block size is part of it) has to be told
+    /// the architecture the code was compiled for.
+    pub source_arch: u32,
 }
 
 pub struct SpirvModule {
@@ -95,6 +102,26 @@ impl From<ptx::TranslateError> for CUresult {
     fn from(_: ptx::TranslateError) -> Self {
         CUresult::CUDA_ERROR_INVALID_PTX
     }
+}
+
+/// The `sm_XY` an application's PTX says it was built for, or 0 when its
+/// `.target` line names none. The lift writes it, and so does every toolkit.
+fn ptx_target_arch(text: &str) -> u32 {
+    for line in text.lines() {
+        let line = line.trim_start();
+        let rest = match line.strip_prefix(".target") {
+            Some(rest) => rest,
+            None => continue,
+        };
+        for token in rest.split(|c: char| c == ',' || c.is_whitespace()) {
+            if let Some(arch) = token.strip_prefix("sm_") {
+                if let Ok(value) = arch.parse::<u32>() {
+                    return value;
+                }
+            }
+        }
+    }
+    0
 }
 
 
@@ -200,6 +227,16 @@ impl SpirvModule {
     /// Whether a record carries compiled code instead of PTX.
     pub fn is_lifted(&self, unit: usize) -> bool {
         matches!(self.units.get(unit), Some(UnitSource::Cubin(_)))
+    }
+
+    /// The architecture the image was built for, from its first record. A
+    /// fatbin carries one architecture for all of its records.
+    pub fn arch(&self) -> u32 {
+        match self.units.first() {
+            Some(UnitSource::Cubin(cubin)) => super::sass::cubin_arch(cubin).unwrap_or(0),
+            Some(UnitSource::Ptx(text)) => ptx_target_arch(text),
+            None => 0,
+        }
     }
 
     /// Translate one kernel of the image: its entry point and the functions it
@@ -537,6 +574,7 @@ pub fn get_function(
             properties: None,
             legacy_args: LegacyArguments::new(),
             name: name.clone(),
+            source_arch: module.source_arch,
         }));
         let ptr = function.as_mut() as *mut _;
         compiled.kernels.insert(name, function);
@@ -698,6 +736,7 @@ pub fn load_data_impl(pmod: *mut *mut Module, spirv_data: SpirvModule) -> Result
             },
         );
         let module_data = ModuleData {
+            source_arch: spirv_data.arch(),
             spirv: spirv_data,
             kernel_info: HashMap::new(),
             param_buffers: HashMap::new(),

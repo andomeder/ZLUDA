@@ -44,6 +44,12 @@ pub struct FunctionData {
     pub legacy_args: LegacyArguments,
     /// The name the kernel was looked up with, for the launch trace.
     pub name: std::ffi::CString,
+    /// The architecture the module's image was built for, 0 when it does not
+    /// say. `cuFuncGetAttribute(PTX_VERSION)` answers from it: an application
+    /// that picks a launch configuration by PTX version needs the
+    /// architecture the code was compiled for, and cub puts the block size in
+    /// that choice.
+    pub source_arch: u32,
 }
 
 pub struct LegacyArguments {
@@ -461,8 +467,27 @@ pub(crate) fn get_attribute(
             CUfunction_attribute::CU_FUNC_ATTRIBUTE_CONST_SIZE_BYTES => 0,
             CUfunction_attribute::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES => props.privateMemSize,
             CUfunction_attribute::CU_FUNC_ATTRIBUTE_NUM_REGS => 0,
-            CUfunction_attribute::CU_FUNC_ATTRIBUTE_PTX_VERSION => 80,
-            CUfunction_attribute::CU_FUNC_ATTRIBUTE_BINARY_VERSION => 80,
+            // The architecture the module's image was built for, which is what
+            // CUDA reports here and what a dispatch that picks a launch
+            // configuration by PTX version reads. Reporting a fixed 80 for an
+            // sm_86 image makes cub choose its sm_80 policy, whose block size
+            // the kernel in the image was not compiled for: a 384-thread
+            // launch of a kernel built for 128 computes the wrong answer, and
+            // a real driver refuses the launch outright.
+            CUfunction_attribute::CU_FUNC_ATTRIBUTE_PTX_VERSION => {
+                if func.source_arch != 0 {
+                    func.source_arch
+                } else {
+                    80
+                }
+            }
+            CUfunction_attribute::CU_FUNC_ATTRIBUTE_BINARY_VERSION => {
+                if func.source_arch != 0 {
+                    func.source_arch
+                } else {
+                    80
+                }
+            }
             CUfunction_attribute::CU_FUNC_ATTRIBUTE_CACHE_MODE_CA => 0,
             CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES => {
                 props.localMemSize

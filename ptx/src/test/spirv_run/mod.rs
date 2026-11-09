@@ -111,6 +111,20 @@ test_ptx!(and, [6u32, 3u32], [2u32]);
 test_ptx!(selp, [100u16, 200u16], [200u16]);
 test_ptx!(selp_true, [100u16, 200u16], [100u16]);
 test_ptx!(fma, [2f32, 3f32, 5f32], [11f32]);
+// fma.rn.f32 promises ONE rounding. These four triples are chosen so that a
+// fused multiply-add and a twice-rounded one disagree, one of them in each
+// direction: (1+2^-23)(1-2^-23)-1 is 2^-46 exactly (0 unfused), and
+// (2^24+1)(1-2^-23)-1 is one ulp BELOW where the twice-rounded form lands.
+test_ptx!(
+    fma_fused,
+    [
+        0x3f800001u32, 0x3f7fffffu32, 0xbf800000u32,
+        0x3f800002u32, 0x3f7ffffeu32, 0xbf800000u32,
+        0x40400000u32, 0x3eaaaaabu32, 0xbf800000u32,
+        0x4b800001u32, 0x3f7fffffu32, 0xbf800000u32
+    ],
+    [0x337ffffeu32, 0x33fffffcu32, 0x33000000u32, 0x4b800000u32]
+);
 test_ptx!(shared_variable, [513u64], [513u64]);
 test_ptx!(shared_ptr_32, [513u64], [513u64]);
 test_ptx!(atom_cas, [91u32, 91u32], [91u32, 100u32]);

@@ -1,0 +1,74 @@
+.version 6.5
+.target sm_30
+.address_size 64
+
+// fma.rn.f32 promises ONE rounding. This backend lowered it to OpenCL's `mad`,
+// which explicitly allows the intermediate to be rounded, so a refinement
+// written with it could be rounded twice - torch's 1/x kernel is rcp.approx
+// plus one fma-based Newton step (odocs/BUG-rcp-approx.md).
+//
+// The four triples here are chosen so that the fused and the twice-rounded
+// answers differ, and so that one of them differs in the other direction, which
+// a "sometimes it is right" implementation cannot pass by luck:
+//
+//   0  (1+2^-23)(1-2^-23) - 1 = 2^-46 exactly    fused 0x337ffffe, unfused 0
+//   1  (1+2^-24)(1-2^-22) - 1                    fused 0x33fffffc, unfused 0x34000000
+//   2  3 * fl(1/3) - 1 = 2^-25 exactly           fused 0x33000000, unfused 0
+//   3  (2^24+1)(1-2^-23) - 1                     fused 0x4b800000, unfused 0x4b800001
+//
+// Inputs are handed over as bit patterns and reinterpreted, so the test cannot
+// lose a bit to a literal.
+.visible .entry fma_fused(
+	.param .u64 input,
+	.param .u64 output
+)
+{
+	.reg .u64 %rd<3>;
+	.reg .b32 %r<8>;
+	.reg .f32 %f<8>;
+
+	ld.param.u64 %rd1, [input];
+	ld.param.u64 %rd2, [output];
+
+	ld.global.b32 %r1, [%rd1];
+	mov.b32 %f1, %r1;
+	ld.global.b32 %r2, [%rd1+4];
+	mov.b32 %f2, %r2;
+	ld.global.b32 %r3, [%rd1+8];
+	mov.b32 %f3, %r3;
+	fma.rn.f32 %f4, %f1, %f2, %f3;
+	mov.b32 %r4, %f4;
+	st.global.b32 [%rd2], %r4;
+
+	ld.global.b32 %r1, [%rd1+12];
+	mov.b32 %f1, %r1;
+	ld.global.b32 %r2, [%rd1+16];
+	mov.b32 %f2, %r2;
+	ld.global.b32 %r3, [%rd1+20];
+	mov.b32 %f3, %r3;
+	fma.rn.f32 %f4, %f1, %f2, %f3;
+	mov.b32 %r4, %f4;
+	st.global.b32 [%rd2+4], %r4;
+
+	ld.global.b32 %r1, [%rd1+24];
+	mov.b32 %f1, %r1;
+	ld.global.b32 %r2, [%rd1+28];
+	mov.b32 %f2, %r2;
+	ld.global.b32 %r3, [%rd1+32];
+	mov.b32 %f3, %r3;
+	fma.rn.f32 %f4, %f1, %f2, %f3;
+	mov.b32 %r4, %f4;
+	st.global.b32 [%rd2+8], %r4;
+
+	ld.global.b32 %r1, [%rd1+36];
+	mov.b32 %f1, %r1;
+	ld.global.b32 %r2, [%rd1+40];
+	mov.b32 %f2, %r2;
+	ld.global.b32 %r3, [%rd1+44];
+	mov.b32 %f3, %r3;
+	fma.rn.f32 %f4, %f1, %f2, %f3;
+	mov.b32 %r4, %f4;
+	st.global.b32 [%rd2+12], %r4;
+
+	ret;
+}

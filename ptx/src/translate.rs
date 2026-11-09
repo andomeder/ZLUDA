@@ -6514,6 +6514,23 @@ fn emit_mad_float(
     arg: &ast::Arg4<ExpandedArgParams>,
 ) -> Result<(), dr::Error> {
     let inst_type = map.get_or_add(builder, SpirvType::from(ast::ScalarType::from(desc.typ)));
+    // The f32 and f64 forms are ONE rounding, because PTX fma.rn promises it and
+    // OpenCL's `mad` is the instruction that allows the intermediate to be
+    // rounded - which is what this used to emit. Anything that refines with it
+    // was therefore rounded twice: torch's 1/x kernel is rcp.approx plus a
+    // single fma-based Newton step, and that step stopped converging, so every
+    // reciprocal came out one ulp low on 10.98% of inputs
+    // (odocs/BUG-rcp-approx.md). ptxas compiles fma.rn and mad.rn alike to one
+    // FFMA, so fusing is also what the hardware does.
+    //
+    // The half precision forms keep `mad`: their fusion has not been measured
+    // here, and llc's 16-bit arithmetic is in the llama.cpp corpus, so it is not
+    // a change to make blind.
+    let ocl_op = if desc.typ == ast::ScalarType::F32 || desc.typ == ast::ScalarType::F64 {
+        spirv::CLOp::fma
+    } else {
+        spirv::CLOp::mad
+    };
     if needs_wide_rounding(ast::Type::Scalar(desc.typ), desc.rounding) {
         return emit_rounded_float(
             builder,
@@ -6548,7 +6565,7 @@ fn emit_mad_float(
         inst_type,
         Some(arg.dst),
         opencl,
-        spirv::CLOp::mad as spirv::Word,
+        ocl_op as spirv::Word,
         [
             dr::Operand::IdRef(arg.src1),
             dr::Operand::IdRef(arg.src2),

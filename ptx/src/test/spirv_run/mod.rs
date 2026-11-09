@@ -105,6 +105,32 @@ test_ptx!(
         0x3eaaaaabu32, 0xbeaaaaaau32, 0x3e124925u32, 0x3ca72f06u32
     ]
 );
+// div.rn must be the correctly rounded quotient and the directed modes must
+// round in the direction they name. Every float32 division used to be one
+// OpFDiv, which is 1-2 ulp off on 22% of inputs here and ignored the mode
+// entirely; the exact forms are now a double quotient narrowed with the asked
+// rounding. The second pair's nearest result was measured one ulp low before
+// that, so the test catches the plain division on its own. Bits, so the compare
+// is exact.
+test_ptx!(
+    div_rounding,
+    [
+        1f32, 3f32,
+        f32::from_bits(0xc104a7f9), f32::from_bits(0x504fd68e),
+        7f32, 49f32,
+        -1f32, 3f32,
+        0f32, -1f32
+    ],
+    [
+        0x3eaaaaabu32, 0x3eaaaaaau32, 0x3eaaaaaau32, 0x3eaaaaabu32,
+        0xb0236572u32, 0xb0236572u32, 0xb0236573u32, 0xb0236572u32,
+        0x3e124925u32, 0x3e124924u32, 0x3e124924u32, 0x3e124925u32,
+        0xbeaaaaabu32, 0xbeaaaaaau32, 0xbeaaaaabu32, 0xbeaaaaaau32,
+        // +0.0 / -1.0: a negative zero, four times. Without the sign repair the
+        // fold-defeating add leaves +0.0 here, and these four rows fail.
+        0x80000000u32, 0x80000000u32, 0x80000000u32, 0x80000000u32
+    ]
+);
 // 0b1_00000000_10000000000000000000000u32 is a large denormal
 // 0x3f000000 is 0.5
 test_ptx!(

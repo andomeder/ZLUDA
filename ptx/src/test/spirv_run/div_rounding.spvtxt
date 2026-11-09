@@ -1,0 +1,655 @@
+               OpCapability GenericPointer
+               OpCapability Linkage
+               OpCapability Addresses
+               OpCapability Kernel
+               OpCapability Int8
+               OpCapability Int16
+               OpCapability Int64
+               OpCapability Float16
+               OpCapability Float64
+               OpCapability KernelAttributesINTEL
+               OpCapability SubgroupShuffleINTEL
+               OpCapability GroupNonUniformVote
+               OpCapability GroupNonUniformBallot
+               OpCapability SubgroupDispatch
+               OpCapability GroupNonUniformArithmetic
+               OpExtension "SPV_INTEL_kernel_attributes"
+               OpExtension "SPV_INTEL_subgroups"
+        %355 = OpExtInstImport "OpenCL.std"
+               OpMemoryModel Physical64 OpenCL
+               OpEntryPoint Kernel %1 "div_rounding"
+               OpExecutionMode %1 MaxWorkgroupSizeINTEL 256 256 256
+               OpDecorate %387 FPRoundingMode RTE
+               OpDecorate %398 FPRoundingMode RTZ
+               OpDecorate %402 FPRoundingMode RTN
+               OpDecorate %406 FPRoundingMode RTP
+               OpDecorate %417 FPRoundingMode RTE
+               OpDecorate %427 FPRoundingMode RTZ
+               OpDecorate %431 FPRoundingMode RTN
+               OpDecorate %435 FPRoundingMode RTP
+               OpDecorate %448 FPRoundingMode RTE
+               OpDecorate %458 FPRoundingMode RTZ
+               OpDecorate %462 FPRoundingMode RTN
+               OpDecorate %466 FPRoundingMode RTP
+               OpDecorate %479 FPRoundingMode RTE
+               OpDecorate %489 FPRoundingMode RTZ
+               OpDecorate %493 FPRoundingMode RTN
+               OpDecorate %497 FPRoundingMode RTP
+               OpDecorate %514 FPRoundingMode RTE
+               OpDecorate %524 FPRoundingMode RTZ
+               OpDecorate %528 FPRoundingMode RTN
+               OpDecorate %532 FPRoundingMode RTP
+       %void = OpTypeVoid
+      %ulong = OpTypeInt 64 0
+        %358 = OpTypeFunction %void %ulong %ulong
+%_ptr_Function_ulong = OpTypePointer Function %ulong
+       %uint = OpTypeInt 32 0
+%_ptr_Function_uint = OpTypePointer Function %uint
+      %float = OpTypeFloat 32
+%_ptr_Function_float = OpTypePointer Function %float
+%_ptr_CrossWorkgroup_uint = OpTypePointer CrossWorkgroup %uint
+    %ulong_4 = OpConstant %ulong 4
+      %uchar = OpTypeInt 8 0
+%_ptr_CrossWorkgroup_uchar = OpTypePointer CrossWorkgroup %uchar
+    %ulong_8 = OpConstant %ulong 8
+   %ulong_12 = OpConstant %ulong 12
+   %ulong_16 = OpConstant %ulong 16
+   %ulong_20 = OpConstant %ulong 20
+   %ulong_24 = OpConstant %ulong 24
+   %ulong_28 = OpConstant %ulong 28
+     %double = OpTypeFloat 64
+   %double_0 = OpConstant %double 0
+%uint_2147483648 = OpConstant %uint 2147483648
+  %ulong_4_0 = OpConstant %ulong 4
+  %ulong_8_0 = OpConstant %ulong 8
+ %ulong_12_0 = OpConstant %ulong 12
+ %ulong_16_0 = OpConstant %ulong 16
+ %ulong_20_0 = OpConstant %ulong 20
+ %ulong_24_0 = OpConstant %ulong 24
+ %ulong_28_0 = OpConstant %ulong 28
+   %ulong_32 = OpConstant %ulong 32
+   %ulong_36 = OpConstant %ulong 36
+   %ulong_40 = OpConstant %ulong 40
+   %ulong_44 = OpConstant %ulong 44
+   %ulong_48 = OpConstant %ulong 48
+   %ulong_52 = OpConstant %ulong 52
+   %ulong_56 = OpConstant %ulong 56
+   %ulong_60 = OpConstant %ulong 60
+ %ulong_32_0 = OpConstant %ulong 32
+ %ulong_36_0 = OpConstant %ulong 36
+   %ulong_64 = OpConstant %ulong 64
+   %ulong_68 = OpConstant %ulong 68
+   %ulong_72 = OpConstant %ulong 72
+   %ulong_76 = OpConstant %ulong 76
+          %1 = OpFunction %void None %358
+         %73 = OpFunctionParameter %ulong
+         %74 = OpFunctionParameter %ulong
+        %353 = OpLabel
+          %2 = OpVariable %_ptr_Function_ulong Function
+          %3 = OpVariable %_ptr_Function_ulong Function
+          %4 = OpVariable %_ptr_Function_ulong Function
+          %5 = OpVariable %_ptr_Function_ulong Function
+          %6 = OpVariable %_ptr_Function_ulong Function
+          %7 = OpVariable %_ptr_Function_ulong Function
+          %8 = OpVariable %_ptr_Function_ulong Function
+          %9 = OpVariable %_ptr_Function_uint Function
+         %10 = OpVariable %_ptr_Function_uint Function
+         %11 = OpVariable %_ptr_Function_uint Function
+         %12 = OpVariable %_ptr_Function_uint Function
+         %13 = OpVariable %_ptr_Function_uint Function
+         %14 = OpVariable %_ptr_Function_uint Function
+         %15 = OpVariable %_ptr_Function_uint Function
+         %16 = OpVariable %_ptr_Function_uint Function
+         %17 = OpVariable %_ptr_Function_uint Function
+         %18 = OpVariable %_ptr_Function_uint Function
+         %19 = OpVariable %_ptr_Function_uint Function
+         %20 = OpVariable %_ptr_Function_uint Function
+         %21 = OpVariable %_ptr_Function_uint Function
+         %22 = OpVariable %_ptr_Function_uint Function
+         %23 = OpVariable %_ptr_Function_uint Function
+         %24 = OpVariable %_ptr_Function_uint Function
+         %25 = OpVariable %_ptr_Function_uint Function
+         %26 = OpVariable %_ptr_Function_uint Function
+         %27 = OpVariable %_ptr_Function_uint Function
+         %28 = OpVariable %_ptr_Function_uint Function
+         %29 = OpVariable %_ptr_Function_uint Function
+         %30 = OpVariable %_ptr_Function_uint Function
+         %31 = OpVariable %_ptr_Function_float Function
+         %32 = OpVariable %_ptr_Function_float Function
+         %33 = OpVariable %_ptr_Function_float Function
+         %34 = OpVariable %_ptr_Function_float Function
+         %35 = OpVariable %_ptr_Function_float Function
+         %36 = OpVariable %_ptr_Function_float Function
+         %37 = OpVariable %_ptr_Function_float Function
+         %38 = OpVariable %_ptr_Function_float Function
+         %39 = OpVariable %_ptr_Function_float Function
+         %40 = OpVariable %_ptr_Function_float Function
+         %41 = OpVariable %_ptr_Function_float Function
+         %42 = OpVariable %_ptr_Function_float Function
+         %43 = OpVariable %_ptr_Function_float Function
+         %44 = OpVariable %_ptr_Function_float Function
+         %45 = OpVariable %_ptr_Function_float Function
+         %46 = OpVariable %_ptr_Function_float Function
+         %47 = OpVariable %_ptr_Function_float Function
+         %48 = OpVariable %_ptr_Function_float Function
+         %49 = OpVariable %_ptr_Function_float Function
+         %50 = OpVariable %_ptr_Function_float Function
+         %51 = OpVariable %_ptr_Function_float Function
+         %52 = OpVariable %_ptr_Function_float Function
+         %53 = OpVariable %_ptr_Function_float Function
+         %54 = OpVariable %_ptr_Function_float Function
+         %55 = OpVariable %_ptr_Function_float Function
+         %56 = OpVariable %_ptr_Function_float Function
+         %57 = OpVariable %_ptr_Function_float Function
+         %58 = OpVariable %_ptr_Function_float Function
+         %59 = OpVariable %_ptr_Function_float Function
+         %60 = OpVariable %_ptr_Function_float Function
+         %61 = OpVariable %_ptr_Function_float Function
+         %62 = OpVariable %_ptr_Function_float Function
+         %63 = OpVariable %_ptr_Function_float Function
+         %64 = OpVariable %_ptr_Function_float Function
+         %65 = OpVariable %_ptr_Function_float Function
+         %66 = OpVariable %_ptr_Function_float Function
+         %67 = OpVariable %_ptr_Function_float Function
+         %68 = OpVariable %_ptr_Function_float Function
+         %69 = OpVariable %_ptr_Function_float Function
+         %70 = OpVariable %_ptr_Function_float Function
+         %71 = OpVariable %_ptr_Function_float Function
+         %72 = OpVariable %_ptr_Function_float Function
+               OpStore %2 %73
+               OpStore %3 %74
+         %75 = OpLoad %ulong %2 Aligned 8
+               OpStore %5 %75
+         %76 = OpLoad %ulong %3 Aligned 8
+               OpStore %6 %76
+         %78 = OpLoad %ulong %5
+        %294 = OpConvertUToPtr %_ptr_CrossWorkgroup_uint %78
+        %293 = OpLoad %uint %294 Aligned 4
+         %77 = OpBitcast %float %293
+               OpStore %32 %77
+         %80 = OpLoad %ulong %5
+        %295 = OpConvertUToPtr %_ptr_CrossWorkgroup_uint %80
+        %367 = OpBitcast %_ptr_CrossWorkgroup_uchar %295
+        %368 = OpInBoundsPtrAccessChain %_ptr_CrossWorkgroup_uchar %367 %ulong_4
+        %238 = OpBitcast %_ptr_CrossWorkgroup_uint %368
+        %296 = OpLoad %uint %238 Aligned 4
+         %79 = OpBitcast %float %296
+               OpStore %33 %79
+         %82 = OpLoad %ulong %5
+        %297 = OpConvertUToPtr %_ptr_CrossWorkgroup_uint %82
+        %369 = OpBitcast %_ptr_CrossWorkgroup_uchar %297
+        %370 = OpInBoundsPtrAccessChain %_ptr_CrossWorkgroup_uchar %369 %ulong_8
+        %240 = OpBitcast %_ptr_CrossWorkgroup_uint %370
+        %298 = OpLoad %uint %240 Aligned 4
+         %81 = OpBitcast %float %298
+               OpStore %34 %81
+         %84 = OpLoad %ulong %5
+        %299 = OpConvertUToPtr %_ptr_CrossWorkgroup_uint %84
+        %371 = OpBitcast %_ptr_CrossWorkgroup_uchar %299
+        %372 = OpInBoundsPtrAccessChain %_ptr_CrossWorkgroup_uchar %371 %ulong_12
+        %242 = OpBitcast %_ptr_CrossWorkgroup_uint %372
+        %300 = OpLoad %uint %242 Aligned 4
+         %83 = OpBitcast %float %300
+               OpStore %35 %83
+         %86 = OpLoad %ulong %5
+        %301 = OpConvertUToPtr %_ptr_CrossWorkgroup_uint %86
+        %373 = OpBitcast %_ptr_CrossWorkgroup_uchar %301
+        %374 = OpInBoundsPtrAccessChain %_ptr_CrossWorkgroup_uchar %373 %ulong_16
+        %244 = OpBitcast %_ptr_CrossWorkgroup_uint %374
+        %302 = OpLoad %uint %244 Aligned 4
+         %85 = OpBitcast %float %302
+               OpStore %36 %85
+         %88 = OpLoad %ulong %5
+        %303 = OpConvertUToPtr %_ptr_CrossWorkgroup_uint %88
+        %375 = OpBitcast %_ptr_CrossWorkgroup_uchar %303
+        %376 = OpInBoundsPtrAccessChain %_ptr_CrossWorkgroup_uchar %375 %ulong_20
+        %246 = OpBitcast %_ptr_CrossWorkgroup_uint %376
+        %304 = OpLoad %uint %246 Aligned 4
+         %87 = OpBitcast %float %304
+               OpStore %37 %87
+         %90 = OpLoad %ulong %5
+        %305 = OpConvertUToPtr %_ptr_CrossWorkgroup_uint %90
+        %377 = OpBitcast %_ptr_CrossWorkgroup_uchar %305
+        %378 = OpInBoundsPtrAccessChain %_ptr_CrossWorkgroup_uchar %377 %ulong_24
+        %248 = OpBitcast %_ptr_CrossWorkgroup_uint %378
+        %306 = OpLoad %uint %248 Aligned 4
+         %89 = OpBitcast %float %306
+               OpStore %38 %89
+         %92 = OpLoad %ulong %5
+        %307 = OpConvertUToPtr %_ptr_CrossWorkgroup_uint %92
+        %379 = OpBitcast %_ptr_CrossWorkgroup_uchar %307
+        %380 = OpInBoundsPtrAccessChain %_ptr_CrossWorkgroup_uchar %379 %ulong_28
+        %250 = OpBitcast %_ptr_CrossWorkgroup_uint %380
+        %308 = OpLoad %uint %250 Aligned 4
+         %91 = OpBitcast %float %308
+               OpStore %39 %91
+         %94 = OpLoad %float %32
+         %95 = OpLoad %float %33
+        %382 = OpFConvert %double %94
+        %383 = OpFConvert %double %95
+        %384 = OpFDiv %double %382 %383
+        %386 = OpFAdd %double %384 %double_0
+        %387 = OpFConvert %float %386
+        %389 = OpBitcast %uint %94
+        %390 = OpBitcast %uint %95
+        %391 = OpBitwiseXor %uint %389 %390
+        %392 = OpBitwiseAnd %uint %391 %uint_2147483648
+        %393 = OpBitcast %uint %387
+        %394 = OpBitwiseOr %uint %393 %392
+         %93 = OpBitcast %float %394
+               OpStore %40 %93
+         %97 = OpLoad %float %32
+         %98 = OpLoad %float %33
+        %395 = OpFConvert %double %97
+        %396 = OpFConvert %double %98
+        %397 = OpFDiv %double %395 %396
+        %398 = OpFConvert %float %397
+         %96 = OpCopyObject %float %398
+               OpStore %41 %96
+        %100 = OpLoad %float %32
+        %101 = OpLoad %float %33
+        %399 = OpFConvert %double %100
+        %400 = OpFConvert %double %101
+        %401 = OpFDiv %double %399 %400
+        %402 = OpFConvert %float %401
+         %99 = OpCopyObject %float %402
+               OpStore %42 %99
+        %103 = OpLoad %float %32
+        %104 = OpLoad %float %33
+        %403 = OpFConvert %double %103
+        %404 = OpFConvert %double %104
+        %405 = OpFDiv %double %403 %404
+        %406 = OpFConvert %float %405
+        %102 = OpCopyObject %float %406
+               OpStore %43 %102
+        %106 = OpLoad %float %40
+        %309 = OpBitcast %uint %106
+        %105 = OpCopyObject %uint %309
+               OpStore %10 %105
+        %108 = OpLoad %float %41
+        %310 = OpBitcast %uint %108
+        %107 = OpCopyObject %uint %310
+               OpStore %11 %107
+        %110 = OpLoad %float %42
+        %311 = OpBitcast %uint %110
+        %109 = OpCopyObject %uint %311
+               OpStore %12 %109
+        %112 = OpLoad %float %43
+        %312 = OpBitcast %uint %112
+        %111 = OpCopyObject %uint %312
+               OpStore %13 %111
+        %113 = OpLoad %ulong %6
+        %114 = OpLoad %uint %10
+        %313 = OpConvertUToPtr %_ptr_CrossWorkgroup_uint %113
+               OpStore %313 %114 Aligned 4
+        %115 = OpLoad %ulong %6
+        %116 = OpLoad %uint %11
+        %314 = OpConvertUToPtr %_ptr_CrossWorkgroup_uint %115
+        %407 = OpBitcast %_ptr_CrossWorkgroup_uchar %314
+        %408 = OpInBoundsPtrAccessChain %_ptr_CrossWorkgroup_uchar %407 %ulong_4_0
+        %252 = OpBitcast %_ptr_CrossWorkgroup_uint %408
+               OpStore %252 %116 Aligned 4
+        %117 = OpLoad %ulong %6
+        %118 = OpLoad %uint %12
+        %315 = OpConvertUToPtr %_ptr_CrossWorkgroup_uint %117
+        %409 = OpBitcast %_ptr_CrossWorkgroup_uchar %315
+        %410 = OpInBoundsPtrAccessChain %_ptr_CrossWorkgroup_uchar %409 %ulong_8_0
+        %254 = OpBitcast %_ptr_CrossWorkgroup_uint %410
+               OpStore %254 %118 Aligned 4
+        %119 = OpLoad %ulong %6
+        %120 = OpLoad %uint %13
+        %316 = OpConvertUToPtr %_ptr_CrossWorkgroup_uint %119
+        %411 = OpBitcast %_ptr_CrossWorkgroup_uchar %316
+        %412 = OpInBoundsPtrAccessChain %_ptr_CrossWorkgroup_uchar %411 %ulong_12_0
+        %256 = OpBitcast %_ptr_CrossWorkgroup_uint %412
+               OpStore %256 %120 Aligned 4
+        %122 = OpLoad %float %34
+        %123 = OpLoad %float %35
+        %413 = OpFConvert %double %122
+        %414 = OpFConvert %double %123
+        %415 = OpFDiv %double %413 %414
+        %416 = OpFAdd %double %415 %double_0
+        %417 = OpFConvert %float %416
+        %418 = OpBitcast %uint %122
+        %419 = OpBitcast %uint %123
+        %420 = OpBitwiseXor %uint %418 %419
+        %421 = OpBitwiseAnd %uint %420 %uint_2147483648
+        %422 = OpBitcast %uint %417
+        %423 = OpBitwiseOr %uint %422 %421
+        %121 = OpBitcast %float %423
+               OpStore %44 %121
+        %125 = OpLoad %float %34
+        %126 = OpLoad %float %35
+        %424 = OpFConvert %double %125
+        %425 = OpFConvert %double %126
+        %426 = OpFDiv %double %424 %425
+        %427 = OpFConvert %float %426
+        %124 = OpCopyObject %float %427
+               OpStore %45 %124
+        %128 = OpLoad %float %34
+        %129 = OpLoad %float %35
+        %428 = OpFConvert %double %128
+        %429 = OpFConvert %double %129
+        %430 = OpFDiv %double %428 %429
+        %431 = OpFConvert %float %430
+        %127 = OpCopyObject %float %431
+               OpStore %46 %127
+        %131 = OpLoad %float %34
+        %132 = OpLoad %float %35
+        %432 = OpFConvert %double %131
+        %433 = OpFConvert %double %132
+        %434 = OpFDiv %double %432 %433
+        %435 = OpFConvert %float %434
+        %130 = OpCopyObject %float %435
+               OpStore %47 %130
+        %134 = OpLoad %float %44
+        %317 = OpBitcast %uint %134
+        %133 = OpCopyObject %uint %317
+               OpStore %14 %133
+        %136 = OpLoad %float %45
+        %318 = OpBitcast %uint %136
+        %135 = OpCopyObject %uint %318
+               OpStore %15 %135
+        %138 = OpLoad %float %46
+        %319 = OpBitcast %uint %138
+        %137 = OpCopyObject %uint %319
+               OpStore %16 %137
+        %140 = OpLoad %float %47
+        %320 = OpBitcast %uint %140
+        %139 = OpCopyObject %uint %320
+               OpStore %17 %139
+        %141 = OpLoad %ulong %6
+        %142 = OpLoad %uint %14
+        %321 = OpConvertUToPtr %_ptr_CrossWorkgroup_uint %141
+        %436 = OpBitcast %_ptr_CrossWorkgroup_uchar %321
+        %437 = OpInBoundsPtrAccessChain %_ptr_CrossWorkgroup_uchar %436 %ulong_16_0
+        %258 = OpBitcast %_ptr_CrossWorkgroup_uint %437
+               OpStore %258 %142 Aligned 4
+        %143 = OpLoad %ulong %6
+        %144 = OpLoad %uint %15
+        %322 = OpConvertUToPtr %_ptr_CrossWorkgroup_uint %143
+        %438 = OpBitcast %_ptr_CrossWorkgroup_uchar %322
+        %439 = OpInBoundsPtrAccessChain %_ptr_CrossWorkgroup_uchar %438 %ulong_20_0
+        %260 = OpBitcast %_ptr_CrossWorkgroup_uint %439
+               OpStore %260 %144 Aligned 4
+        %145 = OpLoad %ulong %6
+        %146 = OpLoad %uint %16
+        %323 = OpConvertUToPtr %_ptr_CrossWorkgroup_uint %145
+        %440 = OpBitcast %_ptr_CrossWorkgroup_uchar %323
+        %441 = OpInBoundsPtrAccessChain %_ptr_CrossWorkgroup_uchar %440 %ulong_24_0
+        %262 = OpBitcast %_ptr_CrossWorkgroup_uint %441
+               OpStore %262 %146 Aligned 4
+        %147 = OpLoad %ulong %6
+        %148 = OpLoad %uint %17
+        %324 = OpConvertUToPtr %_ptr_CrossWorkgroup_uint %147
+        %442 = OpBitcast %_ptr_CrossWorkgroup_uchar %324
+        %443 = OpInBoundsPtrAccessChain %_ptr_CrossWorkgroup_uchar %442 %ulong_28_0
+        %264 = OpBitcast %_ptr_CrossWorkgroup_uint %443
+               OpStore %264 %148 Aligned 4
+        %150 = OpLoad %float %36
+        %151 = OpLoad %float %37
+        %444 = OpFConvert %double %150
+        %445 = OpFConvert %double %151
+        %446 = OpFDiv %double %444 %445
+        %447 = OpFAdd %double %446 %double_0
+        %448 = OpFConvert %float %447
+        %449 = OpBitcast %uint %150
+        %450 = OpBitcast %uint %151
+        %451 = OpBitwiseXor %uint %449 %450
+        %452 = OpBitwiseAnd %uint %451 %uint_2147483648
+        %453 = OpBitcast %uint %448
+        %454 = OpBitwiseOr %uint %453 %452
+        %149 = OpBitcast %float %454
+               OpStore %48 %149
+        %153 = OpLoad %float %36
+        %154 = OpLoad %float %37
+        %455 = OpFConvert %double %153
+        %456 = OpFConvert %double %154
+        %457 = OpFDiv %double %455 %456
+        %458 = OpFConvert %float %457
+        %152 = OpCopyObject %float %458
+               OpStore %49 %152
+        %156 = OpLoad %float %36
+        %157 = OpLoad %float %37
+        %459 = OpFConvert %double %156
+        %460 = OpFConvert %double %157
+        %461 = OpFDiv %double %459 %460
+        %462 = OpFConvert %float %461
+        %155 = OpCopyObject %float %462
+               OpStore %50 %155
+        %159 = OpLoad %float %36
+        %160 = OpLoad %float %37
+        %463 = OpFConvert %double %159
+        %464 = OpFConvert %double %160
+        %465 = OpFDiv %double %463 %464
+        %466 = OpFConvert %float %465
+        %158 = OpCopyObject %float %466
+               OpStore %51 %158
+        %162 = OpLoad %float %48
+        %325 = OpBitcast %uint %162
+        %161 = OpCopyObject %uint %325
+               OpStore %18 %161
+        %164 = OpLoad %float %49
+        %326 = OpBitcast %uint %164
+        %163 = OpCopyObject %uint %326
+               OpStore %19 %163
+        %166 = OpLoad %float %50
+        %327 = OpBitcast %uint %166
+        %165 = OpCopyObject %uint %327
+               OpStore %20 %165
+        %168 = OpLoad %float %51
+        %328 = OpBitcast %uint %168
+        %167 = OpCopyObject %uint %328
+               OpStore %21 %167
+        %169 = OpLoad %ulong %6
+        %170 = OpLoad %uint %18
+        %329 = OpConvertUToPtr %_ptr_CrossWorkgroup_uint %169
+        %467 = OpBitcast %_ptr_CrossWorkgroup_uchar %329
+        %468 = OpInBoundsPtrAccessChain %_ptr_CrossWorkgroup_uchar %467 %ulong_32
+        %266 = OpBitcast %_ptr_CrossWorkgroup_uint %468
+               OpStore %266 %170 Aligned 4
+        %171 = OpLoad %ulong %6
+        %172 = OpLoad %uint %19
+        %330 = OpConvertUToPtr %_ptr_CrossWorkgroup_uint %171
+        %469 = OpBitcast %_ptr_CrossWorkgroup_uchar %330
+        %470 = OpInBoundsPtrAccessChain %_ptr_CrossWorkgroup_uchar %469 %ulong_36
+        %268 = OpBitcast %_ptr_CrossWorkgroup_uint %470
+               OpStore %268 %172 Aligned 4
+        %173 = OpLoad %ulong %6
+        %174 = OpLoad %uint %20
+        %331 = OpConvertUToPtr %_ptr_CrossWorkgroup_uint %173
+        %471 = OpBitcast %_ptr_CrossWorkgroup_uchar %331
+        %472 = OpInBoundsPtrAccessChain %_ptr_CrossWorkgroup_uchar %471 %ulong_40
+        %270 = OpBitcast %_ptr_CrossWorkgroup_uint %472
+               OpStore %270 %174 Aligned 4
+        %175 = OpLoad %ulong %6
+        %176 = OpLoad %uint %21
+        %332 = OpConvertUToPtr %_ptr_CrossWorkgroup_uint %175
+        %473 = OpBitcast %_ptr_CrossWorkgroup_uchar %332
+        %474 = OpInBoundsPtrAccessChain %_ptr_CrossWorkgroup_uchar %473 %ulong_44
+        %272 = OpBitcast %_ptr_CrossWorkgroup_uint %474
+               OpStore %272 %176 Aligned 4
+        %178 = OpLoad %float %38
+        %179 = OpLoad %float %39
+        %475 = OpFConvert %double %178
+        %476 = OpFConvert %double %179
+        %477 = OpFDiv %double %475 %476
+        %478 = OpFAdd %double %477 %double_0
+        %479 = OpFConvert %float %478
+        %480 = OpBitcast %uint %178
+        %481 = OpBitcast %uint %179
+        %482 = OpBitwiseXor %uint %480 %481
+        %483 = OpBitwiseAnd %uint %482 %uint_2147483648
+        %484 = OpBitcast %uint %479
+        %485 = OpBitwiseOr %uint %484 %483
+        %177 = OpBitcast %float %485
+               OpStore %52 %177
+        %181 = OpLoad %float %38
+        %182 = OpLoad %float %39
+        %486 = OpFConvert %double %181
+        %487 = OpFConvert %double %182
+        %488 = OpFDiv %double %486 %487
+        %489 = OpFConvert %float %488
+        %180 = OpCopyObject %float %489
+               OpStore %53 %180
+        %184 = OpLoad %float %38
+        %185 = OpLoad %float %39
+        %490 = OpFConvert %double %184
+        %491 = OpFConvert %double %185
+        %492 = OpFDiv %double %490 %491
+        %493 = OpFConvert %float %492
+        %183 = OpCopyObject %float %493
+               OpStore %54 %183
+        %187 = OpLoad %float %38
+        %188 = OpLoad %float %39
+        %494 = OpFConvert %double %187
+        %495 = OpFConvert %double %188
+        %496 = OpFDiv %double %494 %495
+        %497 = OpFConvert %float %496
+        %186 = OpCopyObject %float %497
+               OpStore %55 %186
+        %190 = OpLoad %float %52
+        %333 = OpBitcast %uint %190
+        %189 = OpCopyObject %uint %333
+               OpStore %22 %189
+        %192 = OpLoad %float %53
+        %334 = OpBitcast %uint %192
+        %191 = OpCopyObject %uint %334
+               OpStore %23 %191
+        %194 = OpLoad %float %54
+        %335 = OpBitcast %uint %194
+        %193 = OpCopyObject %uint %335
+               OpStore %24 %193
+        %196 = OpLoad %float %55
+        %336 = OpBitcast %uint %196
+        %195 = OpCopyObject %uint %336
+               OpStore %25 %195
+        %197 = OpLoad %ulong %6
+        %198 = OpLoad %uint %22
+        %337 = OpConvertUToPtr %_ptr_CrossWorkgroup_uint %197
+        %498 = OpBitcast %_ptr_CrossWorkgroup_uchar %337
+        %499 = OpInBoundsPtrAccessChain %_ptr_CrossWorkgroup_uchar %498 %ulong_48
+        %274 = OpBitcast %_ptr_CrossWorkgroup_uint %499
+               OpStore %274 %198 Aligned 4
+        %199 = OpLoad %ulong %6
+        %200 = OpLoad %uint %23
+        %338 = OpConvertUToPtr %_ptr_CrossWorkgroup_uint %199
+        %500 = OpBitcast %_ptr_CrossWorkgroup_uchar %338
+        %501 = OpInBoundsPtrAccessChain %_ptr_CrossWorkgroup_uchar %500 %ulong_52
+        %276 = OpBitcast %_ptr_CrossWorkgroup_uint %501
+               OpStore %276 %200 Aligned 4
+        %201 = OpLoad %ulong %6
+        %202 = OpLoad %uint %24
+        %339 = OpConvertUToPtr %_ptr_CrossWorkgroup_uint %201
+        %502 = OpBitcast %_ptr_CrossWorkgroup_uchar %339
+        %503 = OpInBoundsPtrAccessChain %_ptr_CrossWorkgroup_uchar %502 %ulong_56
+        %278 = OpBitcast %_ptr_CrossWorkgroup_uint %503
+               OpStore %278 %202 Aligned 4
+        %203 = OpLoad %ulong %6
+        %204 = OpLoad %uint %25
+        %340 = OpConvertUToPtr %_ptr_CrossWorkgroup_uint %203
+        %504 = OpBitcast %_ptr_CrossWorkgroup_uchar %340
+        %505 = OpInBoundsPtrAccessChain %_ptr_CrossWorkgroup_uchar %504 %ulong_60
+        %280 = OpBitcast %_ptr_CrossWorkgroup_uint %505
+               OpStore %280 %204 Aligned 4
+        %206 = OpLoad %ulong %5
+        %341 = OpConvertUToPtr %_ptr_CrossWorkgroup_uint %206
+        %506 = OpBitcast %_ptr_CrossWorkgroup_uchar %341
+        %507 = OpInBoundsPtrAccessChain %_ptr_CrossWorkgroup_uchar %506 %ulong_32_0
+        %282 = OpBitcast %_ptr_CrossWorkgroup_uint %507
+        %342 = OpLoad %uint %282 Aligned 4
+        %205 = OpBitcast %float %342
+               OpStore %56 %205
+        %208 = OpLoad %ulong %5
+        %343 = OpConvertUToPtr %_ptr_CrossWorkgroup_uint %208
+        %508 = OpBitcast %_ptr_CrossWorkgroup_uchar %343
+        %509 = OpInBoundsPtrAccessChain %_ptr_CrossWorkgroup_uchar %508 %ulong_36_0
+        %284 = OpBitcast %_ptr_CrossWorkgroup_uint %509
+        %344 = OpLoad %uint %284 Aligned 4
+        %207 = OpBitcast %float %344
+               OpStore %57 %207
+        %210 = OpLoad %float %56
+        %211 = OpLoad %float %57
+        %510 = OpFConvert %double %210
+        %511 = OpFConvert %double %211
+        %512 = OpFDiv %double %510 %511
+        %513 = OpFAdd %double %512 %double_0
+        %514 = OpFConvert %float %513
+        %515 = OpBitcast %uint %210
+        %516 = OpBitcast %uint %211
+        %517 = OpBitwiseXor %uint %515 %516
+        %518 = OpBitwiseAnd %uint %517 %uint_2147483648
+        %519 = OpBitcast %uint %514
+        %520 = OpBitwiseOr %uint %519 %518
+        %209 = OpBitcast %float %520
+               OpStore %58 %209
+        %213 = OpLoad %float %56
+        %214 = OpLoad %float %57
+        %521 = OpFConvert %double %213
+        %522 = OpFConvert %double %214
+        %523 = OpFDiv %double %521 %522
+        %524 = OpFConvert %float %523
+        %212 = OpCopyObject %float %524
+               OpStore %59 %212
+        %216 = OpLoad %float %56
+        %217 = OpLoad %float %57
+        %525 = OpFConvert %double %216
+        %526 = OpFConvert %double %217
+        %527 = OpFDiv %double %525 %526
+        %528 = OpFConvert %float %527
+        %215 = OpCopyObject %float %528
+               OpStore %60 %215
+        %219 = OpLoad %float %56
+        %220 = OpLoad %float %57
+        %529 = OpFConvert %double %219
+        %530 = OpFConvert %double %220
+        %531 = OpFDiv %double %529 %530
+        %532 = OpFConvert %float %531
+        %218 = OpCopyObject %float %532
+               OpStore %61 %218
+        %222 = OpLoad %float %58
+        %345 = OpBitcast %uint %222
+        %221 = OpCopyObject %uint %345
+               OpStore %26 %221
+        %224 = OpLoad %float %59
+        %346 = OpBitcast %uint %224
+        %223 = OpCopyObject %uint %346
+               OpStore %27 %223
+        %226 = OpLoad %float %60
+        %347 = OpBitcast %uint %226
+        %225 = OpCopyObject %uint %347
+               OpStore %28 %225
+        %228 = OpLoad %float %61
+        %348 = OpBitcast %uint %228
+        %227 = OpCopyObject %uint %348
+               OpStore %29 %227
+        %229 = OpLoad %ulong %6
+        %230 = OpLoad %uint %26
+        %349 = OpConvertUToPtr %_ptr_CrossWorkgroup_uint %229
+        %533 = OpBitcast %_ptr_CrossWorkgroup_uchar %349
+        %534 = OpInBoundsPtrAccessChain %_ptr_CrossWorkgroup_uchar %533 %ulong_64
+        %286 = OpBitcast %_ptr_CrossWorkgroup_uint %534
+               OpStore %286 %230 Aligned 4
+        %231 = OpLoad %ulong %6
+        %232 = OpLoad %uint %27
+        %350 = OpConvertUToPtr %_ptr_CrossWorkgroup_uint %231
+        %535 = OpBitcast %_ptr_CrossWorkgroup_uchar %350
+        %536 = OpInBoundsPtrAccessChain %_ptr_CrossWorkgroup_uchar %535 %ulong_68
+        %288 = OpBitcast %_ptr_CrossWorkgroup_uint %536
+               OpStore %288 %232 Aligned 4
+        %233 = OpLoad %ulong %6
+        %234 = OpLoad %uint %28
+        %351 = OpConvertUToPtr %_ptr_CrossWorkgroup_uint %233
+        %537 = OpBitcast %_ptr_CrossWorkgroup_uchar %351
+        %538 = OpInBoundsPtrAccessChain %_ptr_CrossWorkgroup_uchar %537 %ulong_72
+        %290 = OpBitcast %_ptr_CrossWorkgroup_uint %538
+               OpStore %290 %234 Aligned 4
+        %235 = OpLoad %ulong %6
+        %236 = OpLoad %uint %29
+        %352 = OpConvertUToPtr %_ptr_CrossWorkgroup_uint %235
+        %539 = OpBitcast %_ptr_CrossWorkgroup_uchar %352
+        %540 = OpInBoundsPtrAccessChain %_ptr_CrossWorkgroup_uchar %539 %ulong_76
+        %292 = OpBitcast %_ptr_CrossWorkgroup_uint %540
+               OpStore %292 %236 Aligned 4
+               OpReturn
+               OpFunctionEnd

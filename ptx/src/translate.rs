@@ -4184,9 +4184,7 @@ fn emit_function_body_ops(
                         builder.s_div(result_type, Some(arg.dst), arg.src1, arg.src2)?;
                     }
                     ast::DivDetails::Float(t) => {
-                        let result_type = map.get_or_add_scalar(builder, t.typ.into());
-                        builder.f_div(result_type, Some(arg.dst), arg.src1, arg.src2)?;
-                        emit_float_div_decoration(builder, arg.dst, t.kind);
+                        emit_float_div(builder, map, t, arg)?;
                     }
                 },
                 ast::Instruction::Sqrt(details, a) => {
@@ -6197,6 +6195,124 @@ fn emit_float_div_decoration(builder: &mut dr::Builder, dst: spirv::Word, kind: 
         ast::DivFloatKind::Rounding(_rnd) => {}
         ast::DivFloatKind::Full => {}
     }
+}
+
+/// Whether a float32 division with a rounding mode is compiled to the correctly
+/// rounded shape.
+///
+/// PTX requires `div.rn.f32` to be correctly rounded and the directed forms to
+/// round in the asked direction, and SPIR-V requires the same of `OpFDiv`. This
+/// backend compiles a float32 `OpFDiv` into an estimate plus refinements that is
+/// 1 to 2 ulp off on 22% of inputs and that ignores the rounding mode entirely
+/// (measured on the B580 against an exact rational reference;
+/// `tmp/harness/divrn/`, write-up `odocs/BUG-div-rn.md`). The exact forms are
+/// therefore expressed as a double quotient narrowed with the asked rounding,
+/// which is how `rcp` was fixed.
+///
+/// That shape is exactly correct rather than nearly: a quotient of two float32
+/// values is never exactly a float32 midpoint (the 25-bit significand that would
+/// need forces the divisor's significand to divide the dividend's, which cannot
+/// happen below 2^24), and its distance to one is at least 2^-24 relative against
+/// a 2^-53 double rounding error, so narrowing the f64 quotient cannot cross a
+/// rounding boundary.
+///
+/// `div.approx` and `div.full` are relaxed by contract, so they keep the single
+/// instruction: the compiled Triton and llama.cpp corpora use those forms
+/// (`div.full.f32` and `div.approx.f32` respectively) and a plain float division
+/// is inside both of their bounds.
+///
+/// A `.ftz` form keeps the previous lowering, because neither shape flushes a
+/// subnormal input and the previous behaviour is what the corpus was measured
+/// against; nothing in the lifted or library corpora asks for `div.rn.ftz.f32`.
+///
+/// The double quotient survives only because of the `+ 0.0` below, and that is a
+/// dependency on a compiler behaviour rather than on the ISA: IGC rewrites
+/// `cvt.rn.f32.f64(OpFDiv f64)` back into its own float division (the 1-2 ulp
+/// code this fix exists to avoid), and it folds away every operation that is a
+/// semantic identity - `q * 1.0`, `q + (-0.0)`, `q - 0.0` - so those do not stop
+/// it. `q + (+0.0)` is not an identity for a `-0.0` quotient, so the optimizer
+/// keeps it and the division with it; the sign of a zero quotient is then
+/// restored from the operands. If a future IGC learns to fold `x + 0.0` the
+/// division silently goes back to 1-2 ulp, which is exactly what the device test
+/// `ptx/src/test/spirv_run/div_rounding.ptx` is there to catch.
+fn exact_div_default() -> bool {
+    true
+}
+
+fn exact_div_enabled() -> bool {
+    match std::env::var_os("ZLUDA_PTX_EXACT_DIV") {
+        Some(value) => {
+            let text = value.to_string_lossy().to_lowercase();
+            !(text == "0" || text == "off" || text == "false")
+        }
+        None => exact_div_default(),
+    }
+}
+
+fn emit_float_div(
+    builder: &mut dr::Builder,
+    map: &mut TypeWordMap,
+    desc: &ast::DivFloatDetails,
+    arg: &ast::Arg3<ExpandedArgParams>,
+) -> Result<(), TranslateError> {
+    let exact_rounding = match desc.kind {
+        ast::DivFloatKind::Rounding(mode)
+            if desc.typ == ast::ScalarType::F32
+                && desc.flush_to_zero != Some(true)
+                && exact_div_enabled() =>
+        {
+            Some(mode)
+        }
+        _ => None,
+    };
+    if let Some(rounding) = exact_rounding {
+        let f64_type = map.get_or_add_scalar(builder, ast::ScalarType::F64);
+        let f32_type = map.get_or_add_scalar(builder, ast::ScalarType::F32);
+        let lhs = builder.f_convert(f64_type, None, arg.src1)?;
+        let rhs = builder.f_convert(f64_type, None, arg.src2)?;
+        let quotient = builder.f_div(f64_type, None, lhs, rhs)?;
+        // See the note above: the `+ 0.0` is what keeps the double division
+        // alive in the backend, and it is exact for every quotient except -0.0.
+        let value = if rounding == ast::RoundingMode::NearestEven {
+            let zero = map.get_or_add_constant(
+                builder,
+                &ast::Type::Scalar(ast::ScalarType::F64),
+                &vec_repr(0.0f64),
+            )?;
+            builder.f_add(f64_type, None, quotient, zero)?
+        } else {
+            quotient
+        };
+        let converted = builder.id();
+        builder.f_convert(f32_type, Some(converted), value)?;
+        emit_rounding_decoration(builder, converted, Some(rounding));
+        if rounding == ast::RoundingMode::NearestEven {
+            // A negative quotient that rounds to zero comes back as +0.0 after
+            // the add, so put the sign back: the sign of the quotient is the
+            // exclusive or of the operands' sign bits, and OR-ing it in is a
+            // no-op for every result that is not zero.
+            let u32_type = map.get_or_add_scalar(builder, ast::ScalarType::U32);
+            let mask = map.get_or_add_constant(
+                builder,
+                &ast::Type::Scalar(ast::ScalarType::U32),
+                &vec_repr(0x8000_0000u32),
+            )?;
+            let lhs_bits = builder.bitcast(u32_type, None, arg.src1)?;
+            let rhs_bits = builder.bitcast(u32_type, None, arg.src2)?;
+            let sign = builder.bitwise_xor(u32_type, None, lhs_bits, rhs_bits)?;
+            let sign = builder.bitwise_and(u32_type, None, sign, mask)?;
+            let result_bits = builder.bitcast(u32_type, None, converted)?;
+            let fixed = builder.bitwise_or(u32_type, None, result_bits, sign)?;
+            builder.bitcast(f32_type, Some(arg.dst), fixed)?;
+            return Ok(());
+        }
+        builder.copy_object(f32_type, Some(arg.dst), converted)?;
+        return Ok(());
+    }
+    let result_type = map.get_or_add_scalar(builder, desc.typ.into());
+    builder.f_div(result_type, Some(arg.dst), arg.src1, arg.src2)?;
+    emit_float_div_decoration(builder, arg.dst, desc.kind);
+    Ok(())
 }
 
 fn emit_atom(

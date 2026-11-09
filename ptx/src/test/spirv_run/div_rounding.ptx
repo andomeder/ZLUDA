@@ -1,0 +1,131 @@
+.version 6.5
+.target sm_30
+.address_size 64
+
+// What a float division has to deliver on this backend: `div.rn` must be the
+// correctly rounded quotient, and the directed modes must round in the direction
+// they name.
+//
+// Both were broken. Every float32 division was emitted as a single OpFDiv, which
+// this backend compiles into an estimate plus refinements that is 1 to 2 ulp off
+// on 22% of inputs, and the rounding mode was not emitted at all - so `div.rz`
+// and `div.rp` both returned the round-to-nearest value (measured on the B580
+// against an exact rational reference, 52% of 8192 pairs wrong for the directed
+// modes; the same PTX on an RTX 2070 is exact for all four, so PTX requires it
+// and hardware delivers it). See odocs/BUG-div-rn.md.
+//
+// The four pairs are chosen so that the old lowering fails each mode:
+//   1.0 / 3.0      rn and rp are the float above rz and rm
+//   -8.291009 / 1.3947779072e10
+//                  this pair's NEAREST result was measured one ulp low before
+//                  the fix, so the test catches the plain division on its own
+//   7.0 / 49.0     a second repeating quotient, in the same direction
+//   -1.0 / 3.0     the sign flip: for a negative quotient rm is the one that
+//                  rounds away from zero and rp the one that rounds toward it
+//
+// A fifth pair, +0.0 / -1.0, pins the sign of a zero quotient: the fold-defeating
+// add turns a -0.0 quotient into +0.0, and the lowering restores the sign from the
+// operands' sign bits.
+//
+// Results are written as raw bits, so the comparison is bit equality. Note that
+// a quotient of two float32 values can never be exactly a float32 midpoint, and
+// its distance to one is at least 2^-24 relative against a 2^-53 double rounding
+// error, so expressing a division as a double quotient narrowed with the asked
+// rounding is exactly correct rather than nearly correct.
+//
+// Per pair, four words: rn, rz, rm, rp.
+.visible .entry div_rounding(
+	.param .u64 input,
+	.param .u64 output
+)
+{
+	.reg .u64 %rd<5>;
+	.reg .b32 %r<22>;
+	.reg .f32 %f<42>;
+
+	ld.param.u64 %rd1, [input];
+	ld.param.u64 %rd2, [output];
+
+	ld.global.b32 %f1, [%rd1];        // a0
+	ld.global.b32 %f2, [%rd1+4];      // b0
+	ld.global.b32 %f3, [%rd1+8];      // a1
+	ld.global.b32 %f4, [%rd1+12];     // b1
+	ld.global.b32 %f5, [%rd1+16];     // a2
+	ld.global.b32 %f6, [%rd1+20];     // b2
+	ld.global.b32 %f7, [%rd1+24];     // a3
+	ld.global.b32 %f8, [%rd1+28];     // b3
+
+	div.rn.f32 %f9,  %f1, %f2;
+	div.rz.f32 %f10, %f1, %f2;
+	div.rm.f32 %f11, %f1, %f2;
+	div.rp.f32 %f12, %f1, %f2;
+	mov.b32 %r1, %f9;
+	mov.b32 %r2, %f10;
+	mov.b32 %r3, %f11;
+	mov.b32 %r4, %f12;
+	st.global.b32 [%rd2],    %r1;
+	st.global.b32 [%rd2+4],  %r2;
+	st.global.b32 [%rd2+8],  %r3;
+	st.global.b32 [%rd2+12], %r4;
+
+	div.rn.f32 %f13, %f3, %f4;
+	div.rz.f32 %f14, %f3, %f4;
+	div.rm.f32 %f15, %f3, %f4;
+	div.rp.f32 %f16, %f3, %f4;
+	mov.b32 %r5, %f13;
+	mov.b32 %r6, %f14;
+	mov.b32 %r7, %f15;
+	mov.b32 %r8, %f16;
+	st.global.b32 [%rd2+16], %r5;
+	st.global.b32 [%rd2+20], %r6;
+	st.global.b32 [%rd2+24], %r7;
+	st.global.b32 [%rd2+28], %r8;
+
+	div.rn.f32 %f17, %f5, %f6;
+	div.rz.f32 %f18, %f5, %f6;
+	div.rm.f32 %f19, %f5, %f6;
+	div.rp.f32 %f20, %f5, %f6;
+	mov.b32 %r9, %f17;
+	mov.b32 %r10, %f18;
+	mov.b32 %r11, %f19;
+	mov.b32 %r12, %f20;
+	st.global.b32 [%rd2+32], %r9;
+	st.global.b32 [%rd2+36], %r10;
+	st.global.b32 [%rd2+40], %r11;
+	st.global.b32 [%rd2+44], %r12;
+
+	div.rn.f32 %f21, %f7, %f8;
+	div.rz.f32 %f22, %f7, %f8;
+	div.rm.f32 %f23, %f7, %f8;
+	div.rp.f32 %f24, %f7, %f8;
+	mov.b32 %r13, %f21;
+	mov.b32 %r14, %f22;
+	mov.b32 %r15, %f23;
+	mov.b32 %r16, %f24;
+	st.global.b32 [%rd2+48], %r13;
+	st.global.b32 [%rd2+52], %r14;
+	st.global.b32 [%rd2+56], %r15;
+	st.global.b32 [%rd2+60], %r16;
+
+	// a4 = +0.0, b4 = -1.0: the quotient is a NEGATIVE zero, and its sign comes
+	// from the operands rather than from the value. This is the pair that pins
+	// the sign of a zero result, which the fold-defeating `+ 0.0` would
+	// otherwise turn into +0.0.
+	ld.global.b32 %f25, [%rd1+32];
+	ld.global.b32 %f26, [%rd1+36];
+
+	div.rn.f32 %f27, %f25, %f26;
+	div.rz.f32 %f28, %f25, %f26;
+	div.rm.f32 %f29, %f25, %f26;
+	div.rp.f32 %f30, %f25, %f26;
+	mov.b32 %r17, %f27;
+	mov.b32 %r18, %f28;
+	mov.b32 %r19, %f29;
+	mov.b32 %r20, %f30;
+	st.global.b32 [%rd2+64], %r17;
+	st.global.b32 [%rd2+68], %r18;
+	st.global.b32 [%rd2+72], %r19;
+	st.global.b32 [%rd2+76], %r20;
+
+	ret;
+}

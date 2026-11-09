@@ -334,8 +334,12 @@ impl CUdevice_attribute {
             CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COOPERATIVE_MULTI_DEVICE_LAUNCH => Some(0),
 
             CUdevice_attribute::CU_DEVICE_ATTRIBUTE_HOST_REGISTER_SUPPORTED => Some(1),
-            // The resident-block cap the occupancy queries model.
-            CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_BLOCKS_PER_MULTIPROCESSOR => Some(16),
+            // The resident-block cap the occupancy queries model. Measured on the
+            // Arc B580 with a group that spins on a host word until released, so
+            // every resident group is in flight at once: 1280 workgroups over 20
+            // sub-slices at 16 and at 8 threads per group, i.e. 64 per sub-slice.
+            // At 128 threads the thread limit binds first (16).
+            CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_BLOCKS_PER_MULTIPROCESSOR => Some(64),
             _ => None,
         }
     }
@@ -356,9 +360,24 @@ pub fn get_attribute(
     }
     let value: i32 = match attrib {
         CUdevice_attribute::CU_DEVICE_ATTRIBUTE_ASYNC_ENGINE_COUNT => 2,
-        // A multiprocessor corresponds roughly to a sub-slice (a thread group
-        // cannot cross one either).
-        CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT => 28,
+        // A multiprocessor is a sub-slice: a thread group cannot cross one, and
+        // the limits the occupancy queries model (threads, resident groups,
+        // shared memory) are the sub-slice's. The count has to come from the
+        // device: hardcoding 28 made every occupancy answer 40% too large, and
+        // the Arc B580 has 5 slices of 4 sub-slices, i.e. 20.
+        CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT => {
+            GlobalState::lock_device(dev_idx, |dev| {
+                let props = dev.get_properties()?;
+                Ok::<_, l0::sys::ze_result_t>(cmp::max(
+                    1,
+                    match (props.numSlices, props.numSubslicesPerSlice) {
+                        (slices, subs) if slices > 0 && subs > 0 => slices * subs,
+                        (slices, _) if slices > 0 => slices,
+                        _ => 1,
+                    },
+                ) as i32)
+            })??
+        }
         CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR => {
             GlobalState::lock_device(dev_idx, |dev| {
                 let max_simd = dev.get_max_simd()?;

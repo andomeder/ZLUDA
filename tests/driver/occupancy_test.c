@@ -49,6 +49,43 @@ int main(void) {
         printf("block=%4d -> %d blocks/sm (rc=%d)\n", sizes[i], blocks, r);
         if (r != CUDA_SUCCESS || blocks <= 0) bad++;
     }
+
+    /* The two caps, checked against what the hardware delivers: a group that
+       spins on a host word until it is released (tmp/harness/hangdiag/
+       resident_probe.c) measures 320 resident workgroups at 128 threads, 640 at
+       64, 1280 at 32, 16 and 8 - i.e. threads-per-multiprocessor binds down to
+       128 and the block cap binds below it. The query has to reproduce both,
+       because an application picks its grid from these numbers. */
+    int threads_per_mp = 0, max_blocks = 0, mps = 0;
+    cuDeviceGetAttribute(&threads_per_mp, CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR, dev);
+    cuDeviceGetAttribute(&max_blocks, CU_DEVICE_ATTRIBUTE_MAX_BLOCKS_PER_MULTIPROCESSOR, dev);
+    cuDeviceGetAttribute(&mps, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, dev);
+    int occ128 = 0, occ16 = 0, occ32 = 0, occ1024 = 0;
+    cuOccupancyMaxActiveBlocksPerMultiprocessor(&occ128, fn, 128, 0);
+    cuOccupancyMaxActiveBlocksPerMultiprocessor(&occ16, fn, 16, 0);
+    cuOccupancyMaxActiveBlocksPerMultiprocessor(&occ32, fn, 32, 0);
+    cuOccupancyMaxActiveBlocksPerMultiprocessor(&occ1024, fn, 1024, 0);
+    printf("multiprocessors %d x blocks(128) %d = %d resident workgroups\n", mps, occ128,
+           mps * occ128);
+    if (occ128 != threads_per_mp / 128) {
+        printf("FAIL: 128-thread occupancy should be the thread limit (%d)\n",
+               threads_per_mp / 128);
+        bad++;
+    }
+    if (occ1024 != threads_per_mp / 1024) {
+        printf("FAIL: 1024-thread occupancy should be the thread limit (%d)\n",
+               threads_per_mp / 1024);
+        bad++;
+    }
+    if (occ16 != max_blocks || occ32 != max_blocks) {
+        printf("FAIL: a small group should reach the block cap (%d), got %d and %d\n",
+               max_blocks, occ16, occ32);
+        bad++;
+    }
+    if (mps <= 1 || mps > 256) {
+        printf("FAIL: implausible multiprocessor count %d\n", mps);
+        bad++;
+    }
     /* Dynamic shared memory has to reduce the number of resident blocks. */
     int blocks_no_smem = 0, blocks_big_smem = 0;
     cuOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_no_smem, fn, 256, 0);

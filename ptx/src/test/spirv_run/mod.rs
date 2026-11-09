@@ -93,6 +93,18 @@ test_ptx!(global_array, [0xDEADu32], [1u32]);
 test_ptx!(extern_shared, [127u64], [127u64]);
 test_ptx!(extern_shared_call, [121u64], [123u64]);
 test_ptx!(rcp, [2f32], [0.5f32]);
+// The refinement a caller performs on rcp.approx (which is torch's whole 1/x
+// kernel), and the directed rounding modes. Bits, so the compare is exact.
+test_ptx!(
+    rcp_rounding,
+    [3f32, -3f32, 7f32, 49f32],
+    [
+        0x3eaaaaabu32, 0xbeaaaaabu32, 0x3e124925u32, 0x3ca72f05u32,
+        0x3eaaaaaau32, 0xbeaaaaaau32, 0x3e124924u32, 0x3ca72f05u32,
+        0x3eaaaaaau32, 0xbeaaaaabu32, 0x3e124924u32, 0x3ca72f05u32,
+        0x3eaaaaabu32, 0xbeaaaaaau32, 0x3e124925u32, 0x3ca72f06u32
+    ]
+);
 // 0b1_00000000_10000000000000000000000u32 is a large denormal
 // 0x3f000000 is 0.5
 test_ptx!(

@@ -1,0 +1,115 @@
+.version 6.5
+.target sm_30
+.address_size 64
+
+// What a reciprocal has to deliver on this backend: the refinement a caller
+// performs on rcp.approx must land on the exactly rounded value, and the
+// directed rounding modes must honour their direction.
+//
+// Both were broken. The refinement is what torch's `1.0f / x` kernel does, and
+// it used to be folded away - the refined result came back bit-identical to the
+// approximation on 8190 of 8192 inputs, so a caller got the raw value, one ulp
+// low on 10.4% of them (odocs/BUG-rcp-approx.md). And rcp.rz/rm/rp were emitted
+// as round to nearest, so rcp.rz of 3.0 came back as the float above it.
+//
+// The raw approximate and .rn forms are deliberately NOT pinned here: this
+// backend narrows a double quotient plus a round-to-nearest conversion back into
+// its own float division, which is one ulp from correctly rounded, and encoding
+// that in a test would pin a compiler behaviour rather than a contract. The
+// approximate form is allowed that error; the caller-visible result is what this
+// test holds to the bit.
+//
+// Results are written as raw bits, so the comparison is bit equality.
+//
+// Per input, four words: refined(rcp.approx.ftz), rcp.rz, rcp.rm, rcp.rp.
+.visible .entry rcp_rounding(
+	.param .u64 input,
+	.param .u64 output
+)
+{
+	.reg .u64 %rd<3>;
+	.reg .b32 %r<20>;
+	.reg .f32 %f<40>;
+
+	ld.param.u64 %rd1, [input];
+	ld.param.u64 %rd2, [output];
+
+	ld.global.b32 %f1, [%rd1];
+	ld.global.b32 %f2, [%rd1+4];
+	ld.global.b32 %f3, [%rd1+8];
+	ld.global.b32 %f4, [%rd1+12];
+
+	// the refinement a caller performs on rcp.approx.ftz.f32
+	rcp.approx.ftz.f32 %f5, %f1;
+	fma.rn.f32 %f6, %f5, %f1, 0fBF800000;
+	sub.rn.f32 %f7, 0f00000000, %f6;
+	fma.rn.f32 %f8, %f5, %f7, %f5;
+	mov.b32 %r1, %f8;
+
+	rcp.approx.ftz.f32 %f9, %f2;
+	fma.rn.f32 %f10, %f9, %f2, 0fBF800000;
+	sub.rn.f32 %f11, 0f00000000, %f10;
+	fma.rn.f32 %f12, %f9, %f11, %f9;
+	mov.b32 %r2, %f12;
+
+	rcp.approx.ftz.f32 %f13, %f3;
+	fma.rn.f32 %f14, %f13, %f3, 0fBF800000;
+	sub.rn.f32 %f15, 0f00000000, %f14;
+	fma.rn.f32 %f16, %f13, %f15, %f13;
+	mov.b32 %r3, %f16;
+
+	rcp.approx.ftz.f32 %f17, %f4;
+	fma.rn.f32 %f18, %f17, %f4, 0fBF800000;
+	sub.rn.f32 %f19, 0f00000000, %f18;
+	fma.rn.f32 %f20, %f17, %f19, %f17;
+	mov.b32 %r4, %f20;
+
+	st.global.b32 [%rd2], %r1;
+	st.global.b32 [%rd2+4], %r2;
+	st.global.b32 [%rd2+8], %r3;
+	st.global.b32 [%rd2+12], %r4;
+
+	// rcp.rz.f32
+	rcp.rz.f32 %f21, %f1;
+	rcp.rz.f32 %f22, %f2;
+	rcp.rz.f32 %f23, %f3;
+	rcp.rz.f32 %f24, %f4;
+	mov.b32 %r5, %f21;
+	mov.b32 %r6, %f22;
+	mov.b32 %r7, %f23;
+	mov.b32 %r8, %f24;
+	st.global.b32 [%rd2+16], %r5;
+	st.global.b32 [%rd2+20], %r6;
+	st.global.b32 [%rd2+24], %r7;
+	st.global.b32 [%rd2+28], %r8;
+
+	// rcp.rm.f32
+	rcp.rm.f32 %f25, %f1;
+	rcp.rm.f32 %f26, %f2;
+	rcp.rm.f32 %f27, %f3;
+	rcp.rm.f32 %f28, %f4;
+	mov.b32 %r9, %f25;
+	mov.b32 %r10, %f26;
+	mov.b32 %r11, %f27;
+	mov.b32 %r12, %f28;
+	st.global.b32 [%rd2+32], %r9;
+	st.global.b32 [%rd2+36], %r10;
+	st.global.b32 [%rd2+40], %r11;
+	st.global.b32 [%rd2+44], %r12;
+
+	// rcp.rp.f32
+	rcp.rp.f32 %f29, %f1;
+	rcp.rp.f32 %f30, %f2;
+	rcp.rp.f32 %f31, %f3;
+	rcp.rp.f32 %f32, %f4;
+	mov.b32 %r13, %f29;
+	mov.b32 %r14, %f30;
+	mov.b32 %r15, %f31;
+	mov.b32 %r16, %f32;
+	st.global.b32 [%rd2+48], %r13;
+	st.global.b32 [%rd2+52], %r14;
+	st.global.b32 [%rd2+56], %r15;
+	st.global.b32 [%rd2+60], %r16;
+
+	ret;
+}

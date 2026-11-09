@@ -6349,33 +6349,71 @@ fn emit_mul_float(
     Ok(())
 }
 
+// The reciprocal is expressed as a double quotient narrowed with the asked
+// rounding mode, and both halves of that need a note because the obvious reading
+// of each is wrong.
+//
+// Why not a plain float division: this backend's `1.0 / x` is faithfully but not
+// correctly rounded - one ulp off on 10.4% of inputs, and 22.2% for a general
+// `a / b` - while the same PTX on an RTX 2070 is exact on all 8192 (odocs/
+// BUG-rcp-approx.md). SPIR-V requires OpFDiv to be correctly rounded, so this is
+// a lowering defect. FPFastMathMode AllowRecip changed nothing about what this
+// backend computes for `1.0 / x` (decorated and undecorated modules return
+// identical bits), so the decoration is not carried.
+//
+// Why a caller needs it even though rcp.approx is only bounded at 2^-23: the
+// accuracy of a reciprocal comes from the ONE Newton step callers apply on top,
+// and that step does not run when the kernel came from a bare float division -
+// the backend folds the pair into a single fdiv, and the refined value comes back
+// bit-identical to the base on 8190 of 8192 inputs. Asking for the quotient
+// through a conversion takes the reciprocal out of that pattern, so the
+// refinement runs and lands on the correctly rounded value: torch's `1.0f / x`
+// kernel is exactly that shape.
+//
+// What this does and does not buy, measured: the plain and .rn forms are narrowed
+// straight back to this backend's float division, so their raw value is unchanged
+// (identical bits on 8192 of 8192) and the change costs nothing on that path -
+// inside the 2^-23 bound for .approx, and still one ulp from correctly rounded for
+// .rn. The directed forms are compiled long-hand and are exact: measured against
+// the RTX 2070 over 8192 inputs, denormals and overflow included, rcp.{rz,rm,rp}
+// are bit for bit.
+//
+// Not modelled, and measured: `.ftz` does not flush a subnormal *result* to
+// zero. A subnormal input needs no flush (its true reciprocal overflows anyway),
+// but for |x| >= 2^126 the hardware returns zero where this returns the subnormal
+// that the rest of the stack, the CPU included, calls correct.
 fn emit_rcp(
     builder: &mut dr::Builder,
     map: &mut TypeWordMap,
     desc: &ast::RcpDetails,
     a: &ast::Arg2<ExpandedArgParams>,
 ) -> Result<(), TranslateError> {
-    let (instr_type, constant) = if desc.is_f64 {
-        (ast::ScalarType::F64, vec_repr(1.0f64))
-    } else {
-        (ast::ScalarType::F32, vec_repr(1.0f32))
-    };
-    let one = map.get_or_add_constant(builder, &ast::Type::Scalar(instr_type), &constant)?;
-    let result_type = map.get_or_add_scalar(builder, instr_type);
-    builder.f_div(result_type, Some(a.dst), one, a.src)?;
-    if desc.rounding.is_none() {
-        // Only the approximate form may be compiled as a reciprocal estimate;
-        // rcp.rn promises the correctly rounded quotient.
-        builder.decorate(
-            a.dst,
-            spirv::Decoration::FPFastMathMode,
-            [dr::Operand::FPFastMathMode(
-                spirv::FPFastMathMode::ALLOW_RECIP,
-            )]
-            .iter()
-            .cloned(),
-        );
+    if !desc.is_f64 {
+        let f64_type = map.get_or_add_scalar(builder, ast::ScalarType::F64);
+        let f32_type = map.get_or_add_scalar(builder, ast::ScalarType::F32);
+        let one = map.get_or_add_constant(
+            builder,
+            &ast::Type::Scalar(ast::ScalarType::F64),
+            &vec_repr(1.0f64),
+        )?;
+        let wide = builder.f_convert(f64_type, None, a.src)?;
+        let quotient = builder.f_div(f64_type, None, one, wide)?;
+        let converted = builder.id();
+        builder.f_convert(f32_type, Some(converted), quotient)?;
+        emit_rounding_decoration(builder, converted, desc.rounding);
+        builder.copy_object(f32_type, Some(a.dst), converted)?;
+        return Ok(());
     }
+    // The f64 forms have nowhere wider to go, so they are a plain division. Its
+    // result is measured exact enough to narrow to f32 correctly, which is the
+    // only way rcp.approx.f64 is reached from the PTX in the corpus.
+    let f64_type = map.get_or_add_scalar(builder, ast::ScalarType::F64);
+    let one = map.get_or_add_constant(
+        builder,
+        &ast::Type::Scalar(ast::ScalarType::F64),
+        &vec_repr(1.0f64),
+    )?;
+    builder.f_div(f64_type, Some(a.dst), one, a.src)?;
     Ok(())
 }
 

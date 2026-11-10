@@ -3791,6 +3791,12 @@ fn emit_function_body_ops(
                         emit_add_float(builder, map, opencl, desc, arg)?
                     }
                 },
+                ast::Instruction::AddCarry(details, arg) => {
+                    emit_add_or_sub_carry(builder, map, false, details, arg, carry_flag)?
+                }
+                ast::Instruction::SubCarry(details, arg) => {
+                    emit_add_or_sub_carry(builder, map, true, details, arg, carry_flag)?
+                }
                 ast::Instruction::Setp(setp, arg) => {
                     emit_setp(builder, map, setp, arg)?;
                     if let Some(dst2) = arg.dst2 {
@@ -6611,14 +6617,24 @@ fn emit_variable(
 
 /// Whether any instruction in this function reads or writes PTX's carry flag.
 fn statements_need_carry_flag(statements: &[ExpandedStatement]) -> bool {
-    statements.iter().any(|statement| match statement {
+    statements
+        .iter()
+        .any(|statement| statement_carry(statement).map_or(false, |carry| carry != ast::Carry::None))
+}
+
+/// The carry flag an instruction reads or writes, or None for an instruction that
+/// has nothing to do with PTX's flag.
+fn statement_carry(statement: &ExpandedStatement) -> Option<ast::Carry> {
+    match statement {
         Statement::Instruction(ast::Instruction::Mad(details, _)) => match details {
-            ast::MulDetails::Unsigned(d) => d.carry != ast::MulCarry::None,
-            ast::MulDetails::Signed(d) => d.carry != ast::MulCarry::None,
-            ast::MulDetails::Float(_) => false,
+            ast::MulDetails::Unsigned(d) => Some(d.carry),
+            ast::MulDetails::Signed(d) => Some(d.carry),
+            ast::MulDetails::Float(_) => None,
         },
-        _ => false,
-    })
+        Statement::Instruction(ast::Instruction::AddCarry(details, _))
+        | Statement::Instruction(ast::Instruction::SubCarry(details, _)) => Some(details.carry),
+        _ => None,
+    }
 }
 
 /// A carry read that this function did not produce can only have come from a
@@ -6627,34 +6643,30 @@ fn statements_need_carry_flag(statements: &[ExpandedStatement]) -> bool {
 /// computing something plausible.
 ///
 /// Nothing in the corpus does this - 1909 `madc` instructions over 16699 PTX
-/// files all have their producer in the same block of the same function - so this
-/// is a guard against a silent wrongness, not a path anything takes today.
+/// files all have their producer in the same block of the same function, and
+/// there is not one `addc`/`subc` outside the upstream test corpus - so this is a
+/// guard against a silent wrongness, not a path anything takes today.
 fn check_carry_flag_is_produced(statements: &[ExpandedStatement]) -> Result<(), TranslateError> {
     let mut produced = false;
     for statement in statements {
-        let details = match statement {
-            Statement::Instruction(ast::Instruction::Mad(details, _)) => details,
-            _ => continue,
-        };
-        let carry = match details {
-            ast::MulDetails::Unsigned(d) => d.carry,
-            ast::MulDetails::Signed(d) => d.carry,
-            ast::MulDetails::Float(_) => continue,
+        let carry = match statement_carry(statement) {
+            Some(carry) => carry,
+            None => continue,
         };
         match carry {
             // `.cc` forms write the flag, so anything after them may read it.
-            ast::MulCarry::Out | ast::MulCarry::InOut => produced = true,
-            ast::MulCarry::In => {
+            ast::Carry::Out | ast::Carry::InOut => produced = true,
+            ast::Carry::In => {
                 if !produced {
                     return Err(TranslateError::Unsupported(
-                        "madc reads PTX's carry flag before this function writes it; the flag \
-                         is modelled per function, so a carry arriving from a caller is refused \
-                         rather than read as zero"
+                        "a carrying instruction reads PTX's carry flag before this function \
+                         writes it; the flag is modelled per function, so a carry arriving from \
+                         a caller is refused rather than read as zero"
                             .to_string(),
                     ));
                 }
             }
-            ast::MulCarry::None => {}
+            ast::Carry::None => {}
         }
     }
     Ok(())
@@ -6752,32 +6764,115 @@ fn emit_mad_add(
     map: &mut TypeWordMap,
     inst_type: spirv::Word,
     typ: ast::ScalarType,
-    carry: ast::MulCarry,
+    carry: ast::Carry,
     arg: &ast::Arg4<ExpandedArgParams>,
     product: spirv::Word,
     carry_flag: Option<spirv::Word>,
 ) -> Result<(), TranslateError> {
     match carry {
-        ast::MulCarry::None => {
+        ast::Carry::None => {
             // Operand order kept as it was before the carrying forms existed,
             // so no existing .spvtxt expectation moves for a plain `mad`.
             builder.i_add(inst_type, Some(arg.dst), arg.src3, product)?;
         }
-        ast::MulCarry::Out => {
+        ast::Carry::Out => {
             let (_, overflowed) =
                 emit_add_carry(builder, map, inst_type, product, arg.src3, Some(arg.dst))?;
             emit_store_carry_flag(builder, map, carry_flag, overflowed)?;
         }
-        ast::MulCarry::In => {
+        ast::Carry::In => {
             let flag = emit_load_carry_flag(builder, map, carry_flag, typ, inst_type)?;
             let sum = builder.i_add(inst_type, None, product, arg.src3)?;
             builder.i_add(inst_type, Some(arg.dst), sum, flag)?;
         }
-        ast::MulCarry::InOut => {
+        ast::Carry::InOut => {
             let flag = emit_load_carry_flag(builder, map, carry_flag, typ, inst_type)?;
             let (sum, carry1) = emit_add_carry(builder, map, inst_type, product, arg.src3, None)?;
             let (_, carry2) = emit_add_carry(builder, map, inst_type, sum, flag, Some(arg.dst))?;
             // Adding three values overflows if either addition does.
+            let bool_type = map.get_or_add_scalar(builder, ast::ScalarType::Pred);
+            let combined = builder.logical_or(bool_type, None, carry1, carry2)?;
+            emit_store_carry_flag(builder, map, carry_flag, combined)?;
+        }
+    }
+    Ok(())
+}
+
+/// `add.cc` / `addc` / `sub.cc` / `subc`, which share PTX's carry flag with the
+/// multiply-add family.
+///
+/// Both families are ONE adder, which is why the flag means the same thing after
+/// either and why these forms can be modelled with the machinery that already
+/// exists:
+///
+///     add.cc   d = a + b                CF = carry out of it
+///     addc     d = a + b + CF           CF unchanged unless `.cc`
+///     sub.cc   d = a - b                CF = carry out of (a + ~b + 1) = (a >= b)
+///     subc     d = a + ~b + CF = a - b - 1 + CF
+///
+/// So the subtract's flag is NOT the borrow; the borrow is `1 - CF`. That is the
+/// reading a future editor is most likely to get wrong, and it is also the one
+/// that hides: reading it as a borrow leaves the *value* of every `sub.cc`
+/// identical and only corrupts whatever consumes the flag next (measured - the
+/// value is `a - b - 1 + CF` under either convention, so only the flag's polarity
+/// differs). Settled against ptxas sm_75's SASS, which compiles `sub.cc` to
+/// `IADD3 Rd, P, a, -b, RZ` and `subc` to `IADD3.X Rd, P, a, ~b, RZ, CF`, and
+/// against an RTX 2070: `tmp/harness/ccarith`, 0 wrong of 1280.
+///
+/// Each carry is taken from the same addition that produces the value, in one or
+/// two steps rather than by widening, so a 64-bit form costs no more than a 32-bit
+/// one. Two steps are exact for the `In`/`InOut` forms because `a + ~b + CF`
+/// cannot carry out of both additions at once.
+fn emit_add_or_sub_carry(
+    builder: &mut dr::Builder,
+    map: &mut TypeWordMap,
+    is_sub: bool,
+    details: &ast::ArithCarryInt,
+    arg: &ast::Arg3<ExpandedArgParams>,
+    carry_flag: Option<spirv::Word>,
+) -> Result<(), TranslateError> {
+    let typ = ast::ScalarType::from(details.typ);
+    let inst_type = map.get_or_add(builder, SpirvType::from(typ));
+    // `sub.cc` is `a + ~b + 1`, so the operand that gets added is the complement.
+    let addend = if is_sub {
+        builder.not(inst_type, None, arg.src2)?
+    } else {
+        arg.src2
+    };
+    let one = if typ.size_of() == 8 {
+        builder.constant_u64(inst_type, None, 1)
+    } else {
+        builder.constant_u32(inst_type, None, 1)
+    };
+    match details.carry {
+        ast::Carry::None => return Err(error_unreachable()),
+        ast::Carry::Out => {
+            let (sum, carry1) =
+                emit_add_carry(builder, map, inst_type, arg.src1, addend, None)?;
+            // For an add that is the whole story; for a subtract the implicit +1
+            // can carry as well, so it goes in as a second addend.
+            let carry2 = if is_sub {
+                let (_, carry2) = emit_add_carry(builder, map, inst_type, sum, one, Some(arg.dst))?;
+                carry2
+            } else {
+                builder.copy_object(inst_type, Some(arg.dst), sum)?;
+                // No second carry: the value is already the destination.
+                return emit_store_carry_flag(builder, map, carry_flag, carry1);
+            };
+            let bool_type = map.get_or_add_scalar(builder, ast::ScalarType::Pred);
+            let combined = builder.logical_or(bool_type, None, carry1, carry2)?;
+            emit_store_carry_flag(builder, map, carry_flag, combined)?;
+        }
+        ast::Carry::In => {
+            let carry_in = emit_load_carry_flag(builder, map, carry_flag, typ, inst_type)?;
+            let sum = builder.i_add(inst_type, None, arg.src1, addend)?;
+            builder.i_add(inst_type, Some(arg.dst), sum, carry_in)?;
+        }
+        ast::Carry::InOut => {
+            let carry_in = emit_load_carry_flag(builder, map, carry_flag, typ, inst_type)?;
+            let (sum, carry1) =
+                emit_add_carry(builder, map, inst_type, arg.src1, addend, None)?;
+            let (_, carry2) = emit_add_carry(builder, map, inst_type, sum, carry_in, Some(arg.dst))?;
             let bool_type = map.get_or_add_scalar(builder, ast::ScalarType::Pred);
             let combined = builder.logical_or(bool_type, None, carry1, carry2)?;
             emit_store_carry_flag(builder, map, carry_flag, combined)?;
@@ -6810,7 +6905,7 @@ fn emit_mad_uint(
             )?;
         }
         ast::MulIntControl::High => {
-            if desc.carry == ast::MulCarry::None {
+            if desc.carry == ast::Carry::None {
                 // One instruction, as before the carrying forms existed:
                 // `u_mad_hi` already adds `c`.
                 emit_umadhi_into(builder, inst_type, opencl, arg)?;
@@ -6918,7 +7013,7 @@ fn emit_mad_sint(
             )?;
         }
         ast::MulIntControl::High => {
-            if desc.carry == ast::MulCarry::None {
+            if desc.carry == ast::Carry::None {
                 // One instruction, as before the carrying forms existed:
                 // `s_mad_hi` already adds `c`.
                 emit_smadhi_into(builder, inst_type, opencl, arg)?;
@@ -10374,6 +10469,14 @@ impl<T: ArgParamsEx> ast::Instruction<T> {
                 let inst_type = d.get_type();
                 ast::Instruction::Add(d, a.map_non_shift(visitor, &inst_type, false)?)
             }
+            ast::Instruction::AddCarry(d, a) => {
+                let inst_type = ast::Type::Scalar(ast::ScalarType::from(d.typ));
+                ast::Instruction::AddCarry(d, a.map_non_shift(visitor, &inst_type, false)?)
+            }
+            ast::Instruction::SubCarry(d, a) => {
+                let inst_type = ast::Type::Scalar(ast::ScalarType::from(d.typ));
+                ast::Instruction::SubCarry(d, a.map_non_shift(visitor, &inst_type, false)?)
+            }
             ast::Instruction::Setp(d, a) => {
                 let inst_type = d.typ;
                 ast::Instruction::Setp(d, a.map(visitor, &ast::Type::Scalar(inst_type))?)
@@ -10990,6 +11093,9 @@ impl ast::Instruction<ExpandedArgParams> {
             ast::Instruction::Sub(ast::ArithDetails::Unsigned(_), _) => None,
             ast::Instruction::Add(ast::ArithDetails::Signed(_), _) => None,
             ast::Instruction::Add(ast::ArithDetails::Unsigned(_), _) => None,
+            // No `.ftz` on the carrying integer forms: they are integer only.
+            ast::Instruction::AddCarry(_, _) => None,
+            ast::Instruction::SubCarry(_, _) => None,
             ast::Instruction::Mul(ast::MulDetails::Unsigned(_), _) => None,
             ast::Instruction::Mul(ast::MulDetails::Signed(_), _) => None,
             ast::Instruction::Mad(ast::MulDetails::Unsigned(_), _) => None,

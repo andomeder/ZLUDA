@@ -1,0 +1,88 @@
+.version 6.5
+.target sm_30
+.address_size 64
+
+// `add.cc` / `addc` / `sub.cc` / `subc`: the carry flag is shared with the
+// multiply-add chain, and the subtract is the form that is easy to get backwards.
+//
+//     add.cc   d = a + b                CF = carry out of it
+//     addc     d = a + b + CF
+//     sub.cc   d = a - b                CF = carry out of (a + ~b + 1) = (a >= b)
+//     subc     d = a + ~b + CF = a - b - 1 + CF
+//
+// so the subtract's flag is NOT the borrow (the borrow is 1 - CF), and `subc`
+// folds the carry back in the same way an `addc` does.
+//
+// The input puts the two flags in opposite states, which is what makes a
+// borrow-polarity mistake visible: a = 1 against b = 0xffffffff overflows on the
+// add (flag 1) and borrows on the subtract (flag 0), while a64 = 0xffffffffffffffff
+// against b64 = 1 does the reverse on the 64-bit subtract (flag 1).
+//
+//   out[0]  add.cc.u32 value            out[9]  add.cc.u64 hi
+//   out[1]  flag after add.cc           out[10] flag after add.cc.u64
+//   out[2]  addc.u32 value              out[11] addc.u64 lo
+//   out[3]  sub.cc.u32 value            out[12] addc.u64 hi
+//   out[4]  flag after sub.cc           out[13] sub.cc.u64 lo
+//   out[5]  subc.u32 value              out[14] sub.cc.u64 hi
+//   out[6]  subc.cc.u32 value           out[15] flag after sub.cc.u64
+//   out[7]  flag after subc.cc          out[16] subc.u64 lo
+//   out[8]  add.cc.u64 lo               out[17] subc.u64 hi
+.visible .entry add_sub_carry(
+	.param .u64 input,
+	.param .u64 output
+)
+{
+	.reg .b32 %r<20>;
+	.reg .b64 %rd<16>;
+
+	ld.param.u64 %rd1, [input];
+	ld.param.u64 %rd2, [output];
+	ld.u32 %r1, [%rd1];
+	ld.u32 %r2, [%rd1+4];
+	ld.u64 %rd3, [%rd1+8];
+	ld.u64 %rd4, [%rd1+16];
+	mov.u32 %r3, 0;
+
+	// 32-bit: the value and the flag of each form, in order, so every read of the
+	// flag happens before the next `.cc` overwrites it.
+	add.cc.u32  %r4, %r1, %r2;
+	addc.u32    %r5, %r3, %r3;
+	addc.u32    %r6, %r1, %r2;
+	sub.cc.u32  %r7, %r1, %r2;
+	addc.u32    %r8, %r3, %r3;
+	subc.u32    %r9, %r1, %r2;
+	subc.cc.u32 %r10, %r1, %r2;
+	addc.u32    %r11, %r3, %r3;
+
+	// 64-bit, where the flag is the carry out of bit 63.
+	add.cc.u64 %rd5, %rd3, %rd4;
+	addc.u32   %r12, %r3, %r3;
+	addc.u64   %rd6, %rd3, %rd4;
+	sub.cc.u64 %rd7, %rd3, %rd4;
+	addc.u32   %r13, %r3, %r3;
+	subc.u64   %rd8, %rd3, %rd4;
+	shr.u64    %rd9, %rd5, 32;
+	shr.u64    %rd10, %rd6, 32;
+	shr.u64    %rd11, %rd7, 32;
+	shr.u64    %rd12, %rd8, 32;
+
+	st.u32 [%rd2], %r4;
+	st.u32 [%rd2+4], %r5;
+	st.u32 [%rd2+8], %r6;
+	st.u32 [%rd2+12], %r7;
+	st.u32 [%rd2+16], %r8;
+	st.u32 [%rd2+20], %r9;
+	st.u32 [%rd2+24], %r10;
+	st.u32 [%rd2+28], %r11;
+	st.u32 [%rd2+32], %rd5;
+	st.u32 [%rd2+36], %rd9;
+	st.u32 [%rd2+40], %r12;
+	st.u32 [%rd2+44], %rd6;
+	st.u32 [%rd2+48], %rd10;
+	st.u32 [%rd2+52], %rd7;
+	st.u32 [%rd2+56], %rd11;
+	st.u32 [%rd2+60], %r13;
+	st.u32 [%rd2+64], %rd8;
+	st.u32 [%rd2+68], %rd12;
+	ret;
+}

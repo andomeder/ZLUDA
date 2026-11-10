@@ -110,6 +110,45 @@ test_ptx!(
         0x00000000u32
     ]
 );
+// The carrying add and subtract. `sub.cc`'s flag is the CARRY out of `a + ~b +
+// 1`, i.e. 1 - borrow, so the input is chosen to put the two flags in opposite
+// states: at 32 bits a = 1 against b = 0xffffffff carries on the add and borrows
+// on the subtract, and at 64 bits 0xffffffffffffffff against 1 is the reverse on
+// the subtract. A lowering that reads the flag as a borrow, or that drops it,
+// changes columns 1, 2, 5, 6, 7, 10, 11, 12, 15, 16 and 17.
+test_ptx!(
+    add_sub_carry,
+    [
+        1u32,
+        0xffffffffu32,
+        0xffffffffu32,
+        0xffffffffu32,
+        1u32,
+        0u32,
+        0u32,
+        0u32
+    ],
+    [
+        0x00000000u32,
+        0x00000001u32,
+        0x00000001u32,
+        0x00000002u32,
+        0x00000000u32,
+        0x00000001u32,
+        0x00000001u32,
+        0x00000000u32,
+        0x00000000u32,
+        0x00000000u32,
+        0x00000001u32,
+        0x00000001u32,
+        0x00000000u32,
+        0xfffffffeu32,
+        0xffffffffu32,
+        0x00000001u32,
+        0xfffffffeu32,
+        0xffffffffu32
+    ]
+);
 test_ptx!(
     mul_wide,
     [0x01_00_00_00__01_00_00_00i64],

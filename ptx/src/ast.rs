@@ -289,6 +289,9 @@ pub enum Instruction<P: ArgParams> {
     Mov(MovDetails, Arg2Mov<P>),
     Mul(MulDetails, Arg3<P>),
     Add(ArithDetails, Arg3<P>),
+    /// `add.cc` and `addc`: the same add, with PTX's per-thread carry flag read
+    /// and/or written.
+    AddCarry(ArithCarryInt, Arg3<P>),
     Setp(SetpData, Arg4Setp<P>),
     SetpBool(SetpBoolData, Arg5Setp<P>),
     Not(ScalarType, Arg2<P>),
@@ -304,6 +307,11 @@ pub enum Instruction<P: ArgParams> {
     Mad(MulDetails, Arg4<P>),
     Or(ScalarType, Arg3<P>),
     Sub(ArithDetails, Arg3<P>),
+    /// `sub.cc` and `subc`. The flag is the CARRY out of `a + ~b + 1`, which is
+    /// `1 - borrow`, and `subc` computes `a + ~b + flag`: one adder for both, so
+    /// the flag means the same thing it does after an `add.cc`. Do not read it as
+    /// a borrow (see `Carry`).
+    SubCarry(ArithCarryInt, Arg3<P>),
     Min(MinMaxDetails, Arg3<P>),
     Max(MinMaxDetails, Arg3<P>),
     Rcp(RcpDetails, Arg2<P>),
@@ -702,20 +710,37 @@ pub enum MulIntControl {
     Wide,
 }
 
-/// The carry flag of the integer multiply-add chain. PTX keeps one carry bit
-/// per thread: a `.cc` instruction writes it and the `...c` form of the next
+/// The carry flag of the integer arithmetic chain. PTX keeps one carry bit per
+/// thread: a `.cc` instruction writes it and the `...c` form of the next
 /// instruction reads it, which is how a 64-bit product is built out of a
-/// `mad.lo` and a `madc.hi` (`odocs/BUG-madcc-carry.md`).
+/// `mad.lo` and a `madc.hi`, and a 64-bit sum out of an `add.cc` and an `addc`
+/// (`odocs/BUG-madcc-carry.md`).
+///
+/// The flag is a CARRY in both families, `sub.cc` included: its flag is the carry
+/// out of `a + ~b + 1`, i.e. `1 - borrow`, and `subc` folds it back in as
+/// `a + ~b + flag`. Settled against ptxas sm_75 and an RTX 2070 rather than
+/// recalled, because the opposite reading only reverses the flag's polarity and
+/// leaves every value in the producing instruction unchanged, so it can only show
+/// up in whatever consumes the flag next.
 #[derive(Copy, Clone, PartialEq, Eq)]
-pub enum MulCarry {
+pub enum Carry {
     /// No carry flag is read or written.
     None,
-    /// `mad.cc`: the carry out of the addition replaces the flag.
+    /// `.cc`: the carry out of the operation replaces the flag.
     Out,
-    /// `madc`: the flag is added to the result.
+    /// `...c`: the flag is added to (or subtracted from) the result.
     In,
-    /// `madc.cc`: the flag is added and the new carry replaces it.
+    /// `...c.cc`: the flag is read and the new carry replaces it.
     InOut,
+}
+
+/// The integer add and subtract that read and write the carry flag: `add.cc`,
+/// `addc`, `sub.cc` and `subc`. They exist for 32- and 64-bit integers only,
+/// which is why there is no `.sat` and no `.wide` form of them.
+#[derive(Copy, Clone)]
+pub struct ArithCarryInt {
+    pub typ: ScalarType,
+    pub carry: Carry,
 }
 
 #[derive(PartialEq, Eq, Copy, Clone)]
@@ -896,14 +921,14 @@ pub enum MulDetails {
 pub struct MulUInt {
     pub typ: ScalarType,
     pub control: MulIntControl,
-    pub carry: MulCarry,
+    pub carry: Carry,
 }
 
 #[derive(Copy, Clone)]
 pub struct MulSInt {
     pub typ: ScalarType,
     pub control: MulIntControl,
-    pub carry: MulCarry,
+    pub carry: Carry,
 }
 
 #[derive(Copy, Clone)]

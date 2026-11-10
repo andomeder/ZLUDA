@@ -238,3 +238,9 @@ gcc -o graph_test graph_test.c -I"$CUDA_INC" -L"$ZLUDA_LIB" -lnvcuda
 LD_LIBRARY_PATH="$ZLUDA_LIB" ./graph_test
 # GRAPH TEST: OK
 ```
+
+`graph_cost.c` is the companion measurement: it captures three kernel launches and
+compares 500 replays against 1500 direct submissions, to price the re-append design. On
+the B580 a replayed command costs what a commanded launch costs (3.25 / 2.86 / 4.26 us
+against 2.90 / 4.07 / 4.66 over three alternating rounds), which is why capture here buys
+compatibility and not speed.

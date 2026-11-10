@@ -1,0 +1,46 @@
+.version 6.5
+.target sm_70
+.address_size 64
+
+// activemask under two levels of divergence, one warp.
+//
+// The outer branch keeps lanes 0..15 and the inner one keeps the odd lanes of
+// what survived, so the realised mask at the instruction is 0x0000aaaa. That is
+// the only value that satisfies all three:
+//
+//   the constant 0xffffffff a hardcoded expansion emits   WRONG
+//   the whole warp, ignoring divergence                   WRONG (0xffffffff)
+//   the enclosing region rather than the realised set     WRONG (0x0000ffff)
+//
+// A lane that is not active writes nothing, so its slot keeps the zero the
+// harness filled the buffer with. The device harness launches `threads` threads
+// of one block, which is why this test asks for 32.
+.visible .entry active_mask_divergent(
+	.param .u64 input,
+	.param .u64 output
+)
+{
+	.reg .b32 %r<8>;
+	.reg .b64 %rd<6>;
+	.reg .pred %p<4>;
+
+	ld.param.u64 %rd1, [output];
+	mov.u32 %r1, %tid.x;
+	and.b32 %r2, %r1, 31;
+
+	setp.ge.u32 %p1, %r2, 16;
+	@%p1 bra $done;
+
+	and.b32 %r5, %r2, 1;
+	setp.ne.u32 %p2, %r5, 0;
+	@!%p2 bra $done;
+
+	activemask.b32 %r4;
+	cvt.u64.u32 %rd4, %r4;
+	mul.wide.u32 %rd2, %r1, 8;
+	add.s64 %rd3, %rd1, %rd2;
+	st.u64 [%rd3], %rd4;
+
+$done:
+	ret;
+}

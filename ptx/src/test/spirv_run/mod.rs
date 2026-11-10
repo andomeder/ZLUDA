@@ -297,6 +297,20 @@ test_ptx_threads!(lane_masks, 32u32, [0u64], LANE_MASKS);
 // all-lanes mask a hardcoded expansion would report.
 test_ptx!(active_mask, [0u64], [1u64]);
 
+// The same instruction under two levels of divergence, which is the case a
+// lowering can get right by accident when only one thread runs: lanes 0..15 stay
+// and then only the odd ones of those, so the realised mask is 0x0000aaaa. That
+// value rules out the constant expansion, a ballot over the whole warp and a
+// ballot over the enclosing region (0x0000ffff) alike. A lane that is not active
+// writes nothing, and the harness fills the buffer with zero.
+const ACTIVE_MASK_DIVERGENT: [u64; 32] = [
+    0u64, 43690u64, 0u64, 43690u64, 0u64, 43690u64, 0u64, 43690u64,
+    0u64, 43690u64, 0u64, 43690u64, 0u64, 43690u64, 0u64, 43690u64,
+    0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64,
+    0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64,
+];
+test_ptx_threads!(active_mask_divergent, 32u32, [0u64], ACTIVE_MASK_DIVERGENT);
+
 // A narrowed signed conversion has to sign-extend into the 16-bit register that
 // holds an .s8 value in PTX: 0x80 reads back as 0xff80, not 0x0080.
 test_ptx!(cvt_s8_s32, [0x7f80u32], [0xff80u32, 0x7fu32]);

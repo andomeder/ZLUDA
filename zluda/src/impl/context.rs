@@ -297,6 +297,13 @@ pub fn detach(pctx: *mut Context) -> Result<(), CUresult> {
 }
 
 pub(crate) fn synchronize() -> Result<(), CUresult> {
+    // A context-wide synchronise during a capture would wait for work that has
+    // not been submitted, and CUDA refuses it. Without this the barrier below
+    // never signals and the call sits until the 60 s cap, which is the hang the
+    // refusal exists to prevent.
+    if super::graph::capturing_any() {
+        return Err(CUresult::CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED);
+    }
     GlobalState::lock_current_context(|ctx| {
         ctx.default_stream.synchronize()?;
         for stream in ctx.streams.iter().copied() {

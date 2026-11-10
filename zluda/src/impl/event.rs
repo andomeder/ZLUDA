@@ -175,6 +175,11 @@ pub(crate) fn record(ev: *mut Event, stream: *mut Stream) -> Result<(), CUresult
     if ev == ptr::null_mut() {
         return Err(CUresult::CUDA_ERROR_INVALID_HANDLE);
     }
+    // A record during capture becomes a node: the event is armed by the replay,
+    // not now, because there is no submission to signal it.
+    if super::graph::recording(stream)? {
+        return super::graph::record_event_record(ev);
+    }
     // Check liveness without holding the lock, then record (which takes the
     // stream lock internally).
     GlobalState::lock(|_| {
@@ -188,6 +193,11 @@ pub(crate) fn query(ev: *mut Event) -> Result<(), CUresult> {
     if ev == ptr::null_mut() {
         return Err(CUresult::CUDA_ERROR_INVALID_HANDLE);
     }
+    // Nothing has been submitted, so there is nothing truthful to report and
+    // CUDA refuses the query for that reason.
+    if super::graph::capturing_any() {
+        return Err(CUresult::CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED);
+    }
     GlobalState::lock(|_| {
         let ev_data = unsafe { &*ev }.as_result()?;
         ev_data.query()
@@ -197,6 +207,9 @@ pub(crate) fn query(ev: *mut Event) -> Result<(), CUresult> {
 pub(crate) fn synchronize(ev: *mut Event) -> Result<(), CUresult> {
     if ev == ptr::null_mut() {
         return Err(CUresult::CUDA_ERROR_INVALID_HANDLE);
+    }
+    if super::graph::capturing_any() {
+        return Err(CUresult::CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED);
     }
     GlobalState::lock(|_| {
         let ev_data = unsafe { &*ev }.as_result()?;

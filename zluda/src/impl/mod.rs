@@ -1,7 +1,7 @@
 use crate::{
     cuda::{
-        CUctx_st, CUdevice, CUdeviceptr, CUevent_st, CUfunc_st, CUkern_st, CUlib_st, CUmod_st,
-        CUresult, CUstream_st,
+        CUctx_st, CUdevice, CUdeviceptr, CUevent_st, CUfunc_st, CUgraphExec_st, CUgraph_st,
+        CUkern_st, CUlib_st, CUmod_st, CUresult, CUstream_st,
     },
     r#impl::device::Device,
 };
@@ -36,6 +36,7 @@ pub mod stream;
 pub mod driver_proc_address;
 pub mod event;
 pub mod fatbin;
+pub mod graph;
 pub mod launch_trace;
 pub mod pointer;
 pub mod sass;
@@ -318,6 +319,13 @@ impl GlobalState {
     /// takes no locks of its own); must NOT be called with another
     /// lock_current_context/lock_stream closure active on this thread.
     pub(crate) fn synchronize_context_streams() -> Result<(), CUresult> {
+        if graph::capturing_any() {
+            // The callers of this are the ones that have to wait for queued work
+            // before touching memory: a blocking copy, a free, a 2D copy. All of
+            // them are illegal inside a capture, and CUDA refuses them with this
+            // code.
+            return Err(CUresult::CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED);
+        }
         Self::lock_current_context(|ctx| {
             // A drain that timed out has to be reported: its callers unmap
             // memory afterwards, and unmapping memory that a queued kernel
@@ -692,4 +700,12 @@ impl<'a> CudaRepr for CUstream_st {
 
 impl<'a> CudaRepr for CUevent_st {
     type Impl = event::Event;
+}
+
+impl<'a> CudaRepr for CUgraph_st {
+    type Impl = graph::Graph;
+}
+
+impl<'a> CudaRepr for CUgraphExec_st {
+    type Impl = graph::GraphExec;
 }

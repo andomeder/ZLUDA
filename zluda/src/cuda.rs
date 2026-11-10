@@ -3526,7 +3526,7 @@ pub extern "system" fn cuMemsetD8_v2(
     uc: ::std::os::raw::c_uchar,
     N: usize,
 ) -> CUresult {
-    r#impl::memory::set_d8_v2(dstDevice.decuda(), uc, N, r#impl::stream::CU_STREAM_LEGACY).encuda()
+    r#impl::memory::set_d8_v2(dstDevice.decuda(), uc, N, r#impl::stream::CU_STREAM_LEGACY, true).encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -3535,7 +3535,7 @@ pub extern "system" fn cuMemsetD8(
     uc: ::std::os::raw::c_uchar,
     N: usize,
 ) -> CUresult {
-    r#impl::memory::set_d8_v2(dstDevice.decuda(), uc, N, r#impl::stream::CU_STREAM_LEGACY).encuda()
+    r#impl::memory::set_d8_v2(dstDevice.decuda(), uc, N, r#impl::stream::CU_STREAM_LEGACY, true).encuda()
 }
 
 // TODO: implement default stream semantics
@@ -3545,7 +3545,7 @@ pub extern "system" fn cuMemsetD8_v2_ptds(
     uc: ::std::os::raw::c_uchar,
     N: usize,
 ) -> CUresult {
-    r#impl::memory::set_d8_v2(dstDevice.decuda(), uc, N, r#impl::stream::CU_STREAM_LEGACY).encuda()
+    r#impl::memory::set_d8_v2(dstDevice.decuda(), uc, N, r#impl::stream::CU_STREAM_LEGACY, true).encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -3554,7 +3554,7 @@ pub extern "system" fn cuMemsetD16_v2(
     us: ::std::os::raw::c_ushort,
     N: usize,
 ) -> CUresult {
-    r#impl::memory::set_d16_v2(dstDevice.decuda(), us, N, r#impl::stream::CU_STREAM_LEGACY).encuda()
+    r#impl::memory::set_d16_v2(dstDevice.decuda(), us, N, r#impl::stream::CU_STREAM_LEGACY, true).encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -3563,7 +3563,7 @@ pub extern "system" fn cuMemsetD32_v2(
     ui: ::std::os::raw::c_uint,
     N: usize,
 ) -> CUresult {
-    r#impl::memory::set_d32_v2(dstDevice.decuda(), ui, N, r#impl::stream::CU_STREAM_LEGACY).encuda()
+    r#impl::memory::set_d32_v2(dstDevice.decuda(), ui, N, r#impl::stream::CU_STREAM_LEGACY, true).encuda()
 }
 
 // Non-v2 alias: some host apps (and our test shims) dlsym the plain name.
@@ -3573,7 +3573,7 @@ pub extern "system" fn cuMemsetD32(
     ui: ::std::os::raw::c_uint,
     N: usize,
 ) -> CUresult {
-    r#impl::memory::set_d32_v2(dstDevice.decuda(), ui, N, r#impl::stream::CU_STREAM_LEGACY).encuda()
+    r#impl::memory::set_d32_v2(dstDevice.decuda(), ui, N, r#impl::stream::CU_STREAM_LEGACY, true).encuda()
 }
 // TODO: implement default stream semantics
 #[cfg_attr(not(test), no_mangle)]
@@ -3582,7 +3582,7 @@ pub extern "system" fn cuMemsetD32_v2_ptds(
     ui: ::std::os::raw::c_uint,
     N: usize,
 ) -> CUresult {
-    r#impl::memory::set_d32_v2(dstDevice.decuda(), ui, N, r#impl::stream::CU_STREAM_LEGACY).encuda()
+    r#impl::memory::set_d32_v2(dstDevice.decuda(), ui, N, r#impl::stream::CU_STREAM_LEGACY, true).encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -3625,7 +3625,7 @@ pub extern "system" fn cuMemsetD8Async(
     N: usize,
     hStream: CUstream,
 ) -> CUresult {
-    r#impl::memory::set_d8_v2(dstDevice.decuda(), uc, N, hStream.decuda()).encuda()
+    r#impl::memory::set_d8_v2(dstDevice.decuda(), uc, N, hStream.decuda(), false).encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -3635,7 +3635,7 @@ pub extern "system" fn cuMemsetD16Async(
     N: usize,
     hStream: CUstream,
 ) -> CUresult {
-    r#impl::memory::set_d16_v2(dstDevice.decuda(), us, N, hStream.decuda()).encuda()
+    r#impl::memory::set_d16_v2(dstDevice.decuda(), us, N, hStream.decuda(), false).encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -3645,7 +3645,7 @@ pub extern "system" fn cuMemsetD32Async(
     N: usize,
     hStream: CUstream,
 ) -> CUresult {
-    r#impl::memory::set_d32_v2(dstDevice.decuda(), ui, N, hStream.decuda()).encuda()
+    r#impl::memory::set_d32_v2(dstDevice.decuda(), ui, N, hStream.decuda(), false).encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -4047,19 +4047,38 @@ pub extern "system" fn cuStreamBeginCapture_v2(
     hStream: CUstream,
     mode: CUstreamCaptureMode,
 ) -> CUresult {
-    r#impl::unimplemented()
+    let started = std::time::Instant::now();
+    let code = r#impl::graph::begin_capture(hStream.decuda(), mode).encuda();
+    trace_call("cuStreamBeginCapture_v2", started, code);
+    code
 }
 
 #[cfg_attr(not(test), no_mangle)]
 pub extern "system" fn cuThreadExchangeStreamCaptureMode(
     mode: *mut CUstreamCaptureMode,
 ) -> CUresult {
-    r#impl::unimplemented()
+    r#impl::graph::exchange_mode(mode).encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
 pub extern "system" fn cuStreamEndCapture(hStream: CUstream, phGraph: *mut CUgraph) -> CUresult {
-    r#impl::unimplemented()
+    let started = std::time::Instant::now();
+    let code = cuStreamEndCapture_inner(hStream, phGraph);
+    trace_call("cuStreamEndCapture", started, code);
+    code
+}
+
+fn cuStreamEndCapture_inner(hStream: CUstream, phGraph: *mut CUgraph) -> CUresult {
+    if phGraph.is_null() {
+        return CUresult::CUDA_ERROR_INVALID_VALUE;
+    }
+    match r#impl::graph::end_capture(hStream.decuda()) {
+        Ok(graph) => {
+            unsafe { *phGraph = graph as *mut CUgraph_st };
+            CUresult::CUDA_SUCCESS
+        }
+        Err(e) => e,
+    }
 }
 
 /// Per-launch host cost hunting: counts and times the entry points the runtime
@@ -4082,15 +4101,14 @@ pub extern "system" fn cuStreamIsCapturing(
     captureStatus: *mut CUstreamCaptureStatus,
 ) -> CUresult {
     let started = std::time::Instant::now();
-    // The out-pointer is optional.
-    if !captureStatus.is_null() {
-        unsafe {
-            *captureStatus = CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE;
-        }
-    }
-    // ZLUDA never captures streams; report NONE so callers proceed.
-    trace_call("cuStreamIsCapturing", started, CUresult::CUDA_SUCCESS);
-    CUresult::CUDA_SUCCESS
+    // An application decides from this answer whether it is capturing at all: a
+    // caching allocator switches to its graph pool on it, so answering NONE
+    // unconditionally makes a captured application allocate and free as though
+    // nothing were happening.
+    let code = r#impl::graph::get_capture_info(hStream.decuda(), captureStatus, ::std::ptr::null_mut())
+        .encuda();
+    trace_call("cuStreamIsCapturing", started, code);
+    code
 }
 #[cfg_attr(not(test), no_mangle)]
 pub extern "system" fn cuStreamGetCaptureInfo(
@@ -4108,7 +4126,7 @@ fn cuStreamGetCaptureInfo_inner(
     captureStatus: *mut CUstreamCaptureStatus,
     id: *mut cuuint64_t,
 ) -> CUresult {
-    r#impl::unimplemented()
+    r#impl::graph::get_capture_info(hStream.decuda(), captureStatus, id).encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -4722,7 +4740,11 @@ pub extern "system" fn cuGraphCreate(
     phGraph: *mut CUgraph,
     flags: ::std::os::raw::c_uint,
 ) -> CUresult {
-    r#impl::unimplemented()
+    let _ = flags;
+    match r#impl::graph::create(phGraph as *mut *mut r#impl::graph::Graph) {
+        Ok(()) => CUresult::CUDA_SUCCESS,
+        Err(e) => e,
+    }
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -4895,7 +4917,27 @@ pub extern "system" fn cuGraphGetNodes(
     nodes: *mut CUgraphNode,
     numNodes: *mut usize,
 ) -> CUresult {
-    r#impl::unimplemented()
+    // A captured graph here is a recorded command list rather than a node DAG, so
+    // the count is real and the handles are not: nothing dereferences one. torch
+    // counts the nodes of the graph it just captured and warns when the count is
+    // zero, so answering zero would make every successful capture look empty.
+    if numNodes.is_null() {
+        return CUresult::CUDA_ERROR_INVALID_VALUE;
+    }
+    let count = match r#impl::graph::node_count(hGraph.decuda()) {
+        Ok(count) => count,
+        Err(e) => return e,
+    };
+    unsafe {
+        if !nodes.is_null() {
+            let room = *numNodes;
+            for i in 0..room.min(count) {
+                *nodes.add(i) = (i + 1) as *mut CUgraphNode_st;
+            }
+        }
+        *numNodes = count;
+    }
+    CUresult::CUDA_SUCCESS
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -4968,7 +5010,36 @@ pub extern "system" fn cuGraphInstantiate_v2(
     logBuffer: *mut ::std::os::raw::c_char,
     bufferSize: usize,
 ) -> CUresult {
-    r#impl::unimplemented()
+    let started = std::time::Instant::now();
+    let code = instantiate_graph(phGraphExec, hGraph, 0);
+    if code != CUresult::CUDA_SUCCESS {
+        // The old form reports a failing node and a log; there is no per-node
+        // failure here, so the node is null and the buffer keeps whatever it
+        // held.
+        if !phErrorNode.is_null() {
+            unsafe { *phErrorNode = ::std::ptr::null_mut() };
+        }
+        if !logBuffer.is_null() && bufferSize > 0 {
+            unsafe { *logBuffer = 0 };
+        }
+    }
+    trace_call("cuGraphInstantiate_v2", started, code);
+    code
+}
+
+fn instantiate_graph(phGraphExec: *mut CUgraphExec, hGraph: CUgraph, flags: u64) -> CUresult {
+    if phGraphExec.is_null() {
+        return CUresult::CUDA_ERROR_INVALID_VALUE;
+    }
+    let exec = match r#impl::graph::instantiate(
+        phGraphExec as *mut *mut r#impl::graph::GraphExec,
+        hGraph.decuda(),
+        flags,
+    ) {
+        Ok(()) => CUresult::CUDA_SUCCESS,
+        Err(e) => e,
+    };
+    exec
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -4977,7 +5048,10 @@ pub extern "system" fn cuGraphInstantiateWithFlags(
     hGraph: CUgraph,
     flags: ::std::os::raw::c_ulonglong,
 ) -> CUresult {
-    r#impl::unimplemented()
+    let started = std::time::Instant::now();
+    let code = instantiate_graph(phGraphExec, hGraph, flags as u64);
+    trace_call("cuGraphInstantiateWithFlags", started, code);
+    code
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -4986,7 +5060,31 @@ pub extern "system" fn cuGraphInstantiateWithParams(
     hGraph: CUgraph,
     params: *mut ::std::os::raw::c_void,
 ) -> CUresult {
-    r#impl::unimplemented()
+    // CUgraphInstantiateParams: { stype, pNext, flags, uploadStream,
+    // hErrorNode_out, instantiateResult_out }. Only the flags carry over; there
+    // is nothing to upload and no per-node instantiation failure to report.
+    if params.is_null() {
+        return CUresult::CUDA_ERROR_INVALID_VALUE;
+    }
+    let flags = unsafe { *(params as *const u64).add(2) };
+    let code = instantiate_graph(phGraphExec, hGraph, flags);
+    let started = std::time::Instant::now();
+    trace_call("cuGraphInstantiateWithParams", started, code);
+    code
+}
+
+/// A captured graph is a list of commands, not a device-side artifact, so there
+/// is nothing to upload ahead of a launch. Reporting success is what CUDA does
+/// for a graph that is already resident.
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuGraphUpload(hGraphExec: CUgraphExec, hStream: CUstream) -> CUresult {
+    let _ = (hGraphExec, hStream);
+    CUresult::CUDA_SUCCESS
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub extern "system" fn cuGraphExecGetFlags(hGraphExec: CUgraphExec, flags: *mut cuuint64_t) -> CUresult {
+    r#impl::graph::exec_flags(hGraphExec.decuda(), flags).encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -5066,17 +5164,20 @@ pub extern "system" fn cuGraphExecHostNodeSetParams(
 
 #[cfg_attr(not(test), no_mangle)]
 pub extern "system" fn cuGraphLaunch(hGraphExec: CUgraphExec, hStream: CUstream) -> CUresult {
-    r#impl::unimplemented()
+    let started = std::time::Instant::now();
+    let code = r#impl::graph::launch(hGraphExec.decuda(), hStream.decuda()).encuda();
+    trace_call("cuGraphLaunch", started, code);
+    code
 }
 
 #[cfg_attr(not(test), no_mangle)]
 pub extern "system" fn cuGraphExecDestroy(hGraphExec: CUgraphExec) -> CUresult {
-    r#impl::unimplemented()
+    r#impl::graph::exec_destroy(hGraphExec.decuda()).encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
 pub extern "system" fn cuGraphDestroy(hGraph: CUgraph) -> CUresult {
-    r#impl::unimplemented()
+    r#impl::graph::destroy(hGraph.decuda()).encuda()
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -5115,7 +5216,7 @@ pub extern "system" fn cuGraphInstantiate(
     logBuffer: *mut ::std::os::raw::c_char,
     bufferSize: usize,
 ) -> CUresult {
-    r#impl::unimplemented()
+    cuGraphInstantiate_v2(phGraphExec, hGraph, phErrorNode, logBuffer, bufferSize)
 }
 
 #[cfg_attr(not(test), no_mangle)]
@@ -5123,7 +5224,10 @@ pub extern "system" fn cuStreamBeginCapture(
     hStream: CUstream,
     mode: CUstreamCaptureMode,
 ) -> CUresult {
-    r#impl::unimplemented()
+    let started = std::time::Instant::now();
+    let code = r#impl::graph::begin_capture(hStream.decuda(), mode).encuda();
+    trace_call("cuStreamBeginCapture", started, code);
+    code
 }
 
 #[cfg_attr(not(test), no_mangle)]

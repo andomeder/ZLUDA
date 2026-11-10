@@ -393,10 +393,21 @@ pub(crate) fn destroy_v2(pstream: *mut Stream) -> Result<(), CUresult> {
 }
 
 pub(crate) fn synchronize(pstream: *mut Stream) -> Result<(), CUresult> {
+// A synchronise during capture would have to wait for work that has not been
+// submitted, and CUDA refuses it for that reason. Returning the same code keeps
+// an application that relies on the refusal working.
+if super::graph::capturing_any() {
+    return Err(CUresult::CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED);
+}
 GlobalState::lock_stream(pstream, |stream_data| Ok(stream_data.synchronize()?))?
 }
 
 pub(crate) fn query(pstream: *mut Stream) -> Result<(), CUresult> {
+// Same reasoning as the synchronise: during a capture there is no submitted
+// work to report on.
+if super::graph::capturing_any() {
+    return Err(CUresult::CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED);
+}
 // SUCCESS when all work in the stream has completed, NOT_READY otherwise.
 let ready = GlobalState::lock_stream(pstream, |stream_data| {
 stream_data.try_reuse_finished_events().map_err(|_| CUresult::CUDA_ERROR_UNKNOWN)?;
@@ -426,6 +437,9 @@ pub(crate) fn wait_event(
     if hevent == ptr::null_mut() {
         return Ok(());
     }
+    if super::graph::recording(pstream)? {
+        return super::graph::record_event_wait(hevent);
+    }
     // Enqueue a barrier that waits on the event's L0 signal. The stream's
     // subsequent work will only run after the event fires.
     GlobalState::lock_stream(pstream, |stream_data| {
@@ -454,6 +468,9 @@ pub(crate) fn add_callback(
     };
     // L0 has no host-callback primitive, so the closest semantics is to
     // synchronize the stream and then call back from the host.
+    if super::graph::capturing_any() {
+        return Err(CUresult::CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED);
+    }
     GlobalState::lock_stream(pstream, |stream_data| Ok::<(), CUresult>(stream_data.synchronize()?))??;
     unsafe {
         cb(

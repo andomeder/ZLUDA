@@ -24,8 +24,16 @@ Ok::<_, CUresult>(alloc_ptr)
 })??;
 // A fresh allocation is cleared: applications rely on cudaMalloc memory
 // reading as zeros. ZLUDA_NO_ALLOC_ZERO=1 opts out.
-if std::env::var_os("ZLUDA_NO_ALLOC_ZERO").is_none() && bytesize > 0 {
-    set_d8_v2(alloc_ptr, 0, bytesize, stream::CU_STREAM_LEGACY)?;
+//
+// Not while a capture is in progress: the fill would have to go into the graph,
+// and the memory an application allocates during capture is either a graph pool
+// segment (whose contents the captured work overwrites) or scratch it fills
+// itself.
+if std::env::var_os("ZLUDA_NO_ALLOC_ZERO").is_none()
+    && bytesize > 0
+    && !super::graph::capturing_any()
+{
+    set_d8_v2(alloc_ptr, 0, bytesize, stream::CU_STREAM_LEGACY, true)?;
 }
 Ok(alloc_ptr)
 }
@@ -41,6 +49,16 @@ pub fn copy_v2(dst: *mut c_void, src: *const c_void, bytesize: usize) -> Result<
 // host (see copy_async).
 if bytesize == 0 {
     return Ok(());
+}
+// A blocking copy cannot be recorded and cannot be allowed to wait, both of
+// which capture forbids; CUDA answers the same code for a synchronous copy
+// during a capture.
+if super::graph::capturing_any() {
+    eprintln!(
+        "zluda: a blocking copy was issued during graph capture; capture needs the \
+         asynchronous form (CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED)"
+    );
+    return Err(CUresult::CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED);
 }
 // A blocking copy runs on the legacy stream, which CUDA orders against every
 // other blocking stream. The immediate command lists are independent queues,
@@ -135,6 +153,9 @@ pub fn copy_async(
     if bytesize == 0 {
         return Ok(());
     }
+    if super::graph::recording(hstream)? {
+        return super::graph::record_copy(dst, src, bytesize);
+    }
     GlobalState::lock_enqueue(hstream, |cmd_list, signal, wait| {
         unsafe { cmd_list.append_memory_copy_raw(dst, src, bytesize, Some(signal), wait)? };
         Ok(())
@@ -148,6 +169,23 @@ pub fn copy_htod_async(
     bytesize: usize,
     hstream: *mut stream::Stream,
 ) -> Result<(), CUresult> {
+    if bytesize == 0 {
+        return Ok(());
+    }
+    if super::graph::recording(hstream)? {
+        // A captured copy reads its source again on every replay, so a pageable
+        // buffer cannot be staged through the pool: it could be unmapped or
+        // rewritten by then, and the copy engine faults on pageable pages here
+        // anyway. CUDA requires pinned memory for a captured copy too.
+        if host_untracked(src) {
+            eprintln!(
+                "zluda: a captured host-to-device copy needs a pinned source \
+                 (CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED)"
+            );
+            return Err(CUresult::CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED);
+        }
+        return super::graph::record_copy(dst, src, bytesize);
+    }
     if host_untracked(src) {
         // Unpinned host source: bounce through the pinned staging pool, since
         // the engine faults on pageable pages. Synchronize before returning so
@@ -172,6 +210,16 @@ pub fn copy_dtoh_async(
 ) -> Result<(), CUresult> {
     if bytesize == 0 {
         return Ok(());
+    }
+    if super::graph::recording(hstream)? {
+        if host_untracked(dst) {
+            eprintln!(
+                "zluda: a captured device-to-host copy needs a pinned destination \
+                 (CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED)"
+            );
+            return Err(CUresult::CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED);
+        }
+        return super::graph::record_copy(dst, src, bytesize);
     }
     if host_untracked(dst) {
         // Unpinned host destination: bounce through cached pinned staging.
@@ -236,6 +284,19 @@ pub fn copy_dtoh(
     }
 }
 pub fn copy_dtod(dst: *mut c_void, src: *const c_void, bytesize: usize) -> Result<(), CUresult> {
+    if bytesize == 0 {
+        return Ok(());
+    }
+    // A blocking copy cannot be recorded: it would have to be waited for, and
+    // waiting inside a capture is what CUDA refuses. This one does not go
+    // through synchronize_context_streams, so it needs the guard itself.
+    if super::graph::capturing_any() {
+        eprintln!(
+            "zluda: a blocking copy was issued during graph capture; capture needs the \
+             asynchronous form (CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED)"
+        );
+        return Err(CUresult::CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED);
+    }
     copy_async(dst, src, bytesize, stream::CU_STREAM_LEGACY)?;
     stream::synchronize(stream::CU_STREAM_LEGACY)
 }
@@ -393,7 +454,24 @@ fn set_pattern(
     pattern_size: usize,
     size: usize,
     hstream: *mut stream::Stream,
+    blocking: bool,
 ) -> Result<(), CUresult> {
+    if super::graph::recording(hstream)? {
+        // A captured fill stores the pattern's bytes, because the caller's copy
+        // is on its own stack and will be gone by the first replay. A BLOCKING
+        // fill cannot be captured: it has to have completed when it returns,
+        // which inside a capture it has not, and CUDA refuses it for the same
+        // reason. Recording it would report success for work that had not run,
+        // which is the silent-wrongness class this driver does not ship.
+        if blocking {
+            eprintln!(
+                "zluda: a blocking memset was issued during graph capture; capture needs \
+                 the asynchronous form (CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED)"
+            );
+            return Err(CUresult::CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED);
+        }
+        return super::graph::record_fill(dst, pattern, pattern_size, size);
+    }
     if hstream == stream::CU_STREAM_LEGACY {
         // A fill on the legacy stream is ordered against every other stream.
         GlobalState::synchronize_context_streams()?;
@@ -412,6 +490,7 @@ pub(crate) fn set_d32_v2(
     mut ui: u32,
     n: usize,
     hstream: *mut stream::Stream,
+    blocking: bool,
 ) -> Result<(), CUresult> {
     set_pattern(
         dst,
@@ -419,6 +498,7 @@ pub(crate) fn set_d32_v2(
         mem::size_of::<u32>(),
         mem::size_of::<u32>() * n,
         hstream,
+        blocking,
     )
 }
 
@@ -427,6 +507,7 @@ pub(crate) fn set_d8_v2(
     mut uc: u8,
     n: usize,
     hstream: *mut stream::Stream,
+    blocking: bool,
 ) -> Result<(), CUresult> {
     set_pattern(
         dst,
@@ -434,6 +515,7 @@ pub(crate) fn set_d8_v2(
         mem::size_of::<u8>(),
         mem::size_of::<u8>() * n,
         hstream,
+        blocking,
     )
 }
 
@@ -442,6 +524,7 @@ pub(crate) fn set_d16_v2(
     mut us: u16,
     n: usize,
     hstream: *mut stream::Stream,
+    blocking: bool,
 ) -> Result<(), CUresult> {
     set_pattern(
         dst,
@@ -449,6 +532,7 @@ pub(crate) fn set_d16_v2(
         mem::size_of::<u16>(),
         mem::size_of::<u16>() * n,
         hstream,
+        blocking,
     )
 }
 

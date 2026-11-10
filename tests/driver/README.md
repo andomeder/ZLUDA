@@ -209,3 +209,32 @@ Regenerate the cubin from the library with NVIDIA's own tools:
 cuobjdump -lelf libtorch_cuda.so | grep sm_75          # the ELF images
 cuobjdump -xelf libtorch_cuda.313.sm_75.cubin libtorch_cuda.so
 ```
+
+## Graph capture and replay (2026-11-10)
+
+`graph_test.c` covers `cuStreamBeginCapture`/`cuStreamEndCapture`/`cuGraphInstantiate*`/
+`cuGraphLaunch`, which used to return `CUDA_ERROR_NOT_SUPPORTED` and therefore broke
+`torch.cuda.CUDAGraph` and `torch.compile(mode="reduce-overhead")`. Level Zero has no
+graph API, so a capture records the operations and a launch re-appends them.
+
+What it pins, each a measurement rather than an assertion:
+
+- **nothing executes during capture**: the outputs are poisoned before the capture
+  and must still hold the poison after it;
+- **a replay is repeatable**: two launches give the same answer at the same
+  addresses, and a third after the graph was destroyed still gives it;
+- **arguments are captured by value**: the launch site's scalar and element count
+  are changed between capture and replay, and the replay must use the values the
+  capture saw (a fresh capture must see the new ones);
+- **every recorded kind survives**, in order: a fill (`cuMemsetD32Async`), a kernel
+  launch, a device-to-device copy and a second kernel;
+- **CUDA's refusals**: `cuStreamSynchronize`, `cuCtxSynchronize` and a blocking
+  `cuMemcpyDtoH` inside a capture return `CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`
+  (900) instead of hanging on a barrier that can never signal, and ending a capture
+  that is not in progress returns `CUDA_ERROR_STREAM_CAPTURE_UNMATCHED` (903).
+
+```sh
+gcc -o graph_test graph_test.c -I"$CUDA_INC" -L"$ZLUDA_LIB" -lnvcuda
+LD_LIBRARY_PATH="$ZLUDA_LIB" ./graph_test
+# GRAPH TEST: OK
+```

@@ -129,6 +129,20 @@ pub fn launch_kernel(
             );
         }
     }
+    // A capture records the launch instead of submitting it, and returns here.
+    // Everything the replay needs is copied out of the application's storage
+    // while it is still valid, which is CUDA's by-value contract for a captured
+    // argument.
+    if super::graph::recording(hstream)? {
+        return super::graph::record_launch(
+            f,
+            [grid_dim_x, grid_dim_y, grid_dim_z],
+            [block_dim_x, block_dim_y, block_dim_z],
+            shared_mem_bytes,
+            kernel_params,
+            extra,
+        );
+    }
     let shared_trace = super::diag::trace_shared();
     // A kernel whose arguments do not fit in the parameter list reads them from
     // a buffer. Gathering the bytes is plain host work; filling a buffer here
@@ -320,14 +334,8 @@ pub fn launch_kernel(
             // bound, that bound is what decides - never below the
             // application's own request, never above the declared window.
             let declared_window = shared_mem_bytes as usize + func.shared_mem_prefix;
-            let window = match func.shared_bound {
-                Some(bound) => {
-                    let threads = block_dim_x as u64 * block_dim_y as u64 * block_dim_z as u64;
-                    let needed = bound.bytes(threads) as usize;
-                    declared_window.min(needed.max(shared_mem_bytes as usize))
-                }
-                None => declared_window,
-            };
+            let window = shared_window_for(func, shared_mem_bytes, [block_dim_x, block_dim_y, block_dim_z])
+                .unwrap_or(declared_window);
             if shared_trace {
                 eprintln!(
                     "shared: {} prefix={} app={} total={} declared={} bound={:?}{}",
@@ -438,6 +446,99 @@ pub fn launch_kernel(
 
 fn round_up_to_multiple(x: usize, multiple: usize) -> usize {
     ((x + multiple - 1) / multiple) * multiple
+}
+
+/// The shared-memory window a launch asks for.
+///
+/// The application asks for its own dynamic shared memory; the prefix the kernel
+/// assumes sits in front of it. The declared prefix is the size of the shared
+/// symbol, which for a lifted kernel is the whole module's static shared size, so
+/// it can be many times what the kernel addresses. When the PTX proves a bound,
+/// that bound is what decides - never below the application's own request, never
+/// above the declared window.
+///
+/// Shared by the launch path and by graph capture, because a captured launch has
+/// to ask for exactly what the direct one would.
+pub(crate) fn shared_window_for(
+    func: &FunctionData,
+    shared_mem_bytes: u32,
+    block: [u32; 3],
+) -> Option<usize> {
+    if !func.use_shared_mem {
+        return None;
+    }
+    let declared_window = shared_mem_bytes as usize + func.shared_mem_prefix;
+    Some(match func.shared_bound {
+        Some(bound) => {
+            let threads = block[0] as u64 * block[1] as u64 * block[2] as u64;
+            let needed = bound.bytes(threads) as usize;
+            declared_window.min(needed.max(shared_mem_bytes as usize))
+        }
+        None => declared_window,
+    })
+}
+
+/// The bytes of every argument, copied out of the application's own storage.
+///
+/// A captured launch keeps the values it had at capture time: the caller is
+/// expected to reuse the same launch site and change what the buffers hold, so
+/// re-reading these pointers at replay would pick up a stack slot that has been
+/// reused. Two forms, matching what `cuLaunchKernel` accepts.
+pub(crate) fn capture_arguments(
+    func: &FunctionData,
+    kernel_params: *mut *mut c_void,
+    extra: *mut *mut c_void,
+) -> Result<Vec<Vec<u8>>, CUresult> {
+    let mut args = Vec::with_capacity(func.arg_size.len());
+    if kernel_params != ptr::null_mut() {
+        for (i, size) in func.arg_size.iter().enumerate() {
+            let source = unsafe { *kernel_params.add(i) };
+            if source.is_null() || *size == 0 {
+                args.push(Vec::new());
+                continue;
+            }
+            let bytes = unsafe { std::slice::from_raw_parts(source as *const u8, *size) };
+            args.push(bytes.to_vec());
+        }
+        return Ok(args);
+    }
+    if extra == ptr::null_mut() {
+        return Err(CUresult::CUDA_ERROR_INVALID_VALUE);
+    }
+    // The packed form: one buffer holding every argument, laid out the way the
+    // parameter list would have been.
+    let mut buffer_ptr: Option<*const u8> = None;
+    let mut buffer_size: Option<usize> = None;
+    let mut offset = 0;
+    loop {
+        match unsafe { *extra.add(offset) } {
+            CU_LAUNCH_PARAM_END => break,
+            CU_LAUNCH_PARAM_BUFFER_POINTER => {
+                buffer_ptr = Some(unsafe { *extra.add(offset + 1) as *const u8 });
+            }
+            CU_LAUNCH_PARAM_BUFFER_SIZE => {
+                buffer_size = Some(unsafe { *(*extra.add(offset + 1) as *const usize) });
+            }
+            _ => return Err(CUresult::CUDA_ERROR_INVALID_VALUE),
+        }
+        offset += 2;
+    }
+    let (buffer_ptr, buffer_size) = match (buffer_ptr, buffer_size) {
+        (Some(ptr), Some(size)) => (ptr, size),
+        _ => return Err(CUresult::CUDA_ERROR_INVALID_VALUE),
+    };
+    let mut offset = 0;
+    for size in func.arg_size.iter() {
+        let buffer_offset = round_up_to_multiple(offset, *size);
+        if buffer_offset + *size > buffer_size {
+            return Err(CUresult::CUDA_ERROR_INVALID_VALUE);
+        }
+        let bytes =
+            unsafe { std::slice::from_raw_parts(buffer_ptr.add(buffer_offset), *size) };
+        args.push(bytes.to_vec());
+        offset = buffer_offset + *size;
+    }
+    Ok(args)
 }
 
 pub(crate) fn get_attribute(

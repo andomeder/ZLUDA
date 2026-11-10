@@ -1,0 +1,75 @@
+.version 8.0
+.target sm_70
+.address_size 64
+
+// An indirect branch through a jump table, in the shape llc emits for a switch:
+// a label carrying the target list, the `brx.idx`, then one block per case, with
+// an unsigned range check in front of it because PTX leaves an index past the
+// table undefined.
+//
+// This is how llama.cpp's `mul_mat_vec_q<..., has_fusion=true>` dispatches its
+// GLU epilogue: `ggml_glu_op` selects between gelu, silu, swiglu_oai and the
+// clamp form, and every one of them is a case of that table. The lowering used
+// to resolve the switch's targets from the jump table's label ids but never told
+// the label pass those ids were reachable, so it deleted the case labels while
+// the OpSwitch still named them. spirv-val answers "forward referenced IDs have
+// not been defined" and the backend silently took the default for every entry,
+// i.e. case 0 for every glu op.
+//
+// One thread per index, so one launch covers the whole table:
+//   input[t] = index   output[t] = 100 + index, or 999 past the table.
+.visible .entry brx_idx(
+	.param .u64 input,
+	.param .u64 output
+)
+{
+	.reg .b32 %r<4>;
+	.reg .b64 %rd<8>;
+	.reg .pred %p<2>;
+
+	ld.param.u64 %rd1, [input];
+	ld.param.u64 %rd2, [output];
+	mov.u32 %r1, %tid.x;
+	mul.wide.u32 %rd3, %r1, 8;
+	add.s64 %rd4, %rd1, %rd3;
+	ld.u64 %rd5, [%rd4];
+	cvt.u32.u64 %r2, %rd5;
+
+	setp.gt.u32 %p1, %r2, 5;
+	@%p1 bra $L_def;
+
+$L_tbl: .branchtargets
+	$L_c0,
+	$L_c1,
+	$L_c2,
+	$L_c3,
+	$L_c4,
+	$L_c5;
+	brx.idx %r2, $L_tbl;
+
+$L_c0:
+	mov.u32 %r3, 100;
+	bra.uni $L_done;
+$L_c1:
+	mov.u32 %r3, 101;
+	bra.uni $L_done;
+$L_c2:
+	mov.u32 %r3, 102;
+	bra.uni $L_done;
+$L_c3:
+	mov.u32 %r3, 103;
+	bra.uni $L_done;
+$L_c4:
+	mov.u32 %r3, 104;
+	bra.uni $L_done;
+$L_c5:
+	mov.u32 %r3, 105;
+	bra.uni $L_done;
+$L_def:
+	mov.u32 %r3, 999;
+$L_done:
+	cvt.u64.u32 %rd6, %r3;
+	add.s64 %rd7, %rd2, %rd3;
+	st.u64 [%rd7], %rd6;
+	ret;
+}

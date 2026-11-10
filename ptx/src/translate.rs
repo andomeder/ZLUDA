@@ -2522,6 +2522,15 @@ fn normalize_labels(
     for s in func.iter() {
         match s {
             Statement::Instruction(i) => {
+                // A jump table is a branch with one target per entry, and its
+                // entries are label ids resolved before this pass runs, so
+                // every one of them is a label the function can reach. They
+                // are not jump_target()'s single target, and without this the
+                // pass below drops the labels while the switch still refers to
+                // their ids.
+                if let ast::Instruction::BrxIdx(_, _, targets) = i {
+                    labels_in_use.extend(targets.iter().copied());
+                }
                 if let Some(target) = i.jump_target() {
                     labels_in_use.insert(target);
                 }

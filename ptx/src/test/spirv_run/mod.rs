@@ -343,6 +343,18 @@ const ACTIVE_MASK_DIVERGENT: [u64; 32] = [
 ];
 test_ptx_threads!(active_mask_divergent, 32u32, [0u64], ACTIVE_MASK_DIVERGENT);
 
+// An indirect branch through a `.branchtargets` jump table, the construct llc
+// emits for a switch and llama.cpp's fused matvec uses to pick its GLU epilogue.
+// One thread per table entry, plus two past the end, so every target is covered
+// in one launch: index 0..5 must give 100..105 and any other index 999. A
+// lowering that resolves the switch's targets to label ids the label pass then
+// deletes takes the default for every entry, which reads as all 100.
+const BRX_IDX: [u64; 9] = [
+    100u64, 101u64, 102u64, 103u64, 104u64, 105u64, 999u64, 999u64, 999u64,
+];
+const BRX_IDX_IN: [u64; 9] = [0u64, 1u64, 2u64, 3u64, 4u64, 5u64, 6u64, 7u64, 4294967295u64];
+test_ptx_threads!(brx_idx, 9u32, BRX_IDX_IN, BRX_IDX);
+
 // A narrowed signed conversion has to sign-extend into the 16-bit register that
 // holds an .s8 value in PTX: 0x80 reads back as 0xff80, not 0x0080.
 test_ptx!(cvt_s8_s32, [0x7f80u32], [0xff80u32, 0x7fu32]);

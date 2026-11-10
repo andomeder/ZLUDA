@@ -1062,11 +1062,13 @@ InstMul: ast::Instruction<ast::ParsedArgParams<'input>> = {
 MulDetails: ast::MulDetails = {
     <ctr:MulIntControl> <t:UIntType> => ast::MulDetails::Unsigned(ast::MulUInt{
         typ: t,
-        control: ctr
+        control: ctr,
+        carry: ast::MulCarry::None
     }),
     <ctr:MulIntControl> <t:SIntType> => ast::MulDetails::Signed(ast::MulSInt{
         typ: t,
-        control: ctr
+        control: ctr,
+        carry: ast::MulCarry::None
     }),
     <f:ArithFloat> => ast::MulDetails::Float(f)
 };
@@ -1562,27 +1564,37 @@ InstAbs: ast::Instruction<ast::ParsedArgParams<'input>> = {
 // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#floating-point-instructions-mad
 InstMad: ast::Instruction<ast::ParsedArgParams<'input>> = {
     "mad" <d:MulDetails> <a:Arg4> => ast::Instruction::Mad(d, a),
-    // ".cc" writes the carry-out to a predicate; without a predicate
-    // destination the carry is not observable.
-    "mad" ".lo" ".cc" <t:SignedIntType> <a:Arg4> =>
-        ast::Instruction::Mad(ast::MulDetails::Signed(ast::MulSInt { typ: t, control: ast::MulIntControl::Low }), a),
-    "mad" ".lo" ".cc" <t:UIntType> <a:Arg4> =>
-        ast::Instruction::Mad(ast::MulDetails::Unsigned(ast::MulUInt { typ: t, control: ast::MulIntControl::Low }), a),
+    // A `.cc` instruction writes the per-thread carry flag and the `madc` form
+    // reads it, which is how a 64-bit product is built from a `mad.lo` and a
+    // `madc.hi` pair. Neither form has a destination predicate: ptxas rejects
+    // `d|p` for both ("Predicate output not allowed for instruction
+    // 'mad.lo'"), so the flag is only observable through the next `madc`.
+    "mad" <ctr:MadCarryControl> ".cc" <t:UIntType3264> <a:Arg4> =>
+        ast::Instruction::Mad(ast::MulDetails::Unsigned(ast::MulUInt { typ: t, control: ctr, carry: ast::MulCarry::Out }), a),
+    "mad" <ctr:MadCarryControl> ".cc" <t:SIntType3264> <a:Arg4> =>
+        ast::Instruction::Mad(ast::MulDetails::Signed(ast::MulSInt { typ: t, control: ctr, carry: ast::MulCarry::Out }), a),
+    "madc" <ctr:MadCarryControl> <t:UIntType3264> <a:Arg4> =>
+        ast::Instruction::Mad(ast::MulDetails::Unsigned(ast::MulUInt { typ: t, control: ctr, carry: ast::MulCarry::In }), a),
+    "madc" <ctr:MadCarryControl> <t:SIntType3264> <a:Arg4> =>
+        ast::Instruction::Mad(ast::MulDetails::Signed(ast::MulSInt { typ: t, control: ctr, carry: ast::MulCarry::In }), a),
+    "madc" <ctr:MadCarryControl> ".cc" <t:UIntType3264> <a:Arg4> =>
+        ast::Instruction::Mad(ast::MulDetails::Unsigned(ast::MulUInt { typ: t, control: ctr, carry: ast::MulCarry::InOut }), a),
+    "madc" <ctr:MadCarryControl> ".cc" <t:SIntType3264> <a:Arg4> =>
+        ast::Instruction::Mad(ast::MulDetails::Signed(ast::MulSInt { typ: t, control: ctr, carry: ast::MulCarry::InOut }), a),
     "mad" ".hi" ".sat" ".s32" => todo!(),
-    "madc" ".lo" <t:UIntType> <a:Arg4> =>
-        ast::Instruction::Mad(ast::MulDetails::Unsigned(ast::MulUInt { typ: t, control: ast::MulIntControl::Low }), a),
-    "madc" ".hi" <t:UIntType> <a:Arg4> =>
-        ast::Instruction::Mad(ast::MulDetails::Unsigned(ast::MulUInt { typ: t, control: ast::MulIntControl::High }), a),
-    "madc" ".wide" <t:UIntType> <a:Arg4> =>
-        ast::Instruction::Mad(ast::MulDetails::Unsigned(ast::MulUInt { typ: t, control: ast::MulIntControl::Wide }), a),
-    "madc" ".lo" <t:SIntType> <a:Arg4> =>
-        ast::Instruction::Mad(ast::MulDetails::Signed(ast::MulSInt { typ: t, control: ast::MulIntControl::Low }), a),
-    "madc" ".hi" <t:SIntType> <a:Arg4> =>
-        ast::Instruction::Mad(ast::MulDetails::Signed(ast::MulSInt { typ: t, control: ast::MulIntControl::High }), a),
-    "madc" ".wide" <t:SIntType> <a:Arg4> =>
-        ast::Instruction::Mad(ast::MulDetails::Signed(ast::MulSInt { typ: t, control: ast::MulIntControl::Wide }), a),
     "fma" <f:ArithFloatMustRound> <a:Arg4> => ast::Instruction::Mad(ast::MulDetails::Float(f), a),
 };
+
+// Only `.lo` and `.hi` carry; `mad.wide.cc` and `madc.wide` are rejected by
+// ptxas ("Arguments mismatch for instruction 'mad.wide'", "Unknown modifier
+// '.wide'"), so they are not in the grammar and a `.wide` with a carry fails
+// loudly instead of translating to something PTX does not define. The carry
+// forms exist for 32- and 64-bit integers only: ptxas rejects `mad.lo.cc.u16`
+// with "Arguments mismatch", which is what `UIntType3264` already selects.
+MadCarryControl: ast::MulIntControl = {
+    ".lo" => ast::MulIntControl::Low,
+    ".hi" => ast::MulIntControl::High,
+}
 
 SignedIntType: ast::ScalarType = {
     ".s16" => ast::ScalarType::S16,

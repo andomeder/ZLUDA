@@ -47,6 +47,11 @@ quick_error! {
         TodoAt(location: String) {
             display("unimplemented at {}", location)
         }
+        /// A construct PTX allows but this translator deliberately refuses,
+        /// named so the message says what to do about it.
+        Unsupported(reason: String) {
+            display("unsupported: {}", reason)
+        }
     }
 }
 
@@ -3422,7 +3427,18 @@ fn emit_function_body_ops(
     callee_param_types: &HashMap<spirv::Word, Vec<SpirvType>>,
     laneid: Option<spirv::Word>,
 ) -> Result<(), TranslateError> {
+    // PTX keeps one carry bit per thread, so a function that uses a carrying
+    // multiply-add needs a place to keep it. It is a Function-storage variable
+    // and not an SSA value because the flag has to survive a basic block
+    // boundary, and because the lift clones regions when it inlines a call.
+    let needs_carry_flag = statements_need_carry_flag(func);
+    if needs_carry_flag {
+        check_carry_flag_is_produced(func)?;
+    }
+    let mut carry_flag: Option<spirv::Word> = None;
     for (sidx, s) in func.iter().enumerate() {
+        let opening_first_block =
+            builder.selected_block().is_none() && builder.selected_function().is_some();
         match s {
             Statement::Label(id) => {
                 if builder.selected_block().is_some() {
@@ -3435,6 +3451,12 @@ fn emit_function_body_ops(
                     builder.begin_block(None)?;
                 }
             }
+        }
+        // Variables have to be declared in the function's entry block, before
+        // any other instruction of it, so this runs exactly once and before
+        // anything else is emitted into that block.
+        if opening_first_block && needs_carry_flag {
+            carry_flag = Some(emit_carry_flag_variable(builder, map)?);
         }
         match s {
             Statement::Label(_) => (),
@@ -3889,10 +3911,10 @@ fn emit_function_body_ops(
                 }
                 ast::Instruction::Mad(mad, arg) => match mad {
                     ast::MulDetails::Signed(ref desc) => {
-                        emit_mad_sint(builder, map, opencl, desc, arg)?
+                        emit_mad_sint(builder, map, opencl, desc, arg, carry_flag)?
                     }
                     ast::MulDetails::Unsigned(ref desc) => {
-                        emit_mad_uint(builder, map, opencl, desc, arg)?
+                        emit_mad_uint(builder, map, opencl, desc, arg, carry_flag)?
                     }
                     ast::MulDetails::Float(desc) => {
                         emit_mad_float(builder, map, opencl, desc, arg)?
@@ -6578,37 +6600,234 @@ fn emit_variable(
     Ok(())
 }
 
+/// Whether any instruction in this function reads or writes PTX's carry flag.
+fn statements_need_carry_flag(statements: &[ExpandedStatement]) -> bool {
+    statements.iter().any(|statement| match statement {
+        Statement::Instruction(ast::Instruction::Mad(details, _)) => match details {
+            ast::MulDetails::Unsigned(d) => d.carry != ast::MulCarry::None,
+            ast::MulDetails::Signed(d) => d.carry != ast::MulCarry::None,
+            ast::MulDetails::Float(_) => false,
+        },
+        _ => false,
+    })
+}
+
+/// A carry read that this function did not produce can only have come from a
+/// caller, and PTX's flag is per-thread state that survives a call. The flag is
+/// modelled per function, so that shape would read as zero: refuse it instead of
+/// computing something plausible.
+///
+/// Nothing in the corpus does this - 1909 `madc` instructions over 16699 PTX
+/// files all have their producer in the same block of the same function - so this
+/// is a guard against a silent wrongness, not a path anything takes today.
+fn check_carry_flag_is_produced(statements: &[ExpandedStatement]) -> Result<(), TranslateError> {
+    let mut produced = false;
+    for statement in statements {
+        let details = match statement {
+            Statement::Instruction(ast::Instruction::Mad(details, _)) => details,
+            _ => continue,
+        };
+        let carry = match details {
+            ast::MulDetails::Unsigned(d) => d.carry,
+            ast::MulDetails::Signed(d) => d.carry,
+            ast::MulDetails::Float(_) => continue,
+        };
+        match carry {
+            // `.cc` forms write the flag, so anything after them may read it.
+            ast::MulCarry::Out | ast::MulCarry::InOut => produced = true,
+            ast::MulCarry::In => {
+                if !produced {
+                    return Err(TranslateError::Unsupported(
+                        "madc reads PTX's carry flag before this function writes it; the flag \
+                         is modelled per function, so a carry arriving from a caller is refused \
+                         rather than read as zero"
+                            .to_string(),
+                    ));
+                }
+            }
+            ast::MulCarry::None => {}
+        }
+    }
+    Ok(())
+}
+
+/// The per-thread carry flag of the `.cc` multiply-add forms.
+///
+/// PTX keeps one carry bit per thread and nothing in SPIR-V does, so it lives
+/// in a Function-storage variable holding 0 or 1. A variable rather than a
+/// plain SSA value because the flag has to survive a basic block boundary (it
+/// is thread state, not a value), and because inlining a call clones its region,
+/// which a variable models correctly and a tracked value would not.
+fn emit_carry_flag_variable(
+    builder: &mut dr::Builder,
+    map: &mut TypeWordMap,
+) -> Result<spirv::Word, TranslateError> {
+    let ptr_type = map.get_or_add(
+        builder,
+        SpirvType::Pointer(
+            Box::new(SpirvType::from(ast::ScalarType::U32)),
+            spirv::StorageClass::Function,
+        ),
+    );
+    let flag = builder.variable(ptr_type, None, spirv::StorageClass::Function, None);
+    // No initialising store: every OpVariable has to come before any other
+    // instruction of the entry block, and PTX leaves the flag undefined until
+    // the first `.cc` anyway.
+    Ok(flag)
+}
+
+/// The carry out of `lhs + rhs`, as a predicate.
+///
+/// The sum is written where the caller wants it and the carry costs one more
+/// instruction, an unsigned comparison of the sum against an operand - unsigned
+/// on the bit pattern, which is what PTX's carry means for `.s32` and `.u32`
+/// alike. `OpIAddCarry` would yield both halves of that in one instruction, and
+/// IGC accepts it (checked offline with `ocloc compile -spirv_input`), but it
+/// returns a struct, so it costs two extracts and cannot write the destination
+/// directly.
+fn emit_add_carry(
+    builder: &mut dr::Builder,
+    map: &mut TypeWordMap,
+    inst_type: spirv::Word,
+    lhs: spirv::Word,
+    rhs: spirv::Word,
+    result: Option<spirv::Word>,
+) -> Result<(spirv::Word, spirv::Word), TranslateError> {
+    let sum = builder.i_add(inst_type, result, lhs, rhs)?;
+    let bool_type = map.get_or_add_scalar(builder, ast::ScalarType::Pred);
+    let overflowed = builder.u_less_than(bool_type, None, sum, lhs)?;
+    Ok((sum, overflowed))
+}
+
+/// Writes the carry-out of an addition to the flag.
+fn emit_store_carry_flag(
+    builder: &mut dr::Builder,
+    map: &mut TypeWordMap,
+    flag: Option<spirv::Word>,
+    carry: spirv::Word,
+) -> Result<(), TranslateError> {
+    let flag = flag.ok_or_else(error_todo)?;
+    let u32_type = map.get_or_add_scalar(builder, ast::ScalarType::U32);
+    let zero = builder.constant_u32(u32_type, None, 0);
+    let one = builder.constant_u32(u32_type, None, 1);
+    let value = builder.select(u32_type, None, carry, one, zero)?;
+    builder.store(flag, value, None, iter::empty())?;
+    Ok(())
+}
+
+/// The carry flag as a value of the instruction's own integer type, ready to be
+/// added. The flag is stored 32 bits wide whatever the instruction is, so a
+/// 64-bit form widens it.
+fn emit_load_carry_flag(
+    builder: &mut dr::Builder,
+    map: &mut TypeWordMap,
+    flag: Option<spirv::Word>,
+    typ: ast::ScalarType,
+    inst_type: spirv::Word,
+) -> Result<spirv::Word, TranslateError> {
+    let flag = flag.ok_or_else(error_todo)?;
+    let u32_type = map.get_or_add_scalar(builder, ast::ScalarType::U32);
+    let value = builder.load(u32_type, None, flag, None, iter::empty())?;
+    if typ.size_of() <= 4 {
+        Ok(value)
+    } else {
+        Ok(builder.u_convert(inst_type, None, value)?)
+    }
+}
+
+/// `dst = product + c`, with the carry flag read and/or written as the
+/// instruction asks. `.lo` and `.hi` differ only in which half of the multiply
+/// `product` is, so both go through here.
+fn emit_mad_add(
+    builder: &mut dr::Builder,
+    map: &mut TypeWordMap,
+    inst_type: spirv::Word,
+    typ: ast::ScalarType,
+    carry: ast::MulCarry,
+    arg: &ast::Arg4<ExpandedArgParams>,
+    product: spirv::Word,
+    carry_flag: Option<spirv::Word>,
+) -> Result<(), TranslateError> {
+    match carry {
+        ast::MulCarry::None => {
+            // Operand order kept as it was before the carrying forms existed,
+            // so no existing .spvtxt expectation moves for a plain `mad`.
+            builder.i_add(inst_type, Some(arg.dst), arg.src3, product)?;
+        }
+        ast::MulCarry::Out => {
+            let (_, overflowed) =
+                emit_add_carry(builder, map, inst_type, product, arg.src3, Some(arg.dst))?;
+            emit_store_carry_flag(builder, map, carry_flag, overflowed)?;
+        }
+        ast::MulCarry::In => {
+            let flag = emit_load_carry_flag(builder, map, carry_flag, typ, inst_type)?;
+            let sum = builder.i_add(inst_type, None, product, arg.src3)?;
+            builder.i_add(inst_type, Some(arg.dst), sum, flag)?;
+        }
+        ast::MulCarry::InOut => {
+            let flag = emit_load_carry_flag(builder, map, carry_flag, typ, inst_type)?;
+            let (sum, carry1) = emit_add_carry(builder, map, inst_type, product, arg.src3, None)?;
+            let (_, carry2) = emit_add_carry(builder, map, inst_type, sum, flag, Some(arg.dst))?;
+            // Adding three values overflows if either addition does.
+            let bool_type = map.get_or_add_scalar(builder, ast::ScalarType::Pred);
+            let combined = builder.logical_or(bool_type, None, carry1, carry2)?;
+            emit_store_carry_flag(builder, map, carry_flag, combined)?;
+        }
+    }
+    Ok(())
+}
+
 fn emit_mad_uint(
     builder: &mut dr::Builder,
     map: &mut TypeWordMap,
     opencl: spirv::Word,
     desc: &ast::MulUInt,
     arg: &ast::Arg4<ExpandedArgParams>,
-) -> Result<(), dr::Error> {
+    carry_flag: Option<spirv::Word>,
+) -> Result<(), TranslateError> {
     let inst_type = map.get_or_add(builder, SpirvType::from(ast::ScalarType::from(desc.typ)));
     match desc.control {
         ast::MulIntControl::Low => {
             let mul_result = builder.i_mul(inst_type, None, arg.src1, arg.src2)?;
-            builder.i_add(inst_type, Some(arg.dst), arg.src3, mul_result)?;
+            emit_mad_add(
+                builder,
+                map,
+                inst_type,
+                desc.typ,
+                desc.carry,
+                arg,
+                mul_result,
+                carry_flag,
+            )?;
         }
         ast::MulIntControl::High => {
-            builder.ext_inst(
-                inst_type,
-                Some(arg.dst),
-                opencl,
-                spirv::CLOp::u_mad_hi as spirv::Word,
-                [
-                    dr::Operand::IdRef(arg.src1),
-                    dr::Operand::IdRef(arg.src2),
-                    dr::Operand::IdRef(arg.src3),
-                ]
-                .iter()
-                .cloned(),
-            )?;
+            if desc.carry == ast::MulCarry::None {
+                // One instruction, as before the carrying forms existed:
+                // `u_mad_hi` already adds `c`.
+                emit_umadhi_into(builder, inst_type, opencl, arg)?;
+            } else {
+                // `u_mad_hi` adds `c` internally and does not expose the carry
+                // of that addition, so the high half of the product is
+                // materialised and the add-with-carry is done on it.
+                let zero = builder.constant_null(inst_type, None);
+                let high_product =
+                    emit_umadhi(builder, inst_type, opencl, arg.src1, arg.src2, zero)?;
+                emit_mad_add(
+                    builder,
+                    map,
+                    inst_type,
+                    desc.typ,
+                    desc.carry,
+                    arg,
+                    high_product,
+                    carry_flag,
+                )?;
+            }
         }
         ast::MulIntControl::Wide => {
             // mad.wide.u32 d, a, b, c: the product is 64 bits wide and c is
-            // added to it without truncation.
+            // added to it without truncation. PTX defines no carrying form of
+            // it, so the grammar does not allow one here.
             let wide_type = map.get_or_add_scalar(builder, ast::ScalarType::U64);
             let a = builder.u_convert(wide_type, None, arg.src1)?;
             let b = builder.u_convert(wide_type, None, arg.src2)?;
@@ -6620,33 +6839,95 @@ fn emit_mad_uint(
     Ok(())
 }
 
+fn emit_umadhi(
+    builder: &mut dr::Builder,
+    inst_type: spirv::Word,
+    opencl: spirv::Word,
+    src1: spirv::Word,
+    src2: spirv::Word,
+    src3: spirv::Word,
+) -> Result<spirv::Word, TranslateError> {
+    Ok(builder.ext_inst(
+        inst_type,
+        None,
+        opencl,
+        spirv::CLOp::u_mad_hi as spirv::Word,
+        [
+            dr::Operand::IdRef(src1),
+            dr::Operand::IdRef(src2),
+            dr::Operand::IdRef(src3),
+        ]
+        .iter()
+        .cloned(),
+    )?)
+}
+
+/// A plain `mad.hi`, which is ONE instruction: `u_mad_hi` adds `c` itself.
+fn emit_umadhi_into(
+    builder: &mut dr::Builder,
+    inst_type: spirv::Word,
+    opencl: spirv::Word,
+    arg: &ast::Arg4<ExpandedArgParams>,
+) -> Result<(), TranslateError> {
+    builder.ext_inst(
+        inst_type,
+        Some(arg.dst),
+        opencl,
+        spirv::CLOp::u_mad_hi as spirv::Word,
+        [
+            dr::Operand::IdRef(arg.src1),
+            dr::Operand::IdRef(arg.src2),
+            dr::Operand::IdRef(arg.src3),
+        ]
+        .iter()
+        .cloned(),
+    )?;
+    Ok(())
+}
+
 fn emit_mad_sint(
     builder: &mut dr::Builder,
     map: &mut TypeWordMap,
     opencl: spirv::Word,
     desc: &ast::MulSInt,
     arg: &ast::Arg4<ExpandedArgParams>,
-) -> Result<(), dr::Error> {
+    carry_flag: Option<spirv::Word>,
+) -> Result<(), TranslateError> {
     let inst_type = map.get_or_add(builder, SpirvType::from(ast::ScalarType::from(desc.typ)));
     match desc.control {
         ast::MulIntControl::Low => {
             let mul_result = builder.i_mul(inst_type, None, arg.src1, arg.src2)?;
-            builder.i_add(inst_type, Some(arg.dst), arg.src3, mul_result)?;
+            emit_mad_add(
+                builder,
+                map,
+                inst_type,
+                desc.typ,
+                desc.carry,
+                arg,
+                mul_result,
+                carry_flag,
+            )?;
         }
         ast::MulIntControl::High => {
-            builder.ext_inst(
-                inst_type,
-                Some(arg.dst),
-                opencl,
-                spirv::CLOp::s_mad_hi as spirv::Word,
-                [
-                    dr::Operand::IdRef(arg.src1),
-                    dr::Operand::IdRef(arg.src2),
-                    dr::Operand::IdRef(arg.src3),
-                ]
-                .iter()
-                .cloned(),
-            )?;
+            if desc.carry == ast::MulCarry::None {
+                // One instruction, as before the carrying forms existed:
+                // `s_mad_hi` already adds `c`.
+                emit_smadhi_into(builder, inst_type, opencl, arg)?;
+            } else {
+                let zero = builder.constant_null(inst_type, None);
+                let high_product =
+                    emit_smadhi(builder, inst_type, opencl, arg.src1, arg.src2, zero)?;
+                emit_mad_add(
+                    builder,
+                    map,
+                    inst_type,
+                    desc.typ,
+                    desc.carry,
+                    arg,
+                    high_product,
+                    carry_flag,
+                )?;
+            }
         }
         ast::MulIntControl::Wide => {
             let wide_type = map.get_or_add_scalar(builder, ast::ScalarType::S64);
@@ -6657,6 +6938,52 @@ fn emit_mad_sint(
             builder.i_add(wide_type, Some(arg.dst), product, c)?;
         }
     };
+    Ok(())
+}
+
+fn emit_smadhi(
+    builder: &mut dr::Builder,
+    inst_type: spirv::Word,
+    opencl: spirv::Word,
+    src1: spirv::Word,
+    src2: spirv::Word,
+    src3: spirv::Word,
+) -> Result<spirv::Word, TranslateError> {
+    Ok(builder.ext_inst(
+        inst_type,
+        None,
+        opencl,
+        spirv::CLOp::s_mad_hi as spirv::Word,
+        [
+            dr::Operand::IdRef(src1),
+            dr::Operand::IdRef(src2),
+            dr::Operand::IdRef(src3),
+        ]
+        .iter()
+        .cloned(),
+    )?)
+}
+
+/// A plain `mad.hi` on signed operands, in one instruction.
+fn emit_smadhi_into(
+    builder: &mut dr::Builder,
+    inst_type: spirv::Word,
+    opencl: spirv::Word,
+    arg: &ast::Arg4<ExpandedArgParams>,
+) -> Result<(), TranslateError> {
+    builder.ext_inst(
+        inst_type,
+        Some(arg.dst),
+        opencl,
+        spirv::CLOp::s_mad_hi as spirv::Word,
+        [
+            dr::Operand::IdRef(arg.src1),
+            dr::Operand::IdRef(arg.src2),
+            dr::Operand::IdRef(arg.src3),
+        ]
+        .iter()
+        .cloned(),
+    )?;
     Ok(())
 }
 

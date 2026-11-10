@@ -78,6 +78,38 @@ test_ptx!(b64tof64, [111u64], [111u64]);
 test_ptx!(implicit_param, [34u32], [34u32]);
 test_ptx!(pred_not, [10u64, 11u64], [2u64, 0u64]);
 test_ptx!(mad_s32, [2i32, 3i32, 4i32], [10i32, 10i32, 10i32]);
+// The carrying forms: `mad.cc` writes PTX's per-thread carry flag and `madc`
+// reads it. Every addition below overflows, so a lowering that drops the flag
+// gets columns 1, 2, 3, 6 and 9 wrong - which is what a 64-bit product built
+// from `mad.lo.cc` + `madc.hi` loses in the kernels that use it.
+test_ptx!(
+    mad_carry,
+    [
+        0xffffffffu32,
+        0xffffffffu32,
+        0xffffffffu32,
+        0u32,
+        0xffffffffu32,
+        0xffffffffu32,
+        0xffffffffu32,
+        0xffffffffu32,
+        0xffffffffu32,
+        0xffffffffu32
+    ],
+    [
+        0x00000000u32,
+        0xffffffffu32,
+        0x00000001u32,
+        0x00000002u32,
+        0x00000000u32,
+        0x00000000u32,
+        0x00000001u32,
+        0x00000000u32,
+        0x00000000u32,
+        0x00000001u32,
+        0x00000000u32
+    ]
+);
 test_ptx!(
     mul_wide,
     [0x01_00_00_00__01_00_00_00i64],

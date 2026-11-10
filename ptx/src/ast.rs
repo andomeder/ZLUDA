@@ -702,6 +702,22 @@ pub enum MulIntControl {
     Wide,
 }
 
+/// The carry flag of the integer multiply-add chain. PTX keeps one carry bit
+/// per thread: a `.cc` instruction writes it and the `...c` form of the next
+/// instruction reads it, which is how a 64-bit product is built out of a
+/// `mad.lo` and a `madc.hi` (`odocs/BUG-madcc-carry.md`).
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub enum MulCarry {
+    /// No carry flag is read or written.
+    None,
+    /// `mad.cc`: the carry out of the addition replaces the flag.
+    Out,
+    /// `madc`: the flag is added to the result.
+    In,
+    /// `madc.cc`: the flag is added and the new carry replaces it.
+    InOut,
+}
+
 #[derive(PartialEq, Eq, Copy, Clone)]
 pub enum RoundingMode {
     NearestEven,
@@ -880,12 +896,14 @@ pub enum MulDetails {
 pub struct MulUInt {
     pub typ: ScalarType,
     pub control: MulIntControl,
+    pub carry: MulCarry,
 }
 
 #[derive(Copy, Clone)]
 pub struct MulSInt {
     pub typ: ScalarType,
     pub control: MulIntControl,
+    pub carry: MulCarry,
 }
 
 #[derive(Copy, Clone)]

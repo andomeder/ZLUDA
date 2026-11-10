@@ -1,0 +1,69 @@
+.version 6.5
+.target sm_30
+.address_size 64
+
+// The carrying multiply-add. PTX keeps one carry bit per thread: `mad.cc`
+// writes it and `madc` reads it, which is how nvcc and llvm build a 64-bit
+// product out of a `mad.lo` and a `madc.hi`. A lowering that drops the flag
+// truncates the high word whenever the low addition overflows.
+//
+// The input is chosen so that every addition overflows: a = b = 0xffffffff, so
+// the low product is 1, and c_lo = 0xffffffff, so adding it wraps to zero and
+// sets the flag. The 64-bit chain is 0xffffffffffffffff squared, whose product
+// is 1, plus a 0xffffffffffffffff addend.
+//
+//   out[0]  (u32)(lo of (u64)a*b + (c_hi:c_lo))        mad.lo.cc
+//   out[1]  (u32)(hi of the same)                      madc.hi     <- the carry
+//   out[2]  the flag after out[0], read as a carry-only add
+//   out[3]  a*b + c_hi + carry                         madc.lo.cc
+//   out[4]  the flag after out[3]
+//   out[5]  (s32)(lo of the same, signed operands)      mad.lo.cc.s32
+//   out[6]  (s32)(hi of the same, signed operands)      madc.hi.s32
+//   out[7]  low  word of (u64)a64*b64 + c64            mad.lo.cc.u64
+//   out[8]  high word of the same
+//   out[9]  low  word of the same with the carry added  madc.lo.u64
+//   out[10] high word of the same
+.visible .entry mad_carry(
+	.param .u64 input,
+	.param .u64 output
+)
+{
+	.reg .b32 %r<16>;
+	.reg .b64 %rd<12>;
+
+	ld.param.u64 %rd1, [input];
+	ld.param.u64 %rd2, [output];
+	ld.u32 %r1, [%rd1];
+	ld.u32 %r2, [%rd1+4];
+	ld.u32 %r3, [%rd1+8];
+	ld.u32 %r4, [%rd1+12];
+	ld.u64 %rd3, [%rd1+16];
+	ld.u64 %rd4, [%rd1+24];
+	ld.u64 %rd5, [%rd1+32];
+	mov.u32 %r5, 0;
+
+	mad.lo.cc.u32 %r6, %r1, %r2, %r3;
+	madc.hi.u32 %r7, %r1, %r2, %r4;
+	madc.lo.u32 %r8, %r5, %r5, %r5;
+	madc.lo.cc.u32 %r9, %r1, %r2, %r4;
+	madc.lo.u32 %r10, %r5, %r5, %r5;
+	mad.lo.cc.s32 %r11, %r1, %r2, %r3;
+	madc.hi.s32 %r12, %r1, %r2, %r4;
+	mad.lo.cc.u64 %rd6, %rd3, %rd4, %rd5;
+	madc.lo.u64 %rd7, %rd3, %rd4, %rd5;
+	shr.u64 %rd8, %rd6, 32;
+	shr.u64 %rd9, %rd7, 32;
+
+	st.u32 [%rd2], %r6;
+	st.u32 [%rd2+4], %r7;
+	st.u32 [%rd2+8], %r8;
+	st.u32 [%rd2+12], %r9;
+	st.u32 [%rd2+16], %r10;
+	st.u32 [%rd2+20], %r11;
+	st.u32 [%rd2+24], %r12;
+	st.u32 [%rd2+28], %rd6;
+	st.u32 [%rd2+32], %rd8;
+	st.u32 [%rd2+36], %rd7;
+	st.u32 [%rd2+40], %rd9;
+	ret;
+}
